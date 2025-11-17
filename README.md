@@ -40,9 +40,9 @@
 
 ## 🚀 如何构建 (Getting Started)
 
-### 1. 依赖 (Dependencies)
+本项目包含 `client/` 和 `server/` 两个独立的子项目。
 
-本项目对不同平台的依赖处理方式不同。
+### 1. 依赖 (Dependencies)
 
 #### Linux (服务器端)
 **外部依赖：** 你 **必须** 使用系统的包管理器安装以下库：
@@ -54,7 +54,7 @@
 
 #### Windows (客户端)
 **依赖已打包：** **无需额外安装依赖！**
-* 所有必需的库 (TBB, Zlib, Zstd) 的头文件、静态库 (`.a`/`.lib`) 和动态库 (`.dll`) **均已包含**在 `thirdparty` 目录中。
+* 所有必需的库 (TBB, Zlib, Zstd) 的头文件、静态库 (`.a`/`.lib`) 和动态库 (`.dll`) **均已包含**在 `client/thirdparty` 目录中。
 * 你只需要 MSYS2 提供的 `MinGW64` 编译器和 `CMake` 即可。
 
 ---
@@ -68,35 +68,61 @@
 sudo apt-get update
 sudo apt-get install -y libtbb-dev libzstd-dev zlib1g-dev
 
-# 2. 克隆并编译
+# 2. 克隆仓库
 git clone [https://github.com/AnnieLZZ/MYMQ.git](https://github.com/AnnieLZZ/MYMQ.git)
 cd MYMQ
+
+# 3. (重要) 进入服务器目录
+cd server
+
+# 4. 编译
 mkdir build && cd build
 cmake ..
 make
 
-Windows (客户端)
-重要提示: 请确保你运行的是 MSYS2 MinGW 64-bit 终端 (mingw64.exe)。
-Bash
+MYMQ Windows 客户端编译与运行指南 (MSYS2 MinGW 64-bit)
 
-# 1. (如果还未安装) 确保 CMake 和 MinGW 工具链已安装
-pacman -S --needed base-devel mingw-w64-x86_64-toolchain mingw-w66-x86_64-cmake# 2. 克隆并编译 (CMake 会自动查找 thirdparty 目录下的库)
-git clone [https://github.com/AnnieLZZ/MYMQ.git](https://github.com/AnnieLZZ/MYMQ.git)cd MYMQ
-mkdir build && cd build
-cmake -G "MinGW Makefiles" ..
-cmake --build .
-3. 运行 Windows 客户端 (重要！)
-Windows 客户端依赖动态库 (如 tbb.dll)。在 cmake --build . 编译完成后，你会在 build 目录（或 build/src/client 之类的地方）找到生成的 .exe 可执行文件。
-直接运行 .exe 会失败，因为它找不到 ..dll 文件。
-解决方法：
-你需要将 thirdparty 目录中用到的 .dll 文件（例如 thirdparty/tbb/bin/tbb.dll 等）复制到 .exe 文件所在的同一目录下，然后再运行。
+> **重要提示:** 请确保你运行的是 **MSYS2 MinGW 64-bit 终端** (`mingw64.exe`)。
 
+### 💻 Bash 编译步骤
 
+1.  **安装依赖 (如果还未安装)**
+    确保 `CMake` 和 `MinGW` 工具链已安装。
 
+    ```bash
+    pacman -S --needed base-devel mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake
+    ```
 
+2.  **克隆仓库**
 
+    ```bash
+    git clone [https://github.com/AnnieLZZ/MYMQ.git](https://github.com/AnnieLZZ/MYMQ.git)
+    cd MYMQ
+    ```
 
+3.  **(重要) 进入客户端目录**
 
+    ```bash
+    cd client
+    ```
 
+4.  **编译**
+    `CMake` 会自动查找 `../thirdparty` 目录下的库。
 
+    ```bash
+    mkdir build && cd build
+    cmake -G "MinGW Makefiles" ..
+    cmake --build .
+    ```
 
+### 🚀 运行 Windows 客户端 (重要！)
+
+Windows 客户端依赖动态库 (例如 `tbb.dll`)。
+
+在 `cmake --build .` 编译完成后，你会在 `client/build/` 目录（或 `client/build/src` 之类的地方）找到生成的 `.exe` 可执行文件。
+
+* **直接运行 `.exe` 会失败**，因为它找不到所需的 `.dll` 文件。
+
+**解决方法:**
+
+你需要将 `client/thirdparty` 目录中用到的 **`.dll` 文件**（例如 `client/thirdparty/tbb/bin/tbb.dll` 等）**复制到 `.exe` 文件所在的同一目录下**，然后再运行。
