@@ -1,0 +1,6 @@
+segment_capacity_default=16777216
+segment_capacity_max=2147483648
+LOG_FLUSH_BYTES_INTERVAL=65536
+index_build_interval_bytes=4096
+LOG_FLUSH_INTERVAL_MS=360000
+LOG_CLEAN_S=144000
