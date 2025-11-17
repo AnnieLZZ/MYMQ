@@ -1,0 +1,183 @@
+#ifndef MYMQ_CLIENT_H
+#define MYMQ_CLIENT_H
+#include "Communication.h"
+#include "MurmurHash2.h"
+#include"MYMQ_innercodes.h"
+#include"MYMQ_PublicCodes.h"
+#include"Timer.h"
+#include <unordered_set>
+
+using ConsumerInfo=MYMQ::ConsumerInfo;
+using Consumerbasicinfo=MYMQ::MYMQ_Client::Consumerbasicinfo;
+using Eve=MYMQ::EventType;
+using Err=MYMQ_Public::CommonErrorCode;
+using Gstate=MYMQ::MYMQ_Server::ConsumerGroupState::GroupState;
+using MB=MessageBuilder;
+using Err_Client=MYMQ_Public::ClientErrorCode;
+using Mybyte=std::vector<unsigned char>;
+using Endoffsetmap=tbb::concurrent_hash_map<std::string,MYMQ::MYMQ_Client::endoffset_point>;
+
+
+
+class MYMQ_clientuse{
+
+public:
+    MYMQ_clientuse(const std::string& clientid=std::string(),uint8_t ack_level=UINT8_MAX);
+    MYMQ_clientuse(const MYMQ_clientuse&)=delete;
+    MYMQ_clientuse& operator= (const MYMQ_clientuse&)=delete;
+    ~MYMQ_clientuse();
+
+
+
+    size_t get_position_consumed(const MYMQ_Public::TopicPartition& tp);
+    void exit_rebalance();
+
+    void heartbeat_start();
+
+    void heartbeat_stop();
+
+    void push_perioric_start();
+    void push_perioric_stop();
+
+    void autocommit_start();
+    void autocommit_stop();
+
+
+
+    Err_Client push(const MYMQ_Public::TopicPartition& tp,const std::string& key,const std::string& value
+                    ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant) ;
+
+    std::pair<std::queue<MYMQ_Public::ConsumerRecord>, Err_Client> pull(const MYMQ_Public::TopicPartition& tp) ;
+    void create_topic(const std::string& topicname,size_t parti_num=1);
+    void set_pull_bytes(size_t bytes);
+
+    void subscribe_topic(const std::string& topicname);
+    void unsubscribe_topic(const std::string& topicname);
+
+    Err_Client commit_sync(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume) ;
+
+
+
+    Err_Client commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
+                            ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant) ;
+
+
+
+    Err_Client join_group(const std::string& groupid);
+    Err_Client leave_group(const std::string& groupid);
+
+    void sync_group() ;
+    void heartbeat() ;
+
+    std::unordered_set<MYMQ_Public::TopicPartition> get_assigned_partition();
+
+
+     bool get_is_ingroup(){
+        return is_ingroup.load();
+    }
+
+private:
+    void init(const std::string& clientid,uint8_t ack_level);
+
+    void timer_commit_async();
+
+
+    void send(MYMQ::EventType event_type, const Mybyte& msg_body,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant);
+    std::map<std::string, std::map<std::string, std::set<size_t>>> assign_leaderdo(
+        const std::unordered_map<std::string, std::set<std::string>>& member_to_topics,
+        const std::unordered_map<std::string, size_t>& topic_num_map) ;
+    std::string weave_assignments_message(const std::map<std::string, std::map<std::string, std::set<size_t>>>& assignments) ;
+    Err_Client commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant);
+    MYMQ_Public::ResultVariant handle_response(Eve event_type,const Mybyte& msg_body);
+    void push_timer_send();
+    void out_group_reset();
+    void cerr(const std::string& str){
+        Printqueue::instance().out(str,1,0);
+    }
+
+    void out(const std::string& str){
+        Printqueue::instance().out(str,0,0);
+    }
+
+
+    bool inrange(size_t obj,size_t min,size_t max){
+        return (obj<=max&&obj>=min);
+    }
+
+private:
+    //Config配置项
+    size_t join_collect_timeout_ms; // 重平衡join窗口期
+    size_t rebalance_timeout_ms; // 重平衡超时时长
+    size_t heartbeat_interval_ms;
+    size_t memberid_wait_timeout_s;
+    size_t commit_wait_timeout_s;
+    size_t poll_wait_timeout_s;
+    size_t zstd_level;
+    size_t local_pollqueue_size;
+    size_t batch_size;
+    MYMQ::PullSet pull_start_location;
+    size_t autopush_perior_ms;
+    size_t autocommit_perior_ms;
+    //Config配置项
+
+
+    std::string path_;
+    Communication_client cmc_;
+    bool is_auto_commit;
+
+    Timer timer;
+    size_t rebalance_timeout_taskid{0};
+    size_t join_collect_timeout_taskid{0};
+    size_t heartbeat_taskid{0};
+    size_t push_perioric_taskid{0};
+    size_t autocommit_taskid{0};
+
+
+
+    ClientState state;
+    std::mutex mtx_state;
+
+
+    ConsumerInfo info_consumer;
+    std::shared_mutex mtx_consumerinfo;
+
+    Consumerbasicinfo info_basic;
+
+    std::atomic<bool> is_ingroup{0};
+    bool is_leader{0};
+
+    std::atomic<bool> rebalance_ing{0};
+
+    std::unordered_map<std::string,std::unordered_set<MYMQ_Public::TopicPartition> > map_final_assign;
+    std::shared_mutex mtx_map_final_assign;
+
+    tbb::concurrent_hash_map<std::string,MYMQ::MYMQ_Client::endoffset_point> map_end_offset;
+
+
+    std::unordered_map<std::string,MYMQ::MYMQ_Client::Push_queue> map_push_queue;
+
+
+
+    std::string group_assign_str_retry{""};
+
+
+    std::atomic<size_t>  pull_bytes_once;
+
+    std::condition_variable cv_commit_ready;
+    std::atomic<bool> commit_ready{0};
+    std::mutex mtx_commit_ready;
+
+    std::condition_variable cv_poll_ready;
+    std::atomic<bool> poll_ready{0};
+    std::mutex mtx_poll_ready;
+
+    moodycamel::ReaderWriterQueue<MYMQ_Public::ConsumerRecord> poll_queue;
+
+
+    ZSTD_DCtx* dctx;
+    MYMQ::ACK_Level ack_level_;
+
+};
+
+
+#endif

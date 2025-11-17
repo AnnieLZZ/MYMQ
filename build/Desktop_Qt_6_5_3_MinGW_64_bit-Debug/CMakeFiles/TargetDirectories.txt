@@ -1,0 +1,6 @@
+D:/Qt/QQQQt/programlzz/MYMQ/build/Desktop_Qt_6_5_3_MinGW_64_bit-Debug/CMakeFiles/mymq_lib.dir
+D:/Qt/QQQQt/programlzz/MYMQ/build/Desktop_Qt_6_5_3_MinGW_64_bit-Debug/CMakeFiles/edit_cache.dir
+D:/Qt/QQQQt/programlzz/MYMQ/build/Desktop_Qt_6_5_3_MinGW_64_bit-Debug/CMakeFiles/rebuild_cache.dir
+D:/Qt/QQQQt/programlzz/MYMQ/build/Desktop_Qt_6_5_3_MinGW_64_bit-Debug/examples/CMakeFiles/mymq_app.dir
+D:/Qt/QQQQt/programlzz/MYMQ/build/Desktop_Qt_6_5_3_MinGW_64_bit-Debug/examples/CMakeFiles/edit_cache.dir
+D:/Qt/QQQQt/programlzz/MYMQ/build/Desktop_Qt_6_5_3_MinGW_64_bit-Debug/examples/CMakeFiles/rebuild_cache.dir
