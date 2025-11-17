@@ -1,3 +1,0 @@
-D:\CMake\bin\cmake.exe -E rm -f CMakeFiles\mymq_app.dir/objects.a
-D:\Qt\QQQQt\Tools\mingw1120_64\bin\ar.exe qc CMakeFiles\mymq_app.dir/objects.a @CMakeFiles\mymq_app.dir\objects1.rsp
-D:\Qt\QQQQt\Tools\mingw1120_64\bin\g++.exe -DQT_QML_DEBUG -g -Wl,--whole-archive CMakeFiles\mymq_app.dir/objects.a -Wl,--no-whole-archive -o mymq_app.exe -Wl,--out-implib,libmymq_app.dll.a -Wl,--major-image-version,0,--minor-image-version,0 @CMakeFiles\mymq_app.dir\linkLibs.rsp

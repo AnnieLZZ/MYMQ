@@ -1,8 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"D:/Qt/QQQQt/programlzz/MYMQ/build/Desktop_Qt_6_5_3_MinGW_64_bit-Debug/cmake_install.cmake",
-		"D:/Qt/QQQQt/programlzz/MYMQ/build/Desktop_Qt_6_5_3_MinGW_64_bit-Debug/examples/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

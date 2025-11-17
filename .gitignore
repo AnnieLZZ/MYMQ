@@ -39,3 +39,12 @@
 
 # debug information files
 *.dwo
+
+# Build directories
+build/
+[Bb]uild/
+[Bb]uild-*/
+
+# Qt / CMake user files
+*.user
+CMakeLists.txt.user

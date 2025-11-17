@@ -1,1 +1,0 @@
- ../libmymq_lib.a D:/Qt/QQQQt/programlzz/MYMQ/thirdparty/zlib/lib/libzlibstatic.a D:/Qt/QQQQt/programlzz/MYMQ/thirdparty/zstd/lib/libzstd.a D:/Qt/QQQQt/programlzz/MYMQ/thirdparty/tbb/lib/libtbb12.dll.a -lws2_32 -lssp -lkernel32 -luser32 -lgdi32 -lwinspool -lshell32 -lole32 -loleaut32 -luuid -lcomdlg32 -ladvapi32 

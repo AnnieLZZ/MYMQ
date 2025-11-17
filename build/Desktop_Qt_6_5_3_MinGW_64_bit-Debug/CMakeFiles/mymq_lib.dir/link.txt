@@ -1,2 +1,0 @@
-D:\Qt\QQQQt\Tools\mingw1120_64\bin\ar.exe qc libmymq_lib.a CMakeFiles/mymq_lib.dir/src/MYMQ_C.cpp.obj CMakeFiles/mymq_lib.dir/src/MYMQ_Client.cpp.obj
-D:\Qt\QQQQt\Tools\mingw1120_64\bin\ranlib.exe libmymq_lib.a
