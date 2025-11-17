@@ -7,32 +7,28 @@
 ## 🌟 核心特性 (Features)
 
 * **极致的 I/O 效率 (Extreme I/O Efficiency)**
-    * 利用 Linux `sendfile` 和内存映射 (`mmap`) 避免不必要的内核态/用户态拷贝。
-    * 消息以二进制密排布，并使用 `ZSTD` 高度压缩 + 聚合 Batch 结构存储，大幅降低磁盘和网络开销。
+    * **日志段 + 索引 (Log Segments + Index):** 实现了 Kafka 的核心 I/O 模型，通过高效的索引结构实现快速寻址和顺序写。
+    * **零拷贝 (Zero-Copy):** 利用 Linux `sendfile` 和内存映射 (`mmap`) 避免不必要的内核态/用户态拷贝。
+    * **高效存储 (Efficient Storage):** 消息以二进制密排布，并使用 `ZSTD` 高度压缩 + 聚合 Batch 结构存储，大幅降低磁盘和网络开销。
 
 * **高性能网络模型 (High-Perf Network Model)**
-    * 服务器端采用 `epoll` + `Reactor` + 状态机（FSM）管理多链接非阻塞 I/O。
-    * 自定义线程池和定时器高效处理心跳、请求重试等长时任务。
-
-* **开创性重平衡 (Incremental Rebalancing)**
-    * 采用增量协作式的重平衡策略，高效解决传统消费者断线重连时的“Stop-The-World”重平衡痛点。
-
-* **Kafka 核心设计 (Kafka's Core Design)**
-    * 在单节点上实现了 Kafka 的核心机制：日志段 + 索引（高效磁盘读写）、组协调器（Group Coordinator）、分区分配策略等。
+    * **Reactor 模式:** 服务器端采用 `epoll` + `Reactor` + 状态机（FSM）管理多链接非阻塞 I/O。
+    * **并发管理:** 自定义线程池和定时器高效处理心跳、请求重试等长时任务。
 
 * **工业级并发组件 (Industry-Grade Concurrency)**
-    * 使用 `moodycamel::ReaderWriterQueue` (SPSC无锁队列) 作为高性能通信缓冲。
-    * 使用 `TBB::concurrent_hash_map` 处理高并发下的消费偏移量读写。
+    * **无锁队列 (Lock-Free):** 使用 `moodycamel::ReaderWriterQueue` (SPSC无锁队列) 作为高性能通信缓冲。
+    * **并发哈希 (Concurrent Map):** 使用 `TBB::concurrent_hash_map` 处理高并发下的消费偏移量读写。
 
-* **可靠性与跨平台 (Reliability & Cross-Platform)**
-    * 消息完整性由 `CRC32` 校验保证。
-    * 服务器端 (Linux) 和 客户端 (Windows) 分别优化。
+* **Kafka 核心架构 (Kafka's Core Architecture)**
+    * **开创性重平衡 (Incremental Rebalancing):** 采用增量协作式的重平衡策略，高效解决传统消费者断线重连时的“Stop-The-World”重平衡痛点。
+    * **组协调器 (Group Coordinator):** 高效管理消费者组、分区分配，保证组内运行稳定。
+    * **消息完整性 (Data Integrity):** 消息完整性由 `CRC32` 校验保证。
 
 ## 🛠️ 技术栈 (Technology Stack)
 
 * **网络:** `epoll` + `Reactor`
 * **并发:** `Intel TBB`, `moodycamel::ReaderWriterQueue`
-* **I/O:** `sendfile`, `mmap`
+* **I/O:** `Log-Segmented Index`, `sendfile`, `mmap`
 * **压缩:** `zstd`
 * **校验:** `zlib::crc32`
 
