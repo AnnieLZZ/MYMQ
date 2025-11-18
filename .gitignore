@@ -48,3 +48,5 @@ build/
 # Qt / CMake user files
 *.user
 CMakeLists.txt.user
+
+!thirdparty/**
