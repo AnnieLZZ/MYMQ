@@ -49,4 +49,6 @@ build/
 *.user
 CMakeLists.txt.user
 
-!thirdparty/**
+!client/thirdparty/**
+
+!server/thirdparty/**
