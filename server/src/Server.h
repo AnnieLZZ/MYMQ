@@ -329,21 +329,23 @@ public:
 
                         ClientStateMap::accessor ac;
                         if(map_client_states.find(ac,fd)){
-                            map_client_states.erase(fd);
+                            map_client_states.erase(ac);
                         }
                         else{
                             std::cerr << "[" << now_ms_time_gen_str() << "] [Error] FD '" << fd << "' NOT FOUND " << std::endl;
                         }
+
                         tbb::concurrent_hash_map<int, std::string>::accessor ac1;
                         if(map_clientid.find(ac1,fd)){
                             clientid_to_log=ac1->second;
-                            map_clientid.erase(fd);
+                            map_clientid.erase(ac1);
                         }
                         else{
                               std::cerr << "[" << now_ms_time_gen_str() << "] [Error] FD '" << fd<< "' NOT FOUND " << std::endl;
                         }
 
-                        out("[" + time + "][用户: " + clientid_to_log + "][状态：刚刚离线]" );
+
+                        out("[" + time + "][ClientID: " + clientid_to_log + "][State: Offline]" );
 
                         epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
                         shutdown(fd, SHUT_RDWR);
@@ -707,18 +709,18 @@ private:
 
 
 
-    // 内部辅助函数，用于客户端映射管理（假设 mtx_climap 已加锁）
-    void add_clientid(const std::string& id ,int sock){
-
+    void add_clientid(const std::string& id, int sock) {
         tbb::concurrent_hash_map<int, std::string>::accessor ac;
-        if(!map_clientid.find(ac,sock)){
-            map_clientid.insert(ac,sock);
-            ac->second=id;
+        if (!map_clientid.find(ac, sock)) {
+            map_clientid.insert(ac, sock);
+            ac->second = id;
+        } else {
+            if (ac->second != id) {
+                std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock
+                          << ") 更新 ID: " << ac->second << " -> " << id << std::endl;
+                ac->second = id;
+            }
         }
-        else{
-              std::cerr << "[" << now_ms_time_gen_str() << "] [Error] add_clientid FD '" << sock << "' ALREADY EXISTS " << std::endl;
-        }
-
     }
 
     // 内部辅助函数
@@ -732,79 +734,90 @@ private:
         }
     }
 
-    bool process_message(ClientState& state, int sock, Mybyte&& body,ClientStateMap::accessor& ac) {
-
-
+    bool register_clientid(ClientState& state, int sock, Mybyte&& body, ClientStateMap::accessor& ac){
         MessageParser mp(body);
+        bool success = 0;
+        bool should_close_connection = false; // 标记是否要关闭连接
+        uint32_t coid_to_send = state.correlation_id; // 先保存 coid
 
-        bool success=0;
-        if (!state.id_registered) {
-
-
-            if (static_cast<Eve>(state.event_type)  == Eve::CLIENT_REQUEST_REGISTER) {
-
-                std::string userid=mp.read_string();
-
-                if (userid.empty()) {
-                    std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 客户端 (FD: " << sock
-                              << ") 发送了空的注册ID。" << std::endl;
-                    return false; // ID 为空，关闭连接
-                }
-
+        if (static_cast<Eve>(state.event_type) == Eve::CLIENT_REQUEST_REGISTER) {
+            std::string userid = mp.read_string();
+            if (userid.empty()) {
+                std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 客户端 (FD: " << sock
+                          << ") 发送了空的注册ID。" << std::endl;
+                success = 0;
+                should_close_connection = true; // ID 为空，关闭连接
+            } else {
                 add_clientid(userid, sock);
-                state.clientid=userid;
-
-
+                state.clientid = userid;
                 state.id_registered = true; // 标记为已注册
-
-                success=1;
+                success = 1;
                 std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 '" << userid
                           << "' (FD: " << sock << ") 注册成功。" << std::endl;
-
-
-
-
-            } else {
-                // 错误：未注册的客户端发送了非注册事件
-                std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 客户端 (FD: " << sock
-                          << ") 尚未注册，但发送了事件: " << state.event_type << std::endl;
-               // 非法操作，关闭连接
             }
-
-
-            auto coid= state.correlation_id;
-            ac.release();
-
-            uint16_t placehold2 = UINT16_MAX;
-            MessageBuilder mb;
-            mb.append(success);
-            send_msg(sock, Eve::SERVER_RESPONSE_REGISTER,coid, placehold2, mb.data);
-            return success;
-
         } else {
-            // 状态：已注册
-            // 处理常规事件
+            // 错误：未注册的客户端发送了非注册事件
+            std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 客户端 (FD: " << sock
+                      << ") 尚未注册，但发送了事件: " << state.event_type << std::endl;
+            success = 0;
+            should_close_connection = true; // 非法操作，关闭连接
+        }
 
-            if (static_cast<Eve>(state.event_type)== MYMQ::EventType::CLIENT_REQUEST_REGISTER) {
-                // 错误：已注册的客户端尝试重复注册
-                std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 客户端 (FD: " << sock
-                          << ") 尝试重复注册。" << std::endl;
-                return false; // 重复注册，关闭连接
+        // --- 准备发送响应 ---
+        uint16_t placehold2 = UINT16_MAX;
+        MessageBuilder mb;
+        mb.append(success);
+
+        // ！！！关键修复 (1)！！！
+        // 在释放 ac 之前重置状态，为下一条消息做准备
+        if (!should_close_connection) {
+            state.current_state = ClientState::READING_HEADER;
+            state.bytes_read_in_header = 0;
+            state.expected_body_length = 0;
+            state.bytes_read_in_body = 0;
+        }
+
+        // ！！！关键修复 (2)！！！
+        // 释放锁，以便 send_msg 可以安全工作
+        ac.release();
+
+        // --- 发送响应 ---
+        send_msg(sock, Eve::SERVER_RESPONSE_REGISTER, coid_to_send, placehold2, mb.data);
+
+        return !should_close_connection; // 如果需要关闭，返回 false
+
+    }
+    bool process_message(ClientState& state, int sock, Mybyte&& body, ClientStateMap::accessor& ac) {
+        if (!state.id_registered) {
+           return   register_clientid(state,sock,std::move(body),ac);
+        } else {
+                      // 状态：已注册
+            if (static_cast<Eve>(state.event_type) == MYMQ::EventType::CLIENT_REQUEST_REGISTER) {//可能是客户端崩溃后但tcp检测到断联前再次重连，没必要回绝
+            return   register_clientid(state,sock,std::move(body),ac);
+
             }
 
+              MessageParser mp(body);
             // --- 常规事件处理 ---
+            auto event_type = state.event_type;
+            auto coid = state.correlation_id;
+            auto ack_level = state.ack_level;
+            auto clientid = state.clientid;
 
 
-            auto event_type=state.event_type;
-            auto coid=state.correlation_id;
-            auto ack_level=state.ack_level;
-            auto clientid=state.clientid;
+            state.current_state = ClientState::READING_HEADER;
+            state.bytes_read_in_header = 0;
+            state.expected_body_length = 0;
+            state.bytes_read_in_body = 0;
             ac.release();
-             auto real_body= mp.read_uchar_vector();
-            handle_event(clientid,event_type, std::move(real_body), sock ,coid,ack_level );
+
+            auto real_body = mp.read_uchar_vector();
+            handle_event(clientid, event_type, std::move(real_body), sock, coid, ack_level);
+
             return true;
         }
     }
+
 
     bool handle_client(int sock) {
         ClientStateMap::accessor ac;
@@ -816,152 +829,145 @@ private:
 
         ClientState& state = *(ac->second);
 
+        ssize_t bytes_read = 0;
 
+        // --- 状态 1: 正在读取头部 ---
+        if (state.current_state == ClientState::READING_HEADER) {
 
-        while (true) {
-            ssize_t bytes_read = 0;
-            switch (state.current_state) {
+            // 只有当消息头未完全读取时才调用 recv
+            if (state.bytes_read_in_header < HEADER_SIZE) {
+                bytes_read = recv(sock, reinterpret_cast<char*>(state.header_buffer.data() + state.bytes_read_in_header),
+                                  HEADER_SIZE - state.bytes_read_in_header, 0);
 
-                // READING_ID_LENGTH 和 READING_ID 状态已移除
+                if (bytes_read > 0) {
+                    state.bytes_read_in_header += bytes_read;
+                    if (state.bytes_read_in_header == HEADER_SIZE) {
+                        // --- 解析消息头 ---
+                        uint32_t total_length_net;
+                        memcpy(&total_length_net, state.header_buffer.data(), sizeof(uint32_t));
+                        uint32_t total_length = ntohl(total_length_net);
 
-                case ClientState::READING_HEADER: {
-                    // 只有当消息头未完全读取时才调用 recv
-                    if (state.bytes_read_in_header < HEADER_SIZE) {
-                        bytes_read = recv(sock, reinterpret_cast<char*>(state.header_buffer.data() + state.bytes_read_in_header),
-                                          HEADER_SIZE - state.bytes_read_in_header, 0);
+                        uint16_t event_type_net;
+                        memcpy(&event_type_net, state.header_buffer.data() + sizeof(uint32_t), sizeof(uint16_t));
+                        state.event_type = ntohs(event_type_net);
 
-                        if (bytes_read > 0) {
-                            state.bytes_read_in_header += bytes_read;
+                        uint32_t correlation_id_net;
+                        memcpy(&correlation_id_net, state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t), sizeof(uint32_t));
+                        state.correlation_id = ntohl(correlation_id_net);
 
-                            // 消息头刚刚读完
-                            if (state.bytes_read_in_header == HEADER_SIZE) {
-                                // --- 解析消息头 ---
-                                uint32_t total_length_net;
-                                memcpy(&total_length_net, state.header_buffer.data(), sizeof(uint32_t));
-                                uint32_t total_length = ntohl(total_length_net);
+                        uint16_t ack_level_net;
+                        memcpy(&ack_level_net, state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t), sizeof(uint16_t));
+                        state.ack_level = ntohs(ack_level_net);
 
-                                uint16_t event_type_net;
-                                memcpy(&event_type_net, state.header_buffer.data() + sizeof(uint32_t), sizeof(uint16_t));
-                                state.event_type = ntohs(event_type_net);
-
-                                uint32_t correlation_id_net;
-                                memcpy(&correlation_id_net, state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t), sizeof(uint32_t));
-                                state.correlation_id = ntohl(correlation_id_net);
-
-                                uint16_t ack_level_net;
-                                memcpy(&ack_level_net, state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t), sizeof(uint16_t));
-                                state.ack_level = ntohs(ack_level_net);
-
-                                // --- 验证消息头 ---
-                                if (total_length < HEADER_SIZE) {
-                                    std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到畸形消息 (FD: " << sock << "): total_length (" << total_length << ") < HEADER_SIZE (" << HEADER_SIZE << ")" << std::endl;
-                                    return false;
-                                }
-                                state.expected_body_length = total_length - HEADER_SIZE;
-
-                                if (state.expected_body_length > msg_body_limit) {
-                                    std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state.expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
-                                    return false;
-                                }
-
-                                // --- 状态转换 ---
-                                if (state.expected_body_length == 0) {
-                                    // 没有消息体，立即处理
-
-                                    if (!process_message(state, sock, Mybyte{},ac)) {
-                                        return false; // 处理失败，关闭连接
-                                    }
-                                    // 重置状态以处理下一条消息
-                                    state.bytes_read_in_header = 0;
-                                    // current_state 保持 READING_HEADER，继续循环
-                                } else {
-                                    // 有消息体，准备读取
-                                    state.body_buffer.clear();
-                                    state.bytes_read_in_body = 0;
-                                    state.current_state = ClientState::READING_BODY; // 状态转换
-                                }
-                            }
-                        } else if (bytes_read == 0) {
-                            std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 在读取头部时断开连接。" << std::endl;
-                            return false;
-                        } else { // bytes_read < 0
-                            if (errno == EINTR) continue;
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                return true; // 数据未就绪，等待下次epoll/select
-                            }
-                            perror("read header failed");
+                        // --- 验证消息头 ---
+                        if (total_length < HEADER_SIZE) {
+                            std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到畸形消息 (FD: " << sock << "): total_length (" << total_length << ") < HEADER_SIZE (" << HEADER_SIZE << ")" << std::endl;
                             return false;
                         }
-                    } else {
-                        // 如果 header 已经读满 (例如上一个循环中读完但没有 body)
-                        // 确保我们转换状态或重置
-                        if (state.expected_body_length > 0) {
-                            state.current_state = ClientState::READING_BODY;
+                        state.expected_body_length = total_length - HEADER_SIZE;
+
+                        if (state.expected_body_length > msg_body_limit) {
+                            std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state.expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
+                            return false;
+                        }
+
+
+                        // --- 状态转换 ---
+                        if (state.expected_body_length == 0) {
+                            // 没有消息体，立即处理
+                            // 注意：process_message 会释放 ac
+                            if (!process_message(state, sock, Mybyte{}, ac)) {
+                                return false; // ac 已被释放，处理失败
+                            }
+
+                            // ac 已被释放，必须立即返回
+                            return true;
+
                         } else {
-                            // 这种情况不应该发生，因为无 body 消息会立即重置
-                            state.bytes_read_in_header = 0;
+                            // 有消息体，准备读取
+                            state.body_buffer.clear();
+                            state.bytes_read_in_body = 0;
+                            state.current_state = ClientState::READING_BODY; // 状态转换
+                            // *不要*在这里 break，允许代码 "fall-through"
+                            // 去尝试读取 body（如果数据已可用）
                         }
                     }
-                    break;
-                } // 结束 case READING_HEADER
-
-                case ClientState::READING_BODY: {
-                    // 确保 buffer 至少有预期那么大
-                    if (state.body_buffer.size() < state.expected_body_length) {
-                        state.body_buffer.resize(state.expected_body_length);
-                    }
-
-                    if (state.bytes_read_in_body < state.expected_body_length) {
-                        bytes_read = recv(sock, reinterpret_cast<char*>(state.body_buffer.data() + state.bytes_read_in_body),
-                                          state.expected_body_length - state.bytes_read_in_body, 0);
-
-                        if (bytes_read > 0) {
-                            state.bytes_read_in_body += bytes_read;
-
-                            // 消息体刚刚读完
-                            if (state.bytes_read_in_body == state.expected_body_length) {
-                                // --- 处理消息 ---
-                                // 消息体完全接收，调用 process_message
-                                // 我们移动 body_buffer 以避免复制
-                                if (!process_message(state, sock, std::move(state.body_buffer),ac)) {
-                                    return false; // 处理失败，关闭连接
-                                }
-
-                                // --- 重置状态 ---
-                                // 为下一条消息做准备
-                                state.current_state = ClientState::READING_HEADER;
-                                state.bytes_read_in_header = 0;
-                                state.expected_body_length = 0;
-                                // state.body_buffer 已被移动，下次使用时在READING_HEADER中会clear()
-                                state.bytes_read_in_body = 0;
-                            }
-                        } else if (bytes_read == 0) {
-                            std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 在读取消息体时断开连接。" << std::endl;
-                            return false;
-                        } else { // bytes_read < 0
-                            if (errno == EINTR) continue;
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                return true; // 数据未就绪，等待下次
-                            }
-                            perror("read body failed");
-                            return false;
-                        }
-                    }
-                    break;
-                } // 结束 case READING_BODY
-
-                default:
-                    std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 未知客户端状态 (FD: " << sock << ") state: " << state.current_state << std::endl;
+                } else if (bytes_read == 0) {
+                    std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 在读取头部时断开连接。" << std::endl;
+                    ac.release();
                     return false;
-            } // 结束 switch
+                } else { // bytes_read < 0
+                    if (errno == EINTR) {
+                         // 只是被中断，下次 epoll 会再来
+                    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // 数据未就绪，等待下次epoll
+                    } else {
+                        perror("read header failed");
+                        ac.release();
+                        return false; // 真正发生错误
+                    }
+                    ac.release();
+                    return true; // 连接保持
+                }
+            }
+            // 如果 header 已经读满 (例如上一个if分支)，代码会自然落到下一个 if
+        } // 结束 READING_HEADER
 
-            // 如果我们没有因为 EAGAIN, 0 或 error 退出，
-            // 并且 bytes_read > 0，while(true) 循环将继续处理
-            // (例如：处理完一个无body消息，立即尝试读下一个header)
+        // --- 状态 2: 正在读取消息体 ---
+        // (注意：不是 else if，以便从 READING_HEADER fall-through)
+        if (state.current_state == ClientState::READING_BODY) {
 
-        } // 结束 while(true)
+            // 确保 buffer 至少有预期那么大
+            if (state.body_buffer.size() < state.expected_body_length) {
+                state.body_buffer.resize(state.expected_body_length);
+            }
+
+            if (state.bytes_read_in_body < state.expected_body_length) {
+                bytes_read = recv(sock, reinterpret_cast<char*>(state.body_buffer.data() + state.bytes_read_in_body),
+                                  state.expected_body_length - state.bytes_read_in_body, 0);
+
+                if (bytes_read > 0) {
+                    state.bytes_read_in_body += bytes_read;
+
+                    // 消息体刚刚读完
+                    if (state.bytes_read_in_body == state.expected_body_length) {
+
+                        // 注意：process_message 会释放 ac
+                        if (!process_message(state, sock, std::move(state.body_buffer), ac)) {
+                            return false; // ac 已被释放，处理失败
+                        }
+
+                        // ac 已被释放，必须立即返回
+                        return true;
+                    }
+                } else if (bytes_read == 0) {
+                    std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 在读取消息体时断开连接。" << std::endl;
+                    ac.release();
+                    return false;
+                } else { // bytes_read < 0
+                    if (errno == EINTR) {
+                        // 只是被中断
+                    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        // 数据未就绪
+                    } else {
+                        perror("read body failed");
+                        ac.release();
+                        return false; // 真正发生错误
+                    }
+                    ac.release();
+                    return true; // 连接保持
+                }
+            }
+        } // 结束 READING_BODY
+
+        // 如果代码执行到这里，意味着：
+        // 1. 没有发生错误
+        // 2. 没有完整的消息被处理 (否则我们已经 return 了)
+        // 3. 我们可能只读了部分数据，或者等待 EAGAIN
+        // 释放锁，保持连接
+        ac.release();
+        return true;
     }
-
 
     // 将客户端消息回调函数提交到线程池
     void handle_event(std::string clientid,short event_type, Mybyte msg_body, int client_fd,uint32_t correlation_id,uint16_t ack_level){
