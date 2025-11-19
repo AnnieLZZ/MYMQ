@@ -37,6 +37,7 @@ target_include_directories(mymq_lib
         "${TP_DIR}/tbb/include/oneapi"
         "${TP_DIR}/zlib/include"
         "${TP_DIR}/zstd/include"
+        "${TP_DIR}/openssl3/include"
         "${TP_DIR}/readerwriterqueue/include"
         "${TP_DIR}/nlohmann"
 )
@@ -52,6 +53,8 @@ target_link_libraries(mymq_lib
     # --- TBB (动态链接导入库) ---
     "${TP_DIR}/tbb/lib/libtbb12.dll.a"
     
+    "${TP_DIR}/openssl3/lib/libcrypto.dll.a"
+    "${TP_DIR}/openssl3/lib/libssl.dll.a"
     # --- 系统库 (Windows 网络库) ---
     ws2_32
     ssp
