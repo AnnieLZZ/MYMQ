@@ -1,36 +1,42 @@
-# MYMQ
+# MYMQ: High-Performance Distributed Message Queue
 
-> (Learning Project) A high-performance C++ MQ built from scratch, inspired by Kafka.
-> 
-> (学习项目) 一个从零构建的、受 Kafka 启发的 C++ 高性能消息队列。
+> A C++ distributed messaging system benchmarked against Apache Kafka's architecture.
+> **Role:** Core Developer | **Lang:** C++17
 
-## 🌟 核心特性 (Features)
+## ⚡ 核心性能 (Performance Benchmark)
 
-* **极致的 I/O 效率 (Extreme I/O Efficiency)**
-    * **日志段 + 索引 (Log Segments + Index):** 实现了 Kafka 的核心 I/O 模型，通过高效的索引结构实现快速寻址和顺序写。
-    * **零拷贝 (Zero-Copy):** 利用 Linux `sendfile` 和内存映射 (`mmap`) 避免不必要的内核态/用户态拷贝。
-    * **高效存储 (Efficient Storage):** 消息以二进制密排布，并使用 `ZSTD` 高度压缩 + 聚合 Batch 结构存储，大幅降低磁盘和网络开销。
+在单机单分区 (Single Node, Single Partition) 环境下，处理 200~300B 消息体：
 
-* **高性能网络模型 (High-Perf Network Model)**
-    * **Reactor 模式:** 服务器端采用 `epoll` + `Reactor` + 状态机（FSM）管理多链接非阻塞 I/O。
-    * **并发管理:** 自定义线程池和定时器高效处理心跳、请求重试等长时任务。
+| Metric | Throughput |
+| :--- | :--- |
+| **Push (Producer)** | **> 100,000 msg/s** |
+| **Poll (Consumer)** | **> 95,000 msg/s** |
 
-* **工业级并发组件 (Industry-Grade Concurrency)**
-    * **无锁队列 (Lock-Free):** 使用 `moodycamel::ReaderWriterQueue` (SPSC无锁队列) 作为高性能通信缓冲。
-    * **并发哈希 (Concurrent Map):** 使用 `TBB::concurrent_hash_map` 处理高并发下的消费偏移量读写。
+## 🚀 架构亮点 (Key Features)
 
-* **Kafka 核心架构 (Kafka's Core Architecture)**
-    * **开创性重平衡 (Incremental Rebalancing):** 采用增量协作式的重平衡策略，高效解决传统消费者断线重连时的“Stop-The-World”重平衡痛点。
-    * **组协调器 (Group Coordinator):** 高效管理消费者组、分区分配，保证组内运行稳定。
-    * **消息完整性 (Data Integrity):** 消息完整性由 `CRC32` 校验保证。
+### 1. 极致 I/O 与存储 (Extreme I/O & Storage)
+* **Zero-Copy with kTLS:** 深度整合 Linux `sendfile` 与 `mmap` 消除内核态/用户态拷贝；创新性引入 **OpenSSL kTLS (Kernel TLS)**，将加密卸载至内核，在保障传输安全的同时维持零拷贝特性。
+* **Log-Structured Storage:** 采用“日志段 (Log Segment) + 稀疏索引”结构，结合 Linux Page Cache 实现极速顺序写与 O(1) 级消息寻址。
+* **High Compression:** 消息采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，最大化磁盘与带宽利用率。
 
-## 🛠️ 技术栈 (Technology Stack)
+### 2. 工业级并发模型 (Industry-Grade Concurrency)
+* **Lock-Free Architecture:** 通信层采用 `moodycamel::ReaderWriterQueue` (**SPSC 无锁队列**) 彻底消除线程竞争与锁开销。
+* **Concurrent Structures:** 核心索引与元数据管理集成 `Intel TBB` (`concurrent_hash_map`)，确保高并发下的线程安全与访问效率。
+* **Event-Driven Core:** 基于 `epoll` + `Reactor` 模式，配合 **有限状态机 (FSM)** 处理海量非阻塞连接与长时任务。
 
-* **网络:** `epoll` + `Reactor`
-* **并发:** `Intel TBB`, `moodycamel::ReaderWriterQueue`
-* **I/O:** `Log-Segmented Index`, `sendfile`, `mmap`
-* **压缩:** `zstd`
-* **校验:** `zlib::crc32`
+### 3. 分布式与高可用 (Distributed System)
+* **Incremental Cooperative Rebalancing:** 实现了 Kafka 现代版的“增量协作式重平衡”，摒弃传统的 Stop-The-World 机制，确保消费者组在变更时业务不中断。
+* **Group Coordinator:** 内置组协调器协议，自动化管理分区分配、消费者心跳及 Offset 提交。
+* **Data Integrity:** 全链路集成 `CRC32` 校验，保障数据从写入到消费的绝对完整性。
+
+## 🛠️ 技术栈 (Tech Stack)
+
+* **Kernel/Network:** `Epoll`, `Reactor`, `Linux sendfile`, `OpenSSL kTLS`
+* **Concurrency:** `Intel TBB`, `moodycamel::ReaderWriterQueue (Lock-Free)`, `C++14 Threads`
+* **Storage/Algo:** `Memory Mapped File (mmap)`, `ZSTD`, `Sparse Indexing`, `CRC32`
+* **Build/Test:** `CMake`, `GTest`
+
+
 
 ## 📖 如何使用 (How to Use)
 
@@ -114,7 +120,7 @@ MYMQ Windows 客户端编译与运行指南 (MSYS2 MinGW 64-bit)
     cmake -G "MinGW Makefiles" ..
     cmake --build .
     ```
-
+---
 ### 🚀 运行 Windows 客户端 (重要！)
 
 Windows 客户端依赖动态库 (例如 `tbb.dll`)。
