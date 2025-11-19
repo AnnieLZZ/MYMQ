@@ -461,7 +461,7 @@ public:
           bytes_since_last_index_entry_(0) {
         init();
         if(recover()){
-            out(log_filepath+" : recover successfully");
+//            out(log_filepath+" : recover successfully");
         }
         else{
             cerr(log_filepath+" : recover failed");
