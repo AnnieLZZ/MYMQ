@@ -1,4 +1,3 @@
-# MYMQ
 # MYMQ: High-Performance Distributed Message Queue
 
 > A C++ distributed messaging system benchmarked against Apache Kafka's architecture.
