@@ -550,7 +550,7 @@ public:
     }
 
 
-    bool process_send_queue(int sock, ClientState& state, std::unique_lock<std::mutex>& ulock_send) {
+    bool process_send_queue(SSL* ssl, ClientState& state, std::unique_lock<std::mutex>& ulock_send) {
 
         // Loop while there are items in the queue
         while (!state.send_queue.empty()) {
@@ -561,142 +561,177 @@ public:
             bool should_break_and_wait = false; // Flag for EAGAIN/EWOULDBLOCK
 
             // std::visit logic is copied directly from your original code.
-            std::visit([&](auto&& arg) {
-                using T = std::decay_t<decltype(arg)>;
-
-                // --- 1. Handle sending a regular byte message ---
-                if constexpr (std::is_same_v<T, std::vector<unsigned char>>) {
-                    std::vector<unsigned char>& message = arg;
-                    const char* buffer_ptr = reinterpret_cast<const char*>(message.data() + state.current_vec_send_offset);
-                    size_t remaining_length = message.size() - state.current_vec_send_offset;
-
-                    ssize_t bytes_sent = send(sock, buffer_ptr, remaining_length, 0);
-
-                    if (bytes_sent < 0) {
-                        if (errno == EINTR) { return; } // Interrupted, just retry
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                            should_break_and_wait = true; // Buffer full
-                            return;
-                        }
-                        perror("send failed in process_send_queue for regular message");
-                        error_occurred = true;
-                        return;
-                    } else if (bytes_sent == 0) {
-                        std::cerr << "[" << now_ms_time_gen_str() << "][FD: " << sock << "] : send returned 0 bytes." << std::endl;
-                        error_occurred = true;
-                        return;
-                    } else {
-                        state.current_vec_send_offset += bytes_sent;
-                        if (state.current_vec_send_offset == message.size()) {
-                            item_sent_completely = true;
-                            state.current_vec_send_offset = 0; // Reset for next vector
-                        }
-                        // If partial send, item_sent_completely remains false
-                        // and we will loop again on the same item.
-                    }
-
-                // --- 2. Handle sending a SendFileTask (header + file) ---
-                } else if constexpr (std::is_same_v<T, ClientState::SendFileTask>) {
-                    ClientState::SendFileTask& task = arg;
-
-                    // --- 2a. Send the header first ---
-                    if (!task.header_sent) {
-                        if (task.header_data.empty()) {
 
 
-                            MessageBuilder mb_pull_inf_additional;
+            // std::visit logic
+                        std::visit([&](auto&& arg) {
+                            using T = std::decay_t<decltype(arg)>;
 
-                            mb_pull_inf_additional.append_short(static_cast<short>(Err::NULL_ERROR));
-                            mb_pull_inf_additional.append_size_t(task.offset_batch_first);
-                            mb_pull_inf_additional.append_string(task.topicname);
-                            mb_pull_inf_additional.append_size_t(task.partition);
-                            auto pull_inf_additional=std::move(mb_pull_inf_additional.data) ;
+                            // --- 1. Handle sending a regular byte message ---
+                            if constexpr (std::is_same_v<T, std::vector<unsigned char>>) {
+                                std::vector<unsigned char>& message = arg;
+                                const char* buffer_ptr = reinterpret_cast<const char*>(message.data() + state.current_vec_send_offset);
+                                size_t remaining_length = message.size() - state.current_vec_send_offset;
+                                size_t written_bytes = 0;
 
-                            MessageBuilder mb;
-                            mb.reserve(HEADER_SIZE +sizeof(short) +sizeof (size_t)+sizeof(uint32_t));
-                            uint32_t total_message_length =
-                                    static_cast<uint32_t>(HEADER_SIZE +pull_inf_additional.size()+sizeof(size_t)+ task.total_length);
-                            mb.append_uint32(total_message_length);
-                            mb.append_uint16(static_cast<uint16_t>(Eve::SERVER_RESPONSE_PULL_DATA));
-                            mb.append(task.correlation_id,task.ack_level);//6
-                            mb.append(pull_inf_additional);
-                            mb.append_uint32(static_cast<uint32_t>(task.total_length));
-                            task.header_data = std::move(mb.data);
-                            task.header_send_offset = 0;
-                        }
+                                // [Change 1] 使用 SSL_write_ex
+                                int ret = SSL_write_ex(ssl, buffer_ptr, remaining_length, &written_bytes);
 
-                        const char* buffer_ptr = reinterpret_cast<const char*>(task.header_data.data() + task.header_send_offset);
-                        size_t remaining_header_length = task.header_data.size() - task.header_send_offset;
-                        ssize_t bytes_sent_header = send(sock, buffer_ptr, remaining_header_length, 0);
+                                if (ret == 1) { // Success
+                                    state.current_vec_send_offset += written_bytes;
+                                    if (state.current_vec_send_offset == message.size()) {
+                                        item_sent_completely = true;
+                                        state.current_vec_send_offset = 0; // Reset for next usage if needed
+                                    }
+                                    // 如果没发完，item_sent_completely 为 false，下次循环继续
+                                } else { // Failure (ret == 0)
+                                    // [Change 2] 获取 OpenSSL 错误码，而不是直接看 errno
+                                    int err = SSL_get_error(ssl, 0);
 
-                        if (bytes_sent_header < 0) {
-                            if (errno == EINTR) { return; }
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                should_break_and_wait = true;
-                                return; // Wait for buffer
-                            }
-                            perror("send header failed");
-                            error_occurred = true;
-                            return;
-                        } else if (bytes_sent_header == 0) {
-                            std::cerr << "[" << now_ms_time_gen_str() << "][FD: " << sock << "] : send header returned 0 bytes." << std::endl;
-                            error_occurred = true;
-                            return;
-                        } else {
-                            task.header_send_offset += bytes_sent_header;
-                            if (task.header_send_offset == task.header_data.size()) {
-                                task.header_sent = true; // Header is fully sent
-                            } else {
-                                // Header partially sent, need to wait
-                                should_break_and_wait = true;
-                                return;
-                            }
-                        }
-                    } // end if (!task.header_sent)
+                                    switch (err) {
+                                        case SSL_ERROR_WANT_WRITE:
+                                        case SSL_ERROR_WANT_READ:
+                                            // 内核缓冲区满，或 SSL 握手/重协商需要读数据
+                                            should_break_and_wait = true;
+                                            return;
 
-                    // --- 2b. Send the file data (if header is sent) ---
-                    if (task.header_sent) {
-                        off_t current_file_offset_for_sendfile = task.offset + task.sent_so_far;
-                        size_t remaining_file_length = task.total_length - task.sent_so_far;
+                                        case SSL_ERROR_SYSCALL:
+                                            if (errno == EINTR) return; // 被信号中断，重试
+                                            // 真正的网络错误
+                                            perror("SSL_write_ex syscall failed");
+                                            error_occurred = true;
+                                            return;
 
-                        if (remaining_file_length == 0) {
-                            item_sent_completely = true; // Nothing left to send
-                            return;
-                        }
+                                        default:
+                                            // 协议层错误 (SSL_ERROR_SSL 等)
+                                            std::cerr << "SSL_write_ex error: " << err << std::endl;
+                                            error_occurred = true;
+                                            return;
+                                    }
+                                }
 
-                        // NOTE: Your original code's sendfile call is missing on some OSes.
-                        // This assumes a Linux-like sendfile.
-                        // If on Windows, you'd use TransmitFile.
-                        // Make sure this matches your OS.
-                        ssize_t bytes_sent_file = sendfile(sock, task.in_fd, &current_file_offset_for_sendfile, remaining_file_length);
+                            // --- 2. Handle sending a SendFileTask (header + file) ---
+                            } else if constexpr (std::is_same_v<T, ClientState::SendFileTask>) {
+                                ClientState::SendFileTask& task = arg;
 
-                        if (bytes_sent_file < 0) {
-                            if (errno == EINTR) { return; } // Retry
-                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                                should_break_and_wait = true; // Wait for buffer
-                                return;
-                            }
-                            perror("sendfile failed");
-                            error_occurred = true;
-                            return;
-                        } else if (bytes_sent_file == 0) {
-                            // This might happen if the file handle is weird,
-                            // but usually sendfile handles this.
-                            std::cerr << "[" << now_ms_time_gen_str() << "][FD: " << sock << "] : sendfile returned 0 bytes." << std::endl;
-                            error_occurred = true;
-                            return;
-                        } else {
-                            task.sent_so_far += bytes_sent_file;
-                            if (task.sent_so_far == task.total_length) {
-                                item_sent_completely = true; // File is complete
-                            }
-                            // If partial send, item_sent_completely remains false
-                        }
-                    } // end if (task.header_sent)
-                } // end of SendFileTask variant
-            }, current_item);
+                                // --- 2a. Send the header first ---
+                                if (!task.header_sent) {
+                                    // 构造 Header 的逻辑保持不变
+                                    if (task.header_data.empty()) {
+                                        MessageBuilder mb_pull_inf_additional;
+                                        mb_pull_inf_additional.append_short(static_cast<short>(Err::NULL_ERROR));
+                                        mb_pull_inf_additional.append_size_t(task.offset_batch_first);
+                                        mb_pull_inf_additional.append_string(task.topicname);
+                                        mb_pull_inf_additional.append_size_t(task.partition);
+                                        auto pull_inf_additional = std::move(mb_pull_inf_additional.data);
 
-            // --- Handle loop/state changes based on visit results ---
+                                        MessageBuilder mb;
+                                        mb.reserve(HEADER_SIZE + sizeof(short) + sizeof(size_t) + sizeof(uint32_t));
+                                        uint32_t total_message_length = static_cast<uint32_t>(HEADER_SIZE + pull_inf_additional.size() + sizeof(size_t) + task.total_length);
+
+                                        mb.append_uint32(total_message_length);
+                                        mb.append_uint16(static_cast<uint16_t>(Eve::SERVER_RESPONSE_PULL_DATA));
+                                        mb.append(task.correlation_id, task.ack_level);
+                                        mb.append(pull_inf_additional);
+                                        mb.append_uint32(static_cast<uint32_t>(task.total_length));
+
+                                        task.header_data = std::move(mb.data);
+                                        task.header_send_offset = 0;
+                                    }
+
+                                    const char* buffer_ptr = reinterpret_cast<const char*>(task.header_data.data() + task.header_send_offset);
+                                    size_t remaining_header_length = task.header_data.size() - task.header_send_offset;
+                                    size_t written_bytes = 0;
+
+                                    // [Change 3] Header 发送也改用 SSL_write_ex
+                                    int ret = SSL_write_ex(ssl, buffer_ptr, remaining_header_length, &written_bytes);
+
+                                    if (ret == 1) {
+                                        task.header_send_offset += written_bytes;
+                                        if (task.header_send_offset == task.header_data.size()) {
+                                            task.header_sent = true; // Header 发送完毕
+                                        } else {
+                                            should_break_and_wait = true; // 没发完通常意味着 buffer 满
+                                            return;
+                                        }
+                                    } else {
+                                        int err = SSL_get_error(ssl, 0);
+                                        switch (err) {
+                                            case SSL_ERROR_WANT_WRITE:
+                                            case SSL_ERROR_WANT_READ:
+                                                should_break_and_wait = true;
+                                                return;
+                                            case SSL_ERROR_SYSCALL:
+                                                if (errno == EINTR) return;
+                                                perror("send header failed");
+                                                error_occurred = true;
+                                                return;
+                                            default:
+                                                std::cerr << "SSL error sending header: " << err << std::endl;
+                                                error_occurred = true;
+                                                return;
+                                        }
+                                    }
+                                } // end if (!task.header_sent)
+
+                                // --- 2b. Send the file data (kTLS Zero-copy) ---
+                                if (task.header_sent) {
+                                    off_t current_file_offset = task.offset + task.sent_so_far;
+                                    size_t remaining_file_length = task.total_length - task.sent_so_far;
+
+                                    if (remaining_file_length == 0) {
+                                        item_sent_completely = true;
+                                        return;
+                                    }
+
+                                    // [Change 4] 使用 SSL_sendfile
+                                    // 1. offset 传值 (current_file_offset)，不是指针
+                                    // 2. flags 填 0
+                                    ossl_ssize_t bytes_sent_file = SSL_sendfile(ssl, task.in_fd, current_file_offset, remaining_file_length, 0);
+
+                                    if (bytes_sent_file > 0) {
+                                        task.sent_so_far += bytes_sent_file;
+                                        if (task.sent_so_far == task.total_length) {
+                                            item_sent_completely = true;
+                                        }
+                                        // 如果一次没发完（kTLS 分片限制或 buffer 限制），下次循环继续
+                                    } else {
+                                        // [Change 5] 处理 SSL_sendfile 的特定错误
+                                        int err = SSL_get_error(ssl, bytes_sent_file);
+
+                                        switch (err) {
+                                            case SSL_ERROR_NONE:
+                                                // 理论上 bytes_sent_file > 0 才会是 NONE，但为了稳健
+                                                break;
+
+                                            case SSL_ERROR_WANT_WRITE:
+                                            case SSL_ERROR_WANT_READ:
+                                            case SSL_ERROR_WANT_ASYNC: // kTLS 可能会用到
+                                                should_break_and_wait = true;
+                                                return;
+
+                                            case SSL_ERROR_SYSCALL:
+                                                if (errno == EINTR) return;
+                                                // 某些情况下 sendfile 底层返回 EAGAIN 会被转为 SYSCALL + errno
+                                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                                    should_break_and_wait = true;
+                                                    return;
+                                                }
+                                                perror("SSL_sendfile failed");
+                                                error_occurred = true;
+                                                return;
+
+                                            default:
+                                                std::cerr << "SSL_sendfile error: " << err << std::endl;
+                                                error_occurred = true;
+                                                return;
+                                        }
+                                    }
+                                } // end if (task.header_sent)
+                            } // end of SendFileTask variant
+                        }, current_item);
+
+
 
             if (error_occurred) {
                 // Unrecoverable error. Clear queue, unregister, return false.
@@ -704,7 +739,7 @@ public:
                 state.is_writing = false;
 
                 ulock_send.unlock(); // Release lock to update epoll
-                update_epoll_events(sock, EPOLLIN | EPOLLET); // Remove EPOLLOUT
+                update_epoll_events(SSL_get_fd(ssl), EPOLLIN | EPOLLET); // Remove EPOLLOUT
                 ulock_send.lock();   // Re-acquire lock
 
                 return false; // Signal to close connection
@@ -735,7 +770,7 @@ public:
         state.is_writing = false;
 
         ulock_send.unlock(); // Release lock to update epoll
-        update_epoll_events(sock, EPOLLIN | EPOLLET); // Remove EPOLLOUT
+        update_epoll_events(SSL_get_fd(ssl), EPOLLIN | EPOLLET); // Remove EPOLLOUT
         ulock_send.lock();   // Re-acquire lock
 
         return true; // Connection is alive
@@ -771,7 +806,7 @@ public:
             return true;
         }
 
-        bool is_alive = process_send_queue(sock, state, ulock_send);
+        bool is_alive = process_send_queue(state.ssl, state, ulock_send);
 
         return is_alive;
     }
@@ -940,133 +975,196 @@ private:
         ssize_t bytes_read = 0;
 
         // --- 状态 1: 正在读取头部 ---
-        if (state->current_state == ClientState::READING_HEADER) {
+        // 只有当消息头未完全读取时才调用 SSL_read_ex
+                if (state->bytes_read_in_header < HEADER_SIZE) {
 
-            // 只有当消息头未完全读取时才调用 recv
-            if (state->bytes_read_in_header < HEADER_SIZE) {
-                bytes_read = recv(sock, reinterpret_cast<char*>(state->header_buffer.data() + state->bytes_read_in_header),
-                                  HEADER_SIZE - state->bytes_read_in_header, 0);
+                    size_t bytes_read_this_time = 0;
+                    // 【改动 1】使用 SSL_read_ex
+                    // buf: 计算当前缓冲区的偏移位置
+                    // len: 还需要读多少字节
+                    int ret = SSL_read_ex(state->ssl,
+                                          reinterpret_cast<char*>(state->header_buffer.data() + state->bytes_read_in_header),
+                                          HEADER_SIZE - state->bytes_read_in_header,
+                                          &bytes_read_this_time);
 
-                if (bytes_read > 0) {
-                    state->bytes_read_in_header += bytes_read;
-                    if (state->bytes_read_in_header == HEADER_SIZE) {
-                        // --- 解析消息头 ---
-                        uint32_t total_length_net;
-                        memcpy(&total_length_net, state->header_buffer.data(), sizeof(uint32_t));
-                        uint32_t total_length = ntohl(total_length_net);
+                    if (ret == 1) { // 【成功读取】 (ret == 1)
+                        state->bytes_read_in_header += bytes_read_this_time;
 
-                        uint16_t event_type_net;
-                        memcpy(&event_type_net, state->header_buffer.data() + sizeof(uint32_t), sizeof(uint16_t));
-                        state->event_type = ntohs(event_type_net);
+                        if (state->bytes_read_in_header == HEADER_SIZE) {
+                            // --- 解析消息头 ---
+                            uint32_t total_length_net;
+                            memcpy(&total_length_net, state->header_buffer.data(), sizeof(uint32_t));
+                            uint32_t total_length = ntohl(total_length_net);
 
-                        uint32_t correlation_id_net;
-                        memcpy(&correlation_id_net, state->header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t), sizeof(uint32_t));
-                        state->correlation_id = ntohl(correlation_id_net);
+                            uint16_t event_type_net;
+                            memcpy(&event_type_net, state->header_buffer.data() + sizeof(uint32_t), sizeof(uint16_t));
+                            state->event_type = ntohs(event_type_net);
 
-                        uint16_t ack_level_net;
-                        memcpy(&ack_level_net, state->header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t), sizeof(uint16_t));
-                        state->ack_level = ntohs(ack_level_net);
+                            uint32_t correlation_id_net;
+                            memcpy(&correlation_id_net, state->header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t), sizeof(uint32_t));
+                            state->correlation_id = ntohl(correlation_id_net);
 
-                        // --- 验证消息头 ---
-                        if (total_length < HEADER_SIZE) {
-                            std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到畸形消息 (FD: " << sock << "): total_length (" << total_length << ") < HEADER_SIZE (" << HEADER_SIZE << ")" << std::endl;
-                            return false;
-                        }
-                        state->expected_body_length = total_length - HEADER_SIZE;
+                            uint16_t ack_level_net;
+                            memcpy(&ack_level_net, state->header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t), sizeof(uint16_t));
+                            state->ack_level = ntohs(ack_level_net);
 
-                        if (state->expected_body_length > msg_body_limit) {
-                            std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state->expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
-                            return false;
-                        }
+                            // --- 验证消息头 ---
+                            if (total_length < HEADER_SIZE) {
+                                std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到畸形消息 (FD: " << sock << "): total_length (" << total_length << ") < HEADER_SIZE (" << HEADER_SIZE << ")" << std::endl;
+                                return false;
+                            }
+                            state->expected_body_length = total_length - HEADER_SIZE;
 
-
-                        // --- 状态转换 ---
-                        if (state->expected_body_length == 0) {
-                            // 没有消息体，立即处理
-                            // 注意：process_message 会释放 ac
-                            if (!process_message(state, sock, Mybyte{}, ac)) {
-                                return false; // ac 已被释放，处理失败
+                            if (state->expected_body_length > msg_body_limit) {
+                                std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state->expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
+                                return false;
                             }
 
-                            // ac 已被释放，必须立即返回
-                            return true;
+                            // --- 状态转换 ---
+                            if (state->expected_body_length == 0) {
+                                // 没有消息体，立即处理
+                                // 注意：process_message 会释放 ac
+                                if (!process_message(state, sock, Mybyte{}, ac)) {
+                                    return false; // ac 已被释放，处理失败
+                                }
+                                // ac 已被释放，必须立即返回
+                                return true;
 
-                        } else {
-                            // 有消息体，准备读取
-                            state->body_buffer.clear();
-                            state->bytes_read_in_body = 0;
-                            state->current_state = ClientState::READING_BODY; // 状态转换
-                            // *不要*在这里 break，允许代码 "fall-through"
-                            // 去尝试读取 body（如果数据已可用）
+                            } else {
+                                // 有消息体，准备读取
+                                state->body_buffer.clear();
+                                // 预分配内存优化性能（可选）
+                                state->body_buffer.resize(state->expected_body_length);
+                                state->bytes_read_in_body = 0;
+                                state->current_state = ClientState::READING_BODY; // 状态转换
+
+                                // *不要*在这里 break/return，允许代码 "fall-through"
+                                // 去尝试读取 body（如果数据在同一个 TCP 包里已可用）
+                            }
+                        }
+                    } else { // 【读取失败或需要等待】 (ret == 0)
+                        // 【改动 2】使用 SSL_get_error 进行错误判定
+                        int err = SSL_get_error(state->ssl, 0); // 传入 0 因为 SSL_read_ex 返回了 0
+
+                        switch (err) {
+                            case SSL_ERROR_WANT_READ:
+                            case SSL_ERROR_WANT_WRITE:
+                                // 非阻塞 IO 核心逻辑：
+                                // OpenSSL 告诉我们需要更多数据(WANT_READ)或者需要写数据(WANT_WRITE)才能继续
+                                // 这不是错误，而是“请稍后再试”
+                                ac.release();
+                                return true; // 保持连接，等待下一次 epoll 事件
+
+                            case SSL_ERROR_ZERO_RETURN:
+                                // 对端优雅关闭了 TLS 连接 (close_notify)
+                                std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 断开连接 (TLS Close Notify)。" << std::endl;
+                                ac.release();
+                                return false; // 关闭连接
+
+                            case SSL_ERROR_SYSCALL:
+                                // 系统调用错误，检查 errno
+                                if (errno == EINTR) {
+                                    // 被信号中断，通常可以忽略或重试，这里选择返回等待下次循环
+                                    ac.release();
+                                    return true;
+                                }
+                                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                    // 理论上 SSL_ERROR_WANT_READ 会覆盖这种情况，但为了保险保留
+                                    ac.release();
+                                    return true;
+                                }
+                                // 真正的网络错误 (如 Connection reset by peer)
+                                perror("read header syscall failed");
+                                ac.release();
+                                return false;
+
+                            default:
+                                // 其他 SSL 协议错误 (SSL_ERROR_SSL)
+                                std::cerr << "[" << now_ms_time_gen_str() << "] [错误] SSL_read_ex error code: " << err << std::endl;
+                                ac.release();
+                                return false;
                         }
                     }
-                } else if (bytes_read == 0) {
-                    std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 在读取头部时断开连接。" << std::endl;
-                    ac.release();
-                    return false;
-                } else { // bytes_read < 0
-                    if (errno == EINTR) {
-                        // 只是被中断，下次 epoll 会再来
-                    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        // 数据未就绪，等待下次epoll
-                    } else {
-                        perror("read header failed");
-                        ac.release();
-                        return false; // 真正发生错误
-                    }
-                    ac.release();
-                    return true; // 连接保持
                 }
-            }
-            // 如果 header 已经读满 (例如上一个if分支)，代码会自然落到下一个 if
-        } // 结束 READING_HEADER
+                // 如果 header 已经读满，代码逻辑会自然向下流动（fall-through）
 
         // --- 状态 2: 正在读取消息体 ---
-        // (注意：不是 else if，以便从 READING_HEADER fall-through)
-        if (state->current_state == ClientState::READING_BODY) {
+                if (state->current_state == ClientState::READING_BODY) {
 
-            // 确保 buffer 至少有预期那么大
-            if (state->body_buffer.size() < state->expected_body_length) {
-                state->body_buffer.resize(state->expected_body_length);
-            }
+                            // 确保 buffer 至少有预期那么大
+                            if (state->body_buffer.size() < state->expected_body_length) {
+                                state->body_buffer.resize(state->expected_body_length);
+                            }
 
-            if (state->bytes_read_in_body < state->expected_body_length) {
-                bytes_read = recv(sock, reinterpret_cast<char*>(state->body_buffer.data() + state->bytes_read_in_body),
-                                  state->expected_body_length - state->bytes_read_in_body, 0);
+                            if (state->bytes_read_in_body < state->expected_body_length) {
 
-                if (bytes_read > 0) {
-                    state->bytes_read_in_body += bytes_read;
+                                size_t bytes_read_this_time = 0;
+                                // 【改动 1】使用 SSL_read_ex
+                                int ret = SSL_read_ex(state->ssl,
+                                                      reinterpret_cast<char*>(state->body_buffer.data() + state->bytes_read_in_body),
+                                                      state->expected_body_length - state->bytes_read_in_body,
+                                                      &bytes_read_this_time);
 
-                    // 消息体刚刚读完
-                    if (state->bytes_read_in_body == state->expected_body_length) {
+                                if (ret == 1) { // 【读取成功】
+                                    state->bytes_read_in_body += bytes_read_this_time;
 
-                        // 注意：process_message 会释放 ac
-                        if (!process_message(state, sock, std::move(state->body_buffer), ac)) {
-                            return false; // ac 已被释放，处理失败
-                        }
+                                    // 消息体刚刚读完
+                                    if (state->bytes_read_in_body == state->expected_body_length) {
 
-                        // ac 已被释放，必须立即返回
-                        return true;
-                    }
-                } else if (bytes_read == 0) {
-                    std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 在读取消息体时断开连接。" << std::endl;
-                    ac.release();
-                    return false;
-                } else { // bytes_read < 0
-                    if (errno == EINTR) {
-                        // 只是被中断
-                    } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        // 数据未就绪
-                    } else {
-                        perror("read body failed");
-                        ac.release();
-                        return false; // 真正发生错误
-                    }
-                    ac.release();
-                    return true; // 连接保持
-                }
-            }
-        } // 结束 READING_BODY
+                                        // 注意：process_message 会释放 ac
+                                        if (!process_message(state, sock, std::move(state->body_buffer), ac)) {
+                                            return false; // ac 已被释放，处理失败
+                                        }
+
+                                        // ac 已被释放，必须立即返回
+                                        return true;
+                                    }
+                                    // 如果还没读完，继续下一次循环或等待下一次 epoll 事件
+                                    // 这里通常需要释放 ac 并返回 true，等待下次数据
+                                    ac.release();
+                                    return true;
+
+                                } else { // 【读取返回 0 或 状态码】
+                                    // 【改动 2】使用 SSL_get_error
+                                    int err = SSL_get_error(state->ssl, 0);
+
+                                    switch (err) {
+                                        case SSL_ERROR_WANT_READ:
+                                        case SSL_ERROR_WANT_WRITE:
+                                            // 数据未就绪 (EAGAIN/EWOULDBLOCK 的等价状态)
+                                            // 保持连接，释放 ac 防止函数结束时关闭 socket (如果 ac 是这种机制的话)
+                                            ac.release();
+                                            return true;
+
+                                        case SSL_ERROR_ZERO_RETURN:
+                                            // 对端关闭连接
+                                            std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 在读取消息体时断开连接 (TLS Close)。" << std::endl;
+                                            ac.release();
+                                            return false;
+
+                                        case SSL_ERROR_SYSCALL:
+                                            if (errno == EINTR) {
+                                                // 信号中断，重试或等待
+                                                ac.release();
+                                                return true;
+                                            }
+                                            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                                                // 理论上 WANT_READ 会处理，但作为兜底
+                                                ac.release();
+                                                return true;
+                                            }
+                                            perror("read body syscall failed");
+                                            ac.release();
+                                            return false;
+
+                                        default:
+                                            std::cerr << "[" << now_ms_time_gen_str() << "] [错误] SSL_read_ex body error: " << err << std::endl;
+                                            ac.release();
+                                            return false;
+                                    }
+                                }
+                            }
+                        } // 结束 READING_BODY
 
         // 如果代码执行到这里，意味着：
         // 1. 没有发生错误
