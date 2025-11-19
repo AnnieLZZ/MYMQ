@@ -195,15 +195,23 @@ public:
 
         {//KTLS
             ctx = SSL_CTX_new(TLS_server_method());
+             SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
 
             // 加载证书 (必须)
-            SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM);
-            SSL_CTX_use_PrivateKey_file(ctx, "server.key", SSL_FILETYPE_PEM);
+             if (SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM) <= 0 ||
+                 SSL_CTX_use_PrivateKey_file(ctx, "server.key", SSL_FILETYPE_PEM) <= 0) {
+                 cerr("Error loading cert/key") ;
+                 throw std::runtime_error("Error loading cert/key");
+             }
 
             // 【核心步骤】告诉 OpenSSL 我们想要使用 Kernel TLS
             SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
-            // 建议强制指定支持 kTLS 的加密套件 (AES-GCM)
-            SSL_CTX_set_cipher_list(ctx, "AES128-GCM-SHA256");
+            //指定支持 kTLS 的加密套件 (AES-GCM)
+            if (SSL_CTX_set_ciphersuites(ctx, "TLS_AES_256_GCM_SHA384") != 1) {
+               throw std::runtime_error("Error setting TLS 1.3 ciphersuites");
+            }
+
+            SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
         }
 
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -1105,7 +1113,7 @@ private:
 
     std::mutex mtx_epoll_ctl;
 
-    SSL_CTX* ctx;
+    SSL_CTX* ctx=nullptr;
 
 
 };
