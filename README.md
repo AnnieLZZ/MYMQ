@@ -32,7 +32,7 @@
 ## 🛠️ 技术栈 (Tech Stack)
 
 * **Kernel/Network:** `Epoll`, `Reactor`, `Linux sendfile`, `OpenSSL kTLS`
-* **Concurrency:** `Intel TBB`, `moodycamel::ReaderWriterQueue (Lock-Free)`, `C++11 Threads`
+* **Concurrency:** `Intel TBB`, `moodycamel::ReaderWriterQueue (Lock-Free)`, `C++14 Threads`
 * **Storage/Algo:** `Memory Mapped File (mmap)`, `ZSTD`, `Sparse Indexing`, `CRC32`
 * **Build/Test:** `CMake`, `GTest`
 
