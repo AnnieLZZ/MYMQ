@@ -25,6 +25,9 @@
 #include "tbb/concurrent_hash_map.h"
 #include "ThreadPool.h"
 #include"Printqueue.h"
+#include<openssl/ssl.h>
+#include<openssl/err.h>
+
 
 // Link with Ws2_32.lib
 #pragma comment(lib, "Ws2_32.lib")
@@ -121,6 +124,19 @@ public:
         }
 
 
+        ctx_ = SSL_CTX_new(TLS_client_method());
+        if (!ctx_) throw std::runtime_error("Unable to create SSL context");
+
+        if (SSL_CTX_set_ciphersuites(ctx_, "TLS_AES_256_GCM_SHA384") != 1) {
+            throw std::runtime_error("Error setting TLS 1.3 ciphersuites");
+        }
+
+        SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION);
+
+        // 如果是自签名证书或测试环境，可以暂时跳过验证（生产环境建议开启验证）
+        SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, NULL);
+        // ---------------------------------------------------
+
         WSADATA wsaData;
         int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
         if (iResult != 0) throw std::runtime_error("WSAStartup failed: " + std::to_string(iResult));
@@ -138,6 +154,22 @@ public:
             throw std::runtime_error("ioctlsocket() failed: " + std::to_string(lastError));
         }
 
+        // [NEW] 2. 创建 SSL 对象并绑定 Socket
+        // 注意：此时还没有握手，只是将 SSL 结构绑定到 socket fd 上
+        // ---------------------------------------------------
+        ssl_ = SSL_new(ctx_);
+        if (!ssl_) throw std::runtime_error("Unable to create SSL object");
+
+        // 设置 SNI (Server Name Indication)，某些服务器如果没有这个会握手失败
+        SSL_set_tlsext_host_name(ssl_, server_IP.c_str());
+
+        // 将 SSL 对象绑定到 Windows 的 socket
+        SSL_set_fd(ssl_, clientSocket);
+
+        // 设为连接状态 (Client Mode)
+        SSL_set_connect_state(ssl_);
+        // ---------------------------------------------------
+
         sockaddr_in serverAddr;
         serverAddr.sin_family = AF_INET;
         serverAddr.sin_port = htons(port);
@@ -148,11 +180,13 @@ public:
             throw std::runtime_error("Invalid IP address or inet_pton failed for IP: " + server_IP);
         }
 
+        // [IMPORTANT] TCP 连接逻辑
         iResult = connect(clientSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr));
         if (iResult == SOCKET_ERROR) {
             int lastError = WSAGetLastError();
             if (lastError == WSAEWOULDBLOCK || lastError == WSAEINPROGRESS) {
                 connect_pending_.store(true);
+                // 注意：这里不能立即进行 SSL_connect，因为 TCP 还没通
             } else {
                 closesocket(clientSocket);
                 WSACleanup();
@@ -162,6 +196,10 @@ public:
             std::cout << "Connection with server built" << std::endl;
             connection_established_.store(true);
             connect_pending_.store(false);
+
+            // 如果 TCP 既然已经立即连上了（极少见，但在本地可能发生），
+            // 这里依然不能直接阻塞调用 SSL_connect，建议留给 io_loop 处理，
+            // 或者在这里尝试一次非阻塞握手。
         }
 
         running_.store(true);
@@ -220,8 +258,10 @@ public:
 private:
     // 尝试发送队列中的消息 (logic unchanged)
     void attemped_send() {
-        if (!connection_established_.load()) {
-            send_pending.store(false);
+        // [修改 1] 必须等待 SSL 握手完成才能发送数据
+        if (!connection_established_.load() || !ssl_handshaked_) {
+            // 如果只是握手还没好，保持 send_pending 为 true，下一轮继续尝试
+            // send_pending.store(false); // 不要轻易关掉，否则可能漏发
             return;
         }
 
@@ -234,24 +274,25 @@ private:
             const char* byte_to_send = reinterpret_cast<const char*>(msg.data() + off);
             size_t bytes_remaining = msg.size() - off;
 
-            int res = send(clientSocket, byte_to_send, bytes_remaining, 0);
+            // [修改 2] 使用 SSL_write
+            int res = SSL_write(ssl_, byte_to_send, static_cast<int>(bytes_remaining));
 
-            if (res == SOCKET_ERROR) {
-                int lastError = WSAGetLastError();
-                if (lastError == WSAEWOULDBLOCK) {
+            if (res <= 0) {
+                // [修改 3] SSL 错误处理逻辑
+                int err = SSL_get_error(ssl_, res);
+                if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                    // 底层缓冲区满，稍后重试 (相当于 WSAEWOULDBLOCK)
                     return;
                 } else {
-                    std::cerr << "[" << now_ms_time_gen_str() << "] send failed with error for client_id: " << lastError << std::endl;
+                    // 真正的错误或连接关闭
+                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL_write failed for client_id. Error code: " << err << std::endl;
+                    ERR_print_errors_fp(stderr); // 打印详细 OpenSSL 错误栈
                     client_id_message_to_send_.reset();
                     running_.store(false);
                     return;
                 }
-            } else if (res == 0) {
-                std::cerr << "[" << now_ms_time_gen_str() << "] Connection closed by peer during client_id send." << std::endl;
-                client_id_message_to_send_.reset();
-                running_.store(false);
-                return;
             } else {
+                // 发送成功 res > 0
                 off += res;
                 if (off == msg.size()) {
                     std::cout << "[" << now_ms_time_gen_str() << "] Client ID message fully sent." << std::endl;
@@ -260,6 +301,7 @@ private:
             }
         }
 
+        // 如果 Client ID 还没发完，就先别发后面的
         if (client_id_message_to_send_.has_value()) {
             send_pending.store(true);
             return;
@@ -270,8 +312,9 @@ private:
             return;
         }
 
+        // 2. 发送队列消息
         while (true) {
-            PendingMessage* current_msg_ptr = send_queue.peek(); // 改为 PendingMessage*
+            PendingMessage* current_msg_ptr = send_queue.peek();
             if (current_msg_ptr == nullptr) break;
 
             auto& msg = current_msg_ptr->message_bytes;
@@ -280,48 +323,52 @@ private:
             const char* byte_to_send = reinterpret_cast<const char*>(msg.data() + off);
             size_t bytes_remaining = msg.size() - off;
 
-            int res = send(clientSocket, byte_to_send, bytes_remaining, 0);
+            // [修改 4] 使用 SSL_write
+            int res = SSL_write(ssl_, byte_to_send, static_cast<int>(bytes_remaining));
 
-            if (res == SOCKET_ERROR) {
-                int lastError = WSAGetLastError();
-                if (lastError == WSAEWOULDBLOCK) {
+            if (res <= 0) {
+                int err = SSL_get_error(ssl_, res);
+                if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                    // 缓冲区满，退出循环，等待下次 write 事件
                     break;
                 } else {
-                    std::cerr << "[" << now_ms_time_gen_str() << "] send failed with error: " << lastError << std::endl;
+                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL_write failed. Error code: " << err << std::endl;
+                    ERR_print_errors_fp(stderr);
+
+                    // 移除坏掉的消息并停止
                     PendingMessage dummy;
                     send_queue.try_dequeue(dummy);
                     running_.store(false);
                     return;
                 }
-            } else if (res == 0) {
-                std::cerr << "[" << now_ms_time_gen_str() << "] Connection closed by peer during send (returned 0 bytes)." << std::endl;
-                PendingMessage dummy;
-                send_queue.try_dequeue(dummy);
-                running_.store(false);
-                return;
             } else {
+                // 发送成功
                 off += res;
                 if (off == msg.size()) {
+                    // --- 消息发送完毕逻辑 (保持原样) ---
                     tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
                     map_wait_responces.insert(acc, current_msg_ptr->coid);
                     acc->second = std::move(current_msg_ptr->handler);
                     acc.release();
 
-                    // 2. 启动定时器
-                    auto coid=current_msg_ptr->coid;
-                    timer.commit_s([this, coid]{ // 捕获 coid
+                    // 启动定时器
+                    auto coid = current_msg_ptr->coid;
+                    timer.commit_s([this, coid]{
                         tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc_timer;
                         if( map_wait_responces.find(acc_timer, coid)){
-                            cerr("[Request Time out] Correlationid : "+std::to_string(coid));
+                            std::cerr << "[Request Time out] Correlationid : " << std::to_string(coid) << std::endl;
                             map_wait_responces.erase(acc_timer);
                         }
                     }, request_timeout_s, request_timeout_s, 1);
 
-                    // 3. 将消息出队
+                    // 将消息出队
                     PendingMessage dummy;
                     send_queue.try_dequeue(dummy);
                 }
                 else {
+                    // 没发完 (Partial write)，但 OpenSSL 可能因为底层机制而返回
+                    // 此时不能 continue 死循环，因为如果底层还是满的，会空转 CPU
+                    // 对于 SSL 来说，最好 break 出去重新让 select 调度
                     break;
                 }
             }
@@ -330,7 +377,7 @@ private:
         send_pending.store(client_id_message_to_send_.has_value() || send_queue.peek() != nullptr);
     }
 
-    // (logic unchanged)
+
     void send_client_id_on_connect() {
         if (client_id_sent_.load()) return;
 
@@ -354,7 +401,6 @@ private:
         client_id_sent_.store(true);
     }
 
-    // (logic unchanged)
     void io_loop() {
         FD_SET read_fds, write_fds;
         timeval timeout;
@@ -363,17 +409,38 @@ private:
             FD_ZERO(&read_fds);
             FD_ZERO(&write_fds);
 
-            if (connection_established_.load()) {
-                FD_SET(clientSocket, &read_fds);
-            }
+            // ============================================================
+            // 1. 构建 select 监听集合 (根据当前状态机决定监听什么)
+            // ============================================================
 
-            if (send_pending.load() || connect_pending_.load()) {
+            // 状态 A: TCP 正在连接中 (还没有建立 TCP 连接)
+            if (connect_pending_.load()) {
                 FD_SET(clientSocket, &write_fds);
             }
+            // 状态 B: TCP 已连接，但 SSL 正在握手中
+            else if (connection_established_.load() && !ssl_handshaked_) {
+                // 握手阶段：完全听从 OpenSSL 的指挥 (它想读就监听读，想写就监听写)
+                if (ssl_want_read_) FD_SET(clientSocket, &read_fds);
+                if (ssl_want_write_) FD_SET(clientSocket, &write_fds);
+            }
+            // 状态 C: SSL 握手完成，进入正常业务数据传输
+            else if (ssl_handshaked_) {
+                // 始终监听读 (服务器可能随时推数据或断开)
+                FD_SET(clientSocket, &read_fds);
 
+                // 只有当我们有数据要发送时，才监听写
+                if (send_pending.load()) {
+                    FD_SET(clientSocket, &write_fds);
+                }
+            }
+
+            // ============================================================
+            // 2. 执行 Select
+            // ============================================================
             timeout.tv_sec = 0;
             timeout.tv_usec = 10000; // 10ms
 
+            // 注意：Windows下 select 第一个参数会被忽略，但在 Linux 下需要是 maxfd + 1
             int result = select(0, &read_fds, &write_fds, nullptr, &timeout);
 
             if (result == SOCKET_ERROR) {
@@ -386,6 +453,9 @@ private:
 
             if (result == 0) continue;
 
+            // ============================================================
+            // 3. 处理 TCP 连接完成事件
+            // ============================================================
             if (connect_pending_.load() && FD_ISSET(clientSocket, &write_fds)) {
                 int opt_val;
                 int opt_len = sizeof(opt_val);
@@ -396,9 +466,13 @@ private:
                 }
 
                 if (opt_val == 0) {
-                    std::cout << "[" << now_ms_time_gen_str() << "] Non-blocking connect successful." << std::endl;
+                    std::cout << "[" << now_ms_time_gen_str() << "] TCP Connected. Starting SSL Handshake..." << std::endl;
                     connection_established_.store(true);
                     connect_pending_.store(false);
+
+                    // [关键点] TCP 连上后，立即请求一次“写”权限来触发 SSL_connect
+                    ssl_want_write_ = true;
+                    ssl_want_read_ = false;
                 } else {
                     std::cerr << "[" << now_ms_time_gen_str() << "] Non-blocking connect failed with error: " << opt_val << std::endl;
                     running_.store(false);
@@ -406,45 +480,109 @@ private:
                 }
             }
 
-            if (connection_established_.load() && !client_id_sent_.load()) {
-                send_client_id_on_connect();
-                attemped_send();
-            }
-            else if (connection_established_.load() && FD_ISSET(clientSocket, &write_fds) && send_pending.load()) {
-                attemped_send();
+            // ============================================================
+            // 4. 处理 SSL 握手 (Handshake)
+            // ============================================================
+            if (connection_established_.load() && !ssl_handshaked_) {
+                // 只要 socket 可读或可写，且 OpenSSL 之前要求了对应的事件，就尝试继续握手
+                bool ready_read = FD_ISSET(clientSocket, &read_fds);
+                bool ready_write = FD_ISSET(clientSocket, &write_fds);
+
+                if ((ready_read && ssl_want_read_) || (ready_write && ssl_want_write_)) {
+                    int ret = SSL_connect(ssl_);
+
+                    if (ret == 1) {
+                        std::cout << "[" << now_ms_time_gen_str() << "] SSL/TLS Handshake Success!" << std::endl;
+                        ssl_handshaked_ = true;
+                        // 握手成功，重置握手状态标志，避免干扰后续业务
+                        ssl_want_read_ = false;
+                        ssl_want_write_ = false;
+                    } else {
+                        int err = SSL_get_error(ssl_, ret);
+                        if (err == SSL_ERROR_WANT_READ) {
+                            ssl_want_read_ = true;
+                            ssl_want_write_ = false;
+                        } else if (err == SSL_ERROR_WANT_WRITE) {
+                            ssl_want_write_ = true;
+                            ssl_want_read_ = false;
+                        } else {
+                            std::cerr << "[" << now_ms_time_gen_str() << "] SSL Handshake Failed. Error code: " << err << std::endl;
+                            ERR_print_errors_fp(stderr);
+                            running_.store(false);
+                            break;
+                        }
+                    }
+                }
             }
 
-            if (connection_established_.load() && FD_ISSET(clientSocket, &read_fds)) {
-                if (!handle_incoming_data(static_cast<int>(clientSocket))) {
-                    running_.store(false);
-                    break;
+            // ============================================================
+            // 5. 处理 业务逻辑 (仅在 SSL 握手成功后)
+            // ============================================================
+            if (ssl_handshaked_) {
+
+                // --- A. 自动触发发送 Client ID ---
+                // 握手刚完成时，client_id_sent_ 为 false，立即触发构建消息
+                if (!client_id_sent_.load()) {
+                    send_client_id_on_connect();
+                    // 消息构建完后，立刻尝试发送，不需要等下一轮 select
+                    // 因为 send_client_id_on_connect 只是把数据放进内存，attemped_send 负责 SSL_write
+                    attemped_send();
+                }
+
+                // --- B. 处理写事件 (发送队列中的数据) ---
+                else if (FD_ISSET(clientSocket, &write_fds) && send_pending.load()) {
+                    // 此时 attemped_send 内部已经是 SSL_write 了
+                    attemped_send();
+                }
+
+                // --- C. 处理读事件 (接收服务器响应) ---
+                if (FD_ISSET(clientSocket, &read_fds)) {
+                    // 此时 handle_incoming_data 内部已经是 SSL_read 了
+                    if (!handle_incoming_data()) {
+                        running_.store(false);
+                        break;
+                    }
                 }
             }
         }
+
         std::cout << "[" << now_ms_time_gen_str() << "] Client I/O loop stopped." << std::endl;
     }
-
-
-    bool handle_incoming_data(int sock) {
+    bool handle_incoming_data() {
         char buffer[4096];
-        int bytes_received = recv(sock, buffer, sizeof(buffer), 0);
 
-        if (bytes_received == SOCKET_ERROR) {
-            int lastError = WSAGetLastError();
-            if (lastError == WSAEWOULDBLOCK) return true; // 非阻塞，正常返回
-            std::cerr << "[" << now_ms_time_gen_str() << "] Error receiving data: " << lastError << std::endl;
-            return false; // 真正发生错误
+        // [修改 1] 使用 SSL_read 替代 recv
+        int bytes_received = SSL_read(ssl_, buffer, sizeof(buffer));
+
+        // [修改 2] SSL 特有的错误/状态处理
+        if (bytes_received <= 0) {
+            int err = SSL_get_error(ssl_, bytes_received);
+
+            // 类似于 WSAEWOULDBLOCK，表示底层缓存空了，等待下次 select
+            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+                return true;
+            }
+            // 服务器优雅关闭了 SSL 连接
+            else if (err == SSL_ERROR_ZERO_RETURN) {
+                std::cout << "[" << now_ms_time_gen_str() << "] Server closed SSL connection gracefully." << std::endl;
+                return false;
+            }
+            // 真正的错误
+            else {
+                std::cerr << "[" << now_ms_time_gen_str() << "] SSL_read failed. Error code: " << err << std::endl;
+                ERR_print_errors_fp(stderr); // 打印 OpenSSL 错误队列
+                return false;
+            }
         }
-        if (bytes_received == 0) {
-            std::cout << "[" << now_ms_time_gen_str() << "] Server closed connection gracefully." << std::endl;
-            return false; // 连接已关闭
-        }
+
+        // --------------------------------------------------------------
+        // 下面的逻辑是你原有的代码，完全保持不变 (解析协议、处理粘包)
+        // --------------------------------------------------------------
 
         // 跟踪我们在 buffer 中处理了多少字节
         int bytes_processed = 0;
 
         // 只要 buffer 中还有未处理的数据，就持续循环
-        // 这可以正确处理“粘包”（一个 buffer 里有多条消息）
         while (bytes_processed < bytes_received) {
 
             if (client_state.current_state == ClientState::READING_HEADER) {
@@ -468,7 +606,7 @@ private:
 
                 // 6. 检查头部是否已完整
                 if (client_state.received_bytes == HEADER_SIZE) {
-                    // --- 你的头部解析逻辑（完全不变） ---
+                    // --- 你的头部解析逻辑 ---
                     uint32_t total_length_net;
                     memcpy(&total_length_net, client_state.header_buffer.data(), sizeof(uint32_t));
                     uint32_t total_length = ntohl(total_length_net);
@@ -499,7 +637,7 @@ private:
                         client_state.received_bytes = 0; // 重置计数器，准备接收 body
                     } else {
                         // 没有 body，直接处理事件
-                        handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, Mybyte{}, sock);
+                        handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, Mybyte{});
                         client_state.reset(HEADER_SIZE); // 重置状态机
                     }
                 }
@@ -525,23 +663,22 @@ private:
 
                 // 6. 检查 body 是否已完整
                 if (client_state.received_bytes == client_state.expected_body_length) {
-                    // --- 你的 body 处理逻辑（完全不变） ---
+                    // --- 你的 body 处理逻辑 ---
                     if (!is_registered) {
                         if (static_cast<Eve>(client_state.event_type) == MYMQ::EventType::SERVER_RESPONSE_REGISTER) {
-                             MP mp(client_state.body_buffer);
+                            MP mp(client_state.body_buffer);
                             auto content=  mp.read_uchar_vector();
                             MP mp_content(content);
                             auto succ= mp_content.read_bool();
-                             std::string resp;
+                            std::string resp;
                             resp+="Register result : '"+client_id_str+"' register ";
-                             if(succ){
+                            if(succ){
                                 is_registered = 1;
-                                 resp+="success";
-                             }
-                             else{
-                                 resp+="failed";
-                             }
-
+                                resp+="success";
+                            }
+                            else{
+                                resp+="failed";
+                            }
 
                             out(resp);
 
@@ -553,10 +690,10 @@ private:
                             std::cerr << "[" << now_ms_time_gen_str() << "] Already registered but received  Event 'REGISTER'" << std::endl;
                         } else {
                             if (client_state.event_type == static_cast<uint16_t>(MYMQ::EventType::SERVER_RESPONSE_PULL_DATA)) {
-                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(client_state.body_buffer), sock);
+                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(client_state.body_buffer));
                             } else {
                                 MP mp(client_state.body_buffer);
-                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(mp.read_uchar_vector()), sock);
+                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(mp.read_uchar_vector()));
                             }
                         }
                     }
@@ -567,8 +704,7 @@ private:
 
         return true;
     }
-
-    void handle_event(uint16_t eventtype, uint32_t correlation_id, uint16_t ack_level, Mybyte msg_body, int client_fd) {
+    void handle_event(uint16_t eventtype, uint32_t correlation_id, uint16_t ack_level, Mybyte msg_body) {
         tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
 
         if (map_wait_responces.find(acc, correlation_id)) {
@@ -625,6 +761,16 @@ private:
 
     std::atomic<uint32_t> Correlation_ID{0};
     Timer timer;
+
+    SSL_CTX* ctx_ = nullptr;
+    SSL* ssl_ = nullptr;
+
+    // 用于标记 SSL 握手是否完成
+    std::atomic<bool> ssl_handshake_complete_{false};
+
+    bool ssl_handshaked_ = false;    // 标记 SSL 握手是否完成
+    bool ssl_want_read_ = false;     // 握手过程中 SSL 是否在等待读
+    bool ssl_want_write_ = true;     // 握手过程中 SSL 是否在等待写 (初始为 true 以启动握手)
 
 };
 
