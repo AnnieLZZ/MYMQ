@@ -23,7 +23,7 @@ MYMQ_Client::ClientErrorCode MYMQ_Client::commit_async(const MYMQ_Public::TopicP
 
 MYMQ_Client::ClientErrorCode MYMQ_Client::push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value
                                                ,MYMQ_Public::SupportedCallbacks cb) {
-    return pimpl->push(tp, key, value);
+    return pimpl->push(tp, key, value,cb);
 }
 
 std::pair<std::queue<MYMQ_Client::ConsumerRecord>, MYMQ_Client::ClientErrorCode> MYMQ_Client::pull(const MYMQ_Public::TopicPartition& tp) {

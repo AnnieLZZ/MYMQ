@@ -518,7 +518,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
             auto tmp_ack_level=ack_level;
             if(!inrange(tmp_ack_level,0,2)){
-                ack_level=MYMQ::ack_level_DEFAULT;
+                tmp_ack_level=MYMQ::ack_level_DEFAULT;
             }
             cmc_.set_ACK_level(static_cast<MYMQ::ACK_Level>(tmp_ack_level));
             ack_level_=static_cast<MYMQ::ACK_Level>(tmp_ack_level);

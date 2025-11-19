@@ -248,7 +248,7 @@ int main(){
     out("\nThroughput test finished."); // 吞吐量测试结束。
 
 
-    mc.leave_group("testgroup");
+    // mc.leave_group("testgroup");
 
 
     std::cin.get(); // 保持控制台打开

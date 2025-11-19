@@ -127,11 +127,12 @@ public:
         ctx_ = SSL_CTX_new(TLS_client_method());
         if (!ctx_) throw std::runtime_error("Unable to create SSL context");
 
-        if (SSL_CTX_set_ciphersuites(ctx_, "TLS_AES_256_GCM_SHA384") != 1) {
+        if (SSL_CTX_set_ciphersuites(ctx_, "TLS_AES_128_GCM_SHA256") != 1) {
             throw std::runtime_error("Error setting TLS 1.3 ciphersuites");
         }
 
-        SSL_CTX_set_min_proto_version(ctx_, TLS1_3_VERSION);
+        SSL_CTX_set_min_proto_version(ctx_, TLS1_2_VERSION);
+        SSL_CTX_set_max_proto_version(ctx_, TLS1_2_VERSION);
 
         // 如果是自签名证书或测试环境，可以暂时跳过验证（生产环境建议开启验证）
         SSL_CTX_set_verify(ctx_, SSL_VERIFY_NONE, NULL);
@@ -210,8 +211,7 @@ public:
         ack_level=set;
     }
 
-    // [!_MODIFIED_!] Accepts the new, simplified ResponseCallback
-    uint32_t send_msg(short event_type, const Mybyte& msg_body, ResponseCallback handler) {
+    uint32_t send_msg(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler) {
         MessageBuilder mb;
         uint32_t coid = Correlation_ID.fetch_add(1); // Get new COID
         uint32_t total_length_on_wire = static_cast<uint32_t>(HEADER_SIZE +sizeof(uint32_t)+ msg_body.size());
@@ -255,13 +255,14 @@ public:
         client_id_str = clientid;
     }
 
+    void send_msg_prior(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler){
+
+    }
+
 private:
     // 尝试发送队列中的消息 (logic unchanged)
     void attemped_send() {
-        // [修改 1] 必须等待 SSL 握手完成才能发送数据
         if (!connection_established_.load() || !ssl_handshaked_) {
-            // 如果只是握手还没好，保持 send_pending 为 true，下一轮继续尝试
-            // send_pending.store(false); // 不要轻易关掉，否则可能漏发
             return;
         }
 
@@ -274,10 +275,10 @@ private:
             const char* byte_to_send = reinterpret_cast<const char*>(msg.data() + off);
             size_t bytes_remaining = msg.size() - off;
 
-            // [修改 2] 使用 SSL_write
-            int res = SSL_write(ssl_, byte_to_send, static_cast<int>(bytes_remaining));
+            size_t real_send_bytes=0;
+            int res = SSL_write_ex(ssl_, byte_to_send, static_cast<int>(bytes_remaining),&real_send_bytes);
 
-            if (res <= 0) {
+            if (res ==0) {
                 // [修改 3] SSL 错误处理逻辑
                 int err = SSL_get_error(ssl_, res);
                 if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
@@ -292,8 +293,8 @@ private:
                     return;
                 }
             } else {
-                // 发送成功 res > 0
-                off += res;
+                // 发送成功 res =1
+                off += real_send_bytes;
                 if (off == msg.size()) {
                     std::cout << "[" << now_ms_time_gen_str() << "] Client ID message fully sent." << std::endl;
                     client_id_message_to_send_.reset();
@@ -323,10 +324,10 @@ private:
             const char* byte_to_send = reinterpret_cast<const char*>(msg.data() + off);
             size_t bytes_remaining = msg.size() - off;
 
-            // [修改 4] 使用 SSL_write
-            int res = SSL_write(ssl_, byte_to_send, static_cast<int>(bytes_remaining));
+            size_t real_send_bytes=0;
+            int res = SSL_write_ex(ssl_, byte_to_send, static_cast<int>(bytes_remaining),&real_send_bytes);
 
-            if (res <= 0) {
+            if (res==0) {
                 int err = SSL_get_error(ssl_, res);
                 if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
                     // 缓冲区满，退出循环，等待下次 write 事件
@@ -343,7 +344,7 @@ private:
                 }
             } else {
                 // 发送成功
-                off += res;
+                off += real_send_bytes;
                 if (off == msg.size()) {
                     // --- 消息发送完毕逻辑 (保持原样) ---
                     tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
@@ -383,14 +384,14 @@ private:
 
 
         MessageBuilder mb_full;
-        short event_type = static_cast<short>(Eve::CLIENT_REQUEST_REGISTER);
+        uint16_t event_type = static_cast<uint16_t>(Eve::CLIENT_REQUEST_REGISTER);
         uint32_t total_length_on_wire = static_cast<uint32_t>(HEADER_SIZE + sizeof(uint32_t) +client_id_str.size());
         mb_full.reserve(total_length_on_wire);
 
         ////HEADER
         mb_full.append_uint32(total_length_on_wire);
         mb_full.append_uint16(event_type);
-        mb_full.append_uint32(Correlation_ID++); // Fire-and-forget
+        mb_full.append_uint32(Correlation_ID++);
         mb_full.append_uint16(static_cast<uint16_t>(ack_level));
         ////HEADER
         mb_full.append_string(client_id_str);
@@ -525,7 +526,6 @@ private:
                 if (!client_id_sent_.load()) {
                     send_client_id_on_connect();
                     // 消息构建完后，立刻尝试发送，不需要等下一轮 select
-                    // 因为 send_client_id_on_connect 只是把数据放进内存，attemped_send 负责 SSL_write
                     attemped_send();
                 }
 
@@ -551,159 +551,158 @@ private:
     bool handle_incoming_data() {
         char buffer[4096];
 
-        // [修改 1] 使用 SSL_read 替代 recv
-        int bytes_received = SSL_read(ssl_, buffer, sizeof(buffer));
+        // 【核心修改】死循环读取，直到 SSL 说没数据 (WANT_READ)
+        while (true) {
+            size_t bytes_received = 0;
+            int ret = SSL_read_ex(ssl_, buffer, sizeof(buffer), &bytes_received);
 
-        // [修改 2] SSL 特有的错误/状态处理
-        if (bytes_received <= 0) {
-            int err = SSL_get_error(ssl_, bytes_received);
+            // ---------------------------------------------------------
+            //情况 A: 读取失败或需要等待 (ret == 0)
+            // ---------------------------------------------------------
+            if (ret == 0) {
+                int err_code = SSL_get_error(ssl_, bytes_received);
 
-            // 类似于 WSAEWOULDBLOCK，表示底层缓存空了，等待下次 select
-            if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
-                return true;
-            }
-            // 服务器优雅关闭了 SSL 连接
-            else if (err == SSL_ERROR_ZERO_RETURN) {
-                std::cout << "[" << now_ms_time_gen_str() << "] Server closed SSL connection gracefully." << std::endl;
-                return false;
-            }
-            // 真正的错误
-            else {
-                std::cerr << "[" << now_ms_time_gen_str() << "] SSL_read failed. Error code: " << err << std::endl;
-                ERR_print_errors_fp(stderr); // 打印 OpenSSL 错误队列
-                return false;
-            }
-        }
+                if (err_code == SSL_ERROR_WANT_READ || err_code == SSL_ERROR_WANT_WRITE) {
+                    // [重点] 缓冲区空了，可以安全退出循环，回到 select 等待下一次通知
+                    return true;
+                }
 
-        // --------------------------------------------------------------
-        // 下面的逻辑是你原有的代码，完全保持不变 (解析协议、处理粘包)
-        // --------------------------------------------------------------
+                switch (err_code) {
+                case SSL_ERROR_ZERO_RETURN:
+                    // 对端 Graceful Close
+                    cerr("The connection has been closed normally by the other party.");
+                    running_.store(false);
+                    return false; // 停止 io_loop
 
-        // 跟踪我们在 buffer 中处理了多少字节
-        int bytes_processed = 0;
+                case SSL_ERROR_SYSCALL:
+                    // 网络中断或强制断开
+                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL Syscall error (Network broken)." << std::endl;
+                    running_.store(false);
+                    return false; // 不要 throw，返回 false 让外层退出
 
-        // 只要 buffer 中还有未处理的数据，就持续循环
-        while (bytes_processed < bytes_received) {
+                case SSL_ERROR_SSL:
+                    // 协议错误
+                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL Protocol error." << std::endl;
+                    ERR_print_errors_fp(stderr);
+                    running_.store(false);
+                    return false;
 
-            if (client_state.current_state == ClientState::READING_HEADER) {
-                // 1. 计算还需要多少字节来填满头部
-                int bytes_needed = HEADER_SIZE - client_state.received_bytes;
-
-                // 2. 计算此 buffer 中还剩多少字节可用
-                int bytes_available = bytes_received - bytes_processed;
-
-                // 3. 确定我们这次实际能复制多少（取两者中的较小值）
-                int bytes_to_copy = (bytes_needed < bytes_available) ? bytes_needed : bytes_available;
-
-                // 4. 批量复制数据到 header_buffer
-                memcpy(client_state.header_buffer.data() + client_state.received_bytes,
-                       buffer + bytes_processed,
-                       bytes_to_copy);
-
-                // 5. 更新计数器
-                client_state.received_bytes += bytes_to_copy;
-                bytes_processed += bytes_to_copy;
-
-                // 6. 检查头部是否已完整
-                if (client_state.received_bytes == HEADER_SIZE) {
-                    // --- 你的头部解析逻辑 ---
-                    uint32_t total_length_net;
-                    memcpy(&total_length_net, client_state.header_buffer.data(), sizeof(uint32_t));
-                    uint32_t total_length = ntohl(total_length_net);
-
-                    if (total_length < HEADER_SIZE) {
-                        std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到畸形消息: total_length (" << total_length << ") < HEADER_SIZE (" << HEADER_SIZE << ")" << std::endl;
-                        return false; // 致命协议错误
-                    }
-
-                    uint16_t event_type_net;
-                    memcpy(&event_type_net, client_state.header_buffer.data() + sizeof(uint32_t), sizeof(uint16_t));
-                    client_state.event_type = ntohs(event_type_net);
-
-                    uint32_t correlation_id_net;
-                    memcpy(&correlation_id_net, client_state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t), sizeof(uint32_t));
-                    client_state.correlation_id = ntohl(correlation_id_net);
-
-                    uint16_t ack_level_net;
-                    memcpy(&ack_level_net, client_state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t), sizeof(uint16_t));
-                    client_state.ack_level = ntohs(ack_level_net);
-
-                    client_state.expected_body_length = total_length - HEADER_SIZE;
-                    // --- 头部解析逻辑结束 ---
-
-                    if (client_state.expected_body_length > 0) {
-                        client_state.body_buffer.resize(client_state.expected_body_length);
-                        client_state.current_state = ClientState::READING_BODY;
-                        client_state.received_bytes = 0; // 重置计数器，准备接收 body
-                    } else {
-                        // 没有 body，直接处理事件
-                        handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, Mybyte{});
-                        client_state.reset(HEADER_SIZE); // 重置状态机
-                    }
+                default:
+                    cerr("UNKNOWN ERROR IN SSL_read_ex : " + std::to_string(err_code));
+                    running_.store(false);
+                    return false;
                 }
             }
-            else if (client_state.current_state == ClientState::READING_BODY) {
-                // 1. 计算还需要多少字节来填满 body
-                int bytes_needed = client_state.expected_body_length - client_state.received_bytes;
 
-                // 2. 计算此 buffer 中还剩多少字节可用
-                int bytes_available = bytes_received - bytes_processed;
+            // ---------------------------------------------------------
+            // 情况 B: 成功读取到数据 (ret == 1)
+            // ---------------------------------------------------------
+            else if (ret == 1) {
+                int bytes_processed = 0;
 
-                // 3. 确定我们这次实际能复制多少
-                int bytes_to_copy = (bytes_needed < bytes_available) ? bytes_needed : bytes_available;
+                // 处理当前 buffer 中的所有数据
+                while (bytes_processed < bytes_received) {
 
-                // 4. 批量复制数据到 body_buffer
-                memcpy(client_state.body_buffer.data() + client_state.received_bytes,
-                       buffer + bytes_processed,
-                       bytes_to_copy);
+                    // --- 1. 读头部 ---
+                    if (client_state.current_state == ClientState::READING_HEADER) {
+                        int bytes_needed = HEADER_SIZE - client_state.received_bytes;
+                        int bytes_available = bytes_received - bytes_processed;
+                        int bytes_to_copy = (bytes_needed < bytes_available) ? bytes_needed : bytes_available;
 
-                // 5. 更新计数器
-                client_state.received_bytes += bytes_to_copy;
-                bytes_processed += bytes_to_copy;
+                        memcpy(client_state.header_buffer.data() + client_state.received_bytes,
+                               buffer + bytes_processed,
+                               bytes_to_copy);
 
-                // 6. 检查 body 是否已完整
-                if (client_state.received_bytes == client_state.expected_body_length) {
-                    // --- 你的 body 处理逻辑 ---
-                    if (!is_registered) {
-                        if (static_cast<Eve>(client_state.event_type) == MYMQ::EventType::SERVER_RESPONSE_REGISTER) {
-                            MP mp(client_state.body_buffer);
-                            auto content=  mp.read_uchar_vector();
-                            MP mp_content(content);
-                            auto succ= mp_content.read_bool();
-                            std::string resp;
-                            resp+="Register result : '"+client_id_str+"' register ";
-                            if(succ){
-                                is_registered = 1;
-                                resp+="success";
-                            }
-                            else{
-                                resp+="failed";
+                        client_state.received_bytes += bytes_to_copy;
+                        bytes_processed += bytes_to_copy;
+
+                        if (client_state.received_bytes == HEADER_SIZE) {
+                            // 解析头部
+                            uint32_t total_length_net;
+                            memcpy(&total_length_net, client_state.header_buffer.data(), sizeof(uint32_t));
+                            uint32_t total_length = ntohl(total_length_net);
+
+                            if (total_length < HEADER_SIZE) {
+                                cerr("[" + now_ms_time_gen_str() + "] [Error] Malformed msg. Length: " + std::to_string(total_length));
+                                return false;
                             }
 
-                            out(resp);
+                            uint16_t event_type_net;
+                            memcpy(&event_type_net, client_state.header_buffer.data() + sizeof(uint32_t), sizeof(uint16_t));
+                            client_state.event_type = ntohs(event_type_net);
 
-                        } else {
-                            std::cerr << "[" << now_ms_time_gen_str() << "] Not yet registered but received  Event :" << MYMQ::to_string(static_cast<Eve>(client_state.event_type)) << std::endl;
-                        }
-                    } else {
-                        if (static_cast<Eve>(client_state.event_type) == MYMQ::EventType::SERVER_RESPONSE_REGISTER) {
-                            std::cerr << "[" << now_ms_time_gen_str() << "] Already registered but received  Event 'REGISTER'" << std::endl;
-                        } else {
-                            if (client_state.event_type == static_cast<uint16_t>(MYMQ::EventType::SERVER_RESPONSE_PULL_DATA)) {
-                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(client_state.body_buffer));
+                            uint32_t correlation_id_net;
+                            memcpy(&correlation_id_net, client_state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t), sizeof(uint32_t));
+                            client_state.correlation_id = ntohl(correlation_id_net);
+
+                            uint16_t ack_level_net;
+                            memcpy(&ack_level_net, client_state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t), sizeof(uint16_t));
+                            client_state.ack_level = ntohs(ack_level_net);
+
+                            client_state.expected_body_length = total_length - HEADER_SIZE;
+
+                            if (client_state.expected_body_length > 0) {
+                                client_state.body_buffer.resize(client_state.expected_body_length);
+                                client_state.current_state = ClientState::READING_BODY;
+                                client_state.received_bytes = 0;
                             } else {
-                                MP mp(client_state.body_buffer);
-                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(mp.read_uchar_vector()));
+                                // Header Only 消息处理
+                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, Mybyte{});
+                                client_state.reset(HEADER_SIZE);
                             }
                         }
                     }
-                    client_state.reset(HEADER_SIZE);
+                    // --- 2. 读包体 ---
+                    else if (client_state.current_state == ClientState::READING_BODY) {
+                        int bytes_needed = client_state.expected_body_length - client_state.received_bytes;
+                        int bytes_available = bytes_received - bytes_processed;
+                        int bytes_to_copy = (bytes_needed < bytes_available) ? bytes_needed : bytes_available;
+
+                        memcpy(client_state.body_buffer.data() + client_state.received_bytes,
+                               buffer + bytes_processed,
+                               bytes_to_copy);
+
+                        client_state.received_bytes += bytes_to_copy;
+                        bytes_processed += bytes_to_copy;
+
+                        if (client_state.received_bytes == client_state.expected_body_length) {
+                            // 完整消息处理
+                            if (!is_registered) {
+                                if (static_cast<Eve>(client_state.event_type) == MYMQ::EventType::SERVER_RESPONSE_REGISTER) {
+                                    MP mp(client_state.body_buffer);
+                                    auto content = mp.read_uchar_vector();
+                                    MP mp_content(content);
+                                    auto succ = mp_content.read_bool();
+                                    std::string resp = "Register result : '" + client_id_str + "' register ";
+                                    if (succ) {
+                                        is_registered = 1;
+                                        resp += "success";
+                                    } else {
+                                        resp += "failed";
+                                    }
+                                    out(resp);
+                                } else {
+                                    std::cerr << "[" << now_ms_time_gen_str() << "] Not yet registered but received Event." << std::endl;
+                                }
+                            } else {
+
+                                if (client_state.event_type == static_cast<uint16_t>(MYMQ::EventType::SERVER_RESPONSE_PULL_DATA)) {
+                                    handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(client_state.body_buffer));
+                                } else {
+                                    MP mp(client_state.body_buffer);
+                                    handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(mp.read_uchar_vector()));
+                                }
+                            }
+
+                            client_state.reset(HEADER_SIZE);
+                        }
+                    }
                 }
+                continue;
             }
         }
-
-        return true;
     }
+
     void handle_event(uint16_t eventtype, uint32_t correlation_id, uint16_t ack_level, Mybyte msg_body) {
         tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
 
@@ -713,9 +712,9 @@ private:
             cb(eventtype,std::move(msg_body) );
    }
         else {
-            std::cerr << "[" << now_ms_time_gen_str() << "] Received response for unknown or expired correlation_id: "
-                      << correlation_id
-                      << " Event: " << MYMQ::to_string(static_cast<Eve>(eventtype)) << std::endl;
+            cerr("[" + now_ms_time_gen_str() + "] Received response for unknown or expired correlation_id: "
+                +std:: to_string(correlation_id)+ " Event: " + MYMQ::to_string(static_cast<Eve>(eventtype)));
+
         }
     }
 
