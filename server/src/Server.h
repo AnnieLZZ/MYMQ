@@ -152,6 +152,11 @@ public:
 
             ClientState() = default;
         };
+    enum class IOStatus {
+        OK_WAITING,      // 数据读完了/未就绪，等待下次 Epoll (对应之前的 return true)
+        OK_COMPLETED,    // 成功处理完一条完整消息，【必须立即尝试读取下一条】
+        ERROR_DEAD       // 发生致命错误，断开连接 (对应之前的 return false)
+    };
 
     using ClientStateMap=tbb::concurrent_hash_map<int, std::unique_ptr<ClientState>>;
 
@@ -191,11 +196,19 @@ public:
         check_connect_liveness_ms=cm.getint("livenesscheck_ms");
     }
 
-    void initialize(){
-
+    void initialize(){//linux 4.18 can only use ktls 1.2
+        std::cout << "[Runtime OpenSSL Version]: " << OpenSSL_version(OPENSSL_VERSION) << std::endl;
+        std::cout << "[Compile-time OpenSSL Header]: " << OPENSSL_VERSION_TEXT << std::endl;
         {//KTLS
             ctx = SSL_CTX_new(TLS_server_method());
-             SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+//             SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+//                        SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+
+            SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+            SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+
+            // 加密套件也配合改一下，确保兼容
+
 
             // 加载证书 (必须)
              if (SSL_CTX_use_certificate_file(ctx, "server.crt", SSL_FILETYPE_PEM) <= 0 ||
@@ -205,13 +218,27 @@ public:
              }
 
             // 【核心步骤】告诉 OpenSSL 我们想要使用 Kernel TLS
-            SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
-            //指定支持 kTLS 的加密套件 (AES-GCM)
-            if (SSL_CTX_set_ciphersuites(ctx, "TLS_AES_256_GCM_SHA384") != 1) {
-               throw std::runtime_error("Error setting TLS 1.3 ciphersuites");
-            }
 
-            SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+             long options = SSL_CTX_set_options(ctx, SSL_OP_ENABLE_KTLS);
+
+             // 检查返回值是否包含了 SSL_OP_ENABLE_KTLS 标志
+             if (options & SSL_OP_ENABLE_KTLS) {
+                 cerr("SSL_OP_ENABLE_KTLS option successfully set.");
+             } else {
+                throw std::runtime_error("Failed to open ktls :SSL_OP_ENABLE_KTLS option NOT set. Check OpenSSL version and build config.\n");
+
+             }
+
+             if (SSL_CTX_set_cipher_list(ctx, "AES128-GCM-SHA256") != 1) {
+                 throw std::runtime_error("Error setting TLS 1.2 cipher list");
+             }
+
+//            //指定支持 kTLS 的加密套件 (AES-GCM)
+//            if (SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256") != 1) {
+//               throw std::runtime_error("Error setting TLS 1.3 ciphersuites");
+//            }
+
+
         }
 
         server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -362,13 +389,21 @@ public:
 
                     bool client_alive = true;
 
+                    if (events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) {
+                        std::cerr << "[" << now_ms_time_gen_str() << "] [TCP] 检测到底层连接断开/错误 (Event: " << events[i].events << ") FD: " << fd << std::endl;
+                        client_alive = false;
+                    }
+
                     if (events[i].events & EPOLLIN) {
-                        // 获取 ClientState (使用作用域来管理锁的生命周期)
-                        {
+                        bool keep_looping = true; // 控制 while 循环
+                            bool client_alive = true; // 控制是否销毁连接
+                            while (keep_looping && client_alive){
+
                             ClientStateMap::accessor ac;
                             // 尝试查找，如果没找到，说明可能被其他线程删了，直接标记死亡
                             if (!map_client_states.find(ac, fd)) {
                                 client_alive = false;
+                                            keep_looping = false;
                             }
                             else {
                                 auto& client = ac->second;
@@ -420,11 +455,23 @@ public:
                                 // ---------------------------------------------------------
                                 // 只有握手完成，且 client 还没死的情况下才读取数据
                                 if (client_alive && client->is_handshake_complete) {
-                                    client_alive = handle_client(fd,client,ac);
+                                    IOStatus status = handle_client(fd,client,ac);
+                                    switch (status) {
+                                                    case IOStatus::OK_COMPLETED:
+                                                        keep_looping = true;
+                                                        break;
+
+                                                    case IOStatus::OK_WAITING:
+                                                        keep_looping = false;
+                                                        break;
+
+                                                    case IOStatus::ERROR_DEAD:
+                                                        client_alive = false;
+                                                        keep_looping = false;
+                                                        break;
+                                                }
                                 }
                             }
-                            // ac 在这里自动析构，锁被释放。
-                            // 绝对不要在这里之后再使用 `client` 引用！
                         }
                     }
 
@@ -445,6 +492,7 @@ public:
                         else{
                             std::cerr << "[" << now_ms_time_gen_str() << "] [Error] FD '" << fd << "' NOT FOUND " << std::endl;
                         }
+                        ac.release();
 
                         tbb::concurrent_hash_map<int, std::string>::accessor ac1;
                         if(map_clientid.find(ac1,fd)){
@@ -454,6 +502,7 @@ public:
                         else{
                               std::cerr << "[" << now_ms_time_gen_str() << "] [Error] FD '" << fd<< "' NOT FOUND " << std::endl;
                         }
+                        ac1.release();
 
 
                         out("[" + time + "][ClientID: " + clientid_to_log + "][State: Offline]" );
@@ -463,6 +512,7 @@ public:
                         close(fd);
                     }
                 }
+
             }
         }
 
@@ -684,6 +734,10 @@ public:
                                         return;
                                     }
 
+                                    if (!BIO_get_ktls_send(SSL_get_wbio(ssl))) {
+                                        throw std::runtime_error("[WARNING] kTLS is NOT enabled for SEND! SSL_sendfile will degrade to copy mode.");
+
+                                    }
                                     // [Change 4] 使用 SSL_sendfile
                                     // 1. offset 传值 (current_file_offset)，不是指针
                                     // 2. flags 填 0
@@ -880,108 +934,83 @@ private:
         }
     }
 
-    bool register_clientid(std::unique_ptr<Server::ClientState>& state, int sock, Mybyte&& body, ClientStateMap::accessor& ac) {
+    bool register_clientid( int sock, Mybyte&& body) {
         MessageParser mp(body);
         bool success = 0;
-        bool should_close_connection = false; // 标记是否要关闭连接
-        uint32_t coid_to_send = state->correlation_id; // 先保存 coid
 
-        if (static_cast<Eve>(state->event_type) == Eve::CLIENT_REQUEST_REGISTER) {
             std::string userid = mp.read_string();
             if (userid.empty()) {
-                std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 客户端 (FD: " << sock
-                          << ") 发送了空的注册ID。" << std::endl;
-                success = 0;
-                should_close_connection = true; // ID 为空，关闭连接
+                cerr("[" + now_ms_time_gen_str() + "] [错误] 客户端 (FD: " +std::to_string( sock) + ") 发送了空的注册ID。" );
             } else {
                 add_clientid(userid, sock);
-                state->clientid = userid;
-                state->id_registered = true; // 标记为已注册
-                success = 1;
-                std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 '" << userid
-                          << "' (FD: " << sock << ") 注册成功。" << std::endl;
+                ClientStateMap::accessor ac;
+                if(map_client_states.find(ac,sock)){
+                    auto& state=ac->second;
+                    state->clientid = userid;
+                    state->id_registered = true; // 标记为已注册
+                    success = 1;
+                    state->current_state = ClientState::READING_HEADER;
+                    state->bytes_read_in_header = 0;
+                    state->expected_body_length = 0;
+                    state->bytes_read_in_body = 0;
+
+                    std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 '" << userid
+                              << "' (FD: " << sock << ") 注册成功。" << std::endl;
+                }
+                else{
+                    cerr("[Register] '"+userid+"' not found.");
+                }
+
+
             }
-        } else {
-            // 错误：未注册的客户端发送了非注册事件
-            std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 客户端 (FD: " << sock
-                      << ") 尚未注册，但发送了事件: " << state->event_type << std::endl;
-            success = 0;
-            should_close_connection = true; // 非法操作，关闭连接
-        }
 
-        // --- 准备发送响应 ---
-        uint16_t placehold2 = UINT16_MAX;
-        MessageBuilder mb;
-        mb.append(success);
-
-        // ！！！关键修复 (1)！！！
-        // 在释放 ac 之前重置状态，为下一条消息做准备
-        if (!should_close_connection) {
-            state->current_state = ClientState::READING_HEADER;
-            state->bytes_read_in_header = 0;
-            state->expected_body_length = 0;
-            state->bytes_read_in_body = 0;
-        }
-
-        // ！！！关键修复 (2)！！！
-        // 释放锁，以便 send_msg 可以安全工作
-        ac.release();
-
-        // --- 发送响应 ---
-        send_msg(sock, Eve::SERVER_RESPONSE_REGISTER, coid_to_send, placehold2, mb.data);
-
-        return !should_close_connection; // 如果需要关闭，返回 false
+        return success; // 如果需要关闭，返回 false
     }
 
-    bool process_message(std::unique_ptr<Server::ClientState>& state, int sock, Mybyte&& body, ClientStateMap::accessor& ac) {
-        if (!state->id_registered) {
-            // state->id_registered 检查客户端是否已注册
-            return register_clientid(state, sock, std::move(body), ac);
-        } else {
+    void process_message( int sock, Mybyte&& body) {
+        uint32_t coid=UINT32_MAX;
+        bool id_registered=0;
+        uint16_t eventtype=UINT16_MAX;
+        uint16_t ack_level;
+        std::string clientid ;
+        ClientStateMap::const_accessor cac;
+        if(map_client_states.find(cac,sock)){
+            auto &state=cac->second;
+            id_registered=state->id_registered;
+            coid=state->correlation_id;
+            eventtype=state->event_type;
+            ack_level = state->ack_level;
+            clientid = state->clientid;
+        }
+        cac.release();
+
+        if (static_cast<Eve>(eventtype) == MYMQ::EventType::CLIENT_REQUEST_REGISTER) {
+            // 可能是客户端崩溃后但tcp检测到断联前再次重连，没必要回绝
+            auto succ =register_clientid( sock, std::move(body));
+            // --- 准备发送响应 ---
+            uint16_t placehold2 = UINT16_MAX;
+            MessageBuilder mb;
+            mb.append(succ);
+            // --- 发送响应 ---
+            send_msg(sock, Eve::SERVER_RESPONSE_REGISTER, coid, placehold2, mb.data);
+            return;
+
+        }
+        else{
             // 状态：已注册
-            if (static_cast<Eve>(state->event_type) == MYMQ::EventType::CLIENT_REQUEST_REGISTER) {
-                // 可能是客户端崩溃后但tcp检测到断联前再次重连，没必要回绝
-                return register_clientid(state, sock, std::move(body), ac);
-
-            }
-
             MessageParser mp(body);
-            // --- 常规事件处理 ---
-            auto event_type = state->event_type;
-            auto coid = state->correlation_id;
-            auto ack_level = state->ack_level;
-            auto clientid = state->clientid; // 客户端ID已在注册时保存
-
-            // 重置客户端状态以准备读取下一个消息头
-            state->current_state = ClientState::READING_HEADER;
-            state->bytes_read_in_header = 0;
-            state->expected_body_length = 0;
-            state->bytes_read_in_body = 0;
-
-            // 释放锁，以便其他线程可以访问 ClientStateMap
-            ac.release();
-
-            // 解析消息体
             auto real_body = mp.read_uchar_vector();
-
-            // 处理事件（此函数可能在不同的执行上下文中运行，不持有锁）
-            handle_event(clientid, event_type, std::move(real_body), sock, coid, ack_level);
-
-            return true;
+            handle_event(clientid, eventtype, std::move(real_body), sock, coid, ack_level);
         }
+
     }
 
-    bool handle_client(int sock, std::unique_ptr<Server::ClientState>& state, ClientStateMap::accessor& ac) {
-        ssize_t bytes_read = 0;
-
+    IOStatus handle_client(int sock, std::unique_ptr<Server::ClientState>& state, ClientStateMap::accessor& ac) {
         // --- 状态 1: 正在读取头部 ---
         // 只有当消息头未完全读取时才调用 SSL_read_ex
                 if (state->bytes_read_in_header < HEADER_SIZE) {
 
                     size_t bytes_read_this_time = 0;
-                    // 【改动 1】使用 SSL_read_ex
-                    // buf: 计算当前缓冲区的偏移位置
-                    // len: 还需要读多少字节
                     int ret = SSL_read_ex(state->ssl,
                                           reinterpret_cast<char*>(state->header_buffer.data() + state->bytes_read_in_header),
                                           HEADER_SIZE - state->bytes_read_in_header,
@@ -1011,24 +1040,23 @@ private:
                             // --- 验证消息头 ---
                             if (total_length < HEADER_SIZE) {
                                 std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到畸形消息 (FD: " << sock << "): total_length (" << total_length << ") < HEADER_SIZE (" << HEADER_SIZE << ")" << std::endl;
-                                return false;
+                                return IOStatus::ERROR_DEAD;
                             }
                             state->expected_body_length = total_length - HEADER_SIZE;
 
                             if (state->expected_body_length > msg_body_limit) {
                                 std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state->expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
-                                return false;
+                                return IOStatus::ERROR_DEAD;
                             }
 
-                            // --- 状态转换 ---
                             if (state->expected_body_length == 0) {
-                                // 没有消息体，立即处理
-                                // 注意：process_message 会释放 ac
-                                if (!process_message(state, sock, Mybyte{}, ac)) {
-                                    return false; // ac 已被释放，处理失败
-                                }
-                                // ac 已被释放，必须立即返回
-                                return true;
+
+                                state->current_state = ClientState::READING_HEADER; // 切回读头状态
+                                    state->bytes_read_in_header = 0; // 清空头计数器
+                                    state->bytes_read_in_body = 0;   // 清空体计数器
+                                 ac.release();
+                                 process_message(sock, Mybyte{});
+                               return IOStatus::OK_COMPLETED;
 
                             } else {
                                 // 有消息体，准备读取
@@ -1053,36 +1081,37 @@ private:
                                 // OpenSSL 告诉我们需要更多数据(WANT_READ)或者需要写数据(WANT_WRITE)才能继续
                                 // 这不是错误，而是“请稍后再试”
                                 ac.release();
-                                return true; // 保持连接，等待下一次 epoll 事件
+
+                               return IOStatus::OK_WAITING; // 保持连接，等待下一次 epoll 事件
 
                             case SSL_ERROR_ZERO_RETURN:
                                 // 对端优雅关闭了 TLS 连接 (close_notify)
                                 std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 断开连接 (TLS Close Notify)。" << std::endl;
                                 ac.release();
-                                return false; // 关闭连接
+                                return IOStatus::ERROR_DEAD; // 关闭连接
 
                             case SSL_ERROR_SYSCALL:
                                 // 系统调用错误，检查 errno
                                 if (errno == EINTR) {
                                     // 被信号中断，通常可以忽略或重试，这里选择返回等待下次循环
                                     ac.release();
-                                    return true;
+                                 return IOStatus::OK_WAITING;
                                 }
                                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
                                     // 理论上 SSL_ERROR_WANT_READ 会覆盖这种情况，但为了保险保留
                                     ac.release();
-                                    return true;
+                                    return IOStatus::OK_WAITING;
                                 }
                                 // 真正的网络错误 (如 Connection reset by peer)
                                 perror("read header syscall failed");
                                 ac.release();
-                                return false;
+                              return IOStatus::ERROR_DEAD;
 
                             default:
                                 // 其他 SSL 协议错误 (SSL_ERROR_SSL)
                                 std::cerr << "[" << now_ms_time_gen_str() << "] [错误] SSL_read_ex error code: " << err << std::endl;
                                 ac.release();
-                                return false;
+                              return IOStatus::ERROR_DEAD;
                         }
                     }
                 }
@@ -1108,21 +1137,24 @@ private:
                                 if (ret == 1) { // 【读取成功】
                                     state->bytes_read_in_body += bytes_read_this_time;
 
-                                    // 消息体刚刚读完
+
                                     if (state->bytes_read_in_body == state->expected_body_length) {
 
-                                        // 注意：process_message 会释放 ac
-                                        if (!process_message(state, sock, std::move(state->body_buffer), ac)) {
-                                            return false; // ac 已被释放，处理失败
-                                        }
+                                        auto completed_body = std::move(state->body_buffer);
 
-                                        // ac 已被释放，必须立即返回
-                                        return true;
+                                            state->current_state = ClientState::READING_HEADER; // 切回读头状态
+                                            state->bytes_read_in_header = 0; // 清空头计数器
+                                            state->bytes_read_in_body = 0;   // 清空体计数器
+                                            state->expected_body_length = 0; // 清空预期长度
+                                        ac.release();
+                               process_message( sock, std::move(completed_body));
+
+
+                                     return IOStatus::OK_COMPLETED;
                                     }
-                                    // 如果还没读完，继续下一次循环或等待下一次 epoll 事件
-                                    // 这里通常需要释放 ac 并返回 true，等待下次数据
+
                                     ac.release();
-                                    return true;
+                                   return IOStatus::OK_WAITING;
 
                                 } else { // 【读取返回 0 或 状态码】
                                     // 【改动 2】使用 SSL_get_error
@@ -1133,34 +1165,32 @@ private:
                                         case SSL_ERROR_WANT_WRITE:
                                             // 数据未就绪 (EAGAIN/EWOULDBLOCK 的等价状态)
                                             // 保持连接，释放 ac 防止函数结束时关闭 socket (如果 ac 是这种机制的话)
-                                            ac.release();
-                                            return true;
-
+                                    return IOStatus::OK_WAITING;
                                         case SSL_ERROR_ZERO_RETURN:
                                             // 对端关闭连接
                                             std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock << ") 在读取消息体时断开连接 (TLS Close)。" << std::endl;
                                             ac.release();
-                                            return false;
+                                           return IOStatus::ERROR_DEAD;
 
                                         case SSL_ERROR_SYSCALL:
                                             if (errno == EINTR) {
                                                 // 信号中断，重试或等待
                                                 ac.release();
-                                                return true;
+                                              return IOStatus::OK_WAITING;
                                             }
                                             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                                                 // 理论上 WANT_READ 会处理，但作为兜底
                                                 ac.release();
-                                                return true;
+                                               return IOStatus::OK_WAITING;
                                             }
                                             perror("read body syscall failed");
                                             ac.release();
-                                            return false;
+                                           return IOStatus::ERROR_DEAD;
 
                                         default:
                                             std::cerr << "[" << now_ms_time_gen_str() << "] [错误] SSL_read_ex body error: " << err << std::endl;
                                             ac.release();
-                                            return false;
+                                           return IOStatus::ERROR_DEAD;
                                     }
                                 }
                             }
@@ -1172,9 +1202,10 @@ private:
         // 3. 我们可能只读了部分数据，或者等待 EAGAIN
         // 释放锁，保持连接
         ac.release();
-        return true;
+       return IOStatus::OK_WAITING;
     }
-    // 将客户端消息回调函数提交到线程池
+
+
     void handle_event(std::string clientid,short event_type, Mybyte msg_body, int client_fd,uint32_t correlation_id,uint16_t ack_level){
         ClientMessageCallback curr_cb;
         {
