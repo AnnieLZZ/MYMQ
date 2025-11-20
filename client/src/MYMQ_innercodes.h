@@ -511,3 +511,4 @@ struct ConsumerGroupState {
 
 }
 
+#endif // MYMQ_INNERCODES_H
