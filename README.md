@@ -15,19 +15,19 @@
 ## 🚀 架构亮点 (Key Features)
 
 ### 1. 极致 I/O 与存储 (Extreme I/O & Storage)
-* **Zero-Copy with kTLS:** 深度整合 Linux `sendfile` 与 `mmap` 消除内核态/用户态拷贝；创新性引入 **OpenSSL kTLS (Kernel TLS)**，将加密卸载至内核，在保障传输安全的同时维持零拷贝特性。
+* **Zero-Copy with kTLS:** 深度整合 Linux `sendfile` 与 `mmap` 消除内核态/用户态拷贝；引入 **OpenSSL kTLS (Kernel TLS)**，将加密卸载至内核，在保障传输安全的同时维持sendfile零拷贝特性。
 * **Log-Structured Storage:** 采用“日志段 (Log Segment) + 稀疏索引”结构，结合 Linux Page Cache 实现极速顺序写与 O(1) 级消息寻址。
 * **High Compression:** 消息采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，最大化磁盘与带宽利用率。
 
 ### 2. 工业级并发模型 (Industry-Grade Concurrency)
 * **Lock-Free Architecture:** 通信层采用 `moodycamel::ReaderWriterQueue` (**SPSC 无锁队列**) 彻底消除线程竞争与锁开销。
 * **Concurrent Structures:** 核心索引与元数据管理集成 `Intel TBB` (`concurrent_hash_map`)，确保高并发下的线程安全与访问效率。
-* **Event-Driven Core:** 基于 `epoll` + `Reactor` 模式，配合 **有限状态机 (FSM)** 处理海量非阻塞连接与长时任务。
+* **Event-Driven Core:** 基于 `epoll` + `Reactor` + `SSL通信` 模式，配合 **有限状态机 (FSM)** 处理海量非阻塞连接与长时任务。
 
 ### 3. 分布式与高可用 (Distributed System)
 * **Incremental Cooperative Rebalancing:** 实现了 Kafka 现代版的“增量协作式重平衡”，摒弃传统的 Stop-The-World 机制，确保消费者组在变更时业务不中断。
 * **Group Coordinator:** 内置组协调器协议，自动化管理分区分配、消费者心跳及 Offset 提交。
-* **Data Integrity:** 全链路集成 `CRC32` 校验，保障数据从写入到消费的绝对完整性。
+* **Data Integrity:** 全链路集成 `CRC32` 校验，保障数据完整性。
 
 ## 🛠️ 技术栈 (Tech Stack)
 
