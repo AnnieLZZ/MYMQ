@@ -111,25 +111,10 @@ std::queue<std::string> generateRandomStringQueue(
 
 int main(){
 
-    MYMQ_Client mc("test",1);
-    mc.subscribe_topic("testtopic");
-    mc.create_topic("testtopic");
-    mc.join_group("testgroup");
-    mc.set_pull_bytes(1024*1024);
-
-
-
-
-
-
-
-    std::condition_variable cv;
-    std::mutex mtx;
-
     // --- 吞吐量测试配置 ---
-    const int NUM_MESSAGES_TO_TEST = 50000; // Number of messages to push and pull
-    const int MESSAGE_MIN_LENGTH = 200;     // Minimum length of random message values
-    const int MESSAGE_MAX_LENGTH = 300;    // Maximum length of random message values
+    const int NUM_MESSAGES_TO_TEST = 5000000; // Number of messages to push and pull
+    const int MESSAGE_MIN_LENGTH = 999;     // Minimum length of random message values
+    const int MESSAGE_MAX_LENGTH = 1000;    // Maximum length of random message values
     const std::string TOPIC_NAME = "testtopic";
 
     // -------------------------------------
@@ -141,6 +126,18 @@ int main(){
         message_keys[i] = "key_" + std::to_string(i);
     }
     out("Message generation complete."); // 消息生成完成。
+
+
+    MYMQ_Client mc("test",2);
+    mc.subscribe_topic("testtopic");
+    mc.create_topic("testtopic");
+    mc.join_group("testgroup");
+    mc.set_pull_bytes(1024*1024);
+
+
+    std::condition_variable cv;
+    std::mutex mtx;
+
 
     {
         std::unique_lock<std::mutex> lock(mtx);

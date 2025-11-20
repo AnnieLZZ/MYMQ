@@ -938,7 +938,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             out(std::string{}+"[PULL] Result : "+" State : "+MYMQ_Public::to_string(error));
             if(error==Err::NULL_ERROR){
                 auto message_collection= mp.read_uchar_vector();
-                auto allocation_alignment=MYMQ::ALLOCATION_ALIGNMENT;
+                // Removed: auto allocation_alignment=MYMQ::ALLOCATION_ALIGNMENT;
 
                 size_t current_position = 0;
                 const size_t collection_size = message_collection.size();
@@ -946,14 +946,12 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                 // 消息头部包含一个 uint64_t 的逻辑偏移和一个 uint32_t 的消息实际长度。
                 const size_t RECORD_HEADER_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
 
-
-
-                // 检查对齐值是否有效：必须是2的幂且大于0
-                if (allocation_alignment == 0 || (allocation_alignment & (allocation_alignment - 1)) != 0) {
-                    std::cerr << "Error: Invalid allocation_alignment (" << allocation_alignment
-                              << "). Must be a power of 2 and greater than 0. Cannot extract messages." << std::endl;
-                    return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
-                }
+                // Removed: 检查对齐值是否有效
+                // if (allocation_alignment == 0 || (allocation_alignment & (allocation_alignment - 1)) != 0) {
+                //     std::cerr << "Error: Invalid allocation_alignment (" << allocation_alignment
+                //             << "). Must be a power of 2 and greater than 0. Cannot extract messages." << std::endl;
+                //     return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
+                // }
 
 
                 bool is_interrupted=0;
@@ -1016,7 +1014,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                             int64_t time;
                             try {
                                 if (record_serial.empty()) {
-                                   throw std::out_of_range("EMPTY RECORD");
+                                    throw std::out_of_range("EMPTY RECORD");
                                 }
 
                                 MessageParser mp(record_serial);
@@ -1040,7 +1038,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                 break;
                             }
                             if (!poll_queue.try_emplace(std::move(MYMQ_Public::ConsumerRecord(
-                                topicname,partition,key,value,time,base+i)) )) {
+                                    topicname,partition,key,value,time,base+i)) )) {
 
                                 cerr("Poll result : Poll queue full .");
                                 is_interrupted=1;
@@ -1052,22 +1050,18 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
                     size_t current_record_logical_end = current_position + RECORD_HEADER_SIZE + record_size;
-                    // 应用对齐规则：(value + alignment - 1) & ~(alignment - 1)
 
-                    size_t next_aligned_position = (current_record_logical_end + allocation_alignment - 1) & ~(allocation_alignment - 1);
+                    // Removed: 应用对齐规则：(value + alignment - 1) & ~(alignment - 1)
+                    // size_t next_aligned_position = (current_record_logical_end + allocation_alignment - 1) & ~(allocation_alignment - 1);
 
-                    // 6. 更新当前位置以处理下一个消息
-                    current_position = next_aligned_position;
+                    // 6. 更新当前位置以处理下一个消息 (直接跳到当前记录的逻辑末尾)
+                    current_position = current_record_logical_end;
+
                     if (current_position > collection_size) {
-                        // 这通常发生在最后一个消息的对齐填充使其超出集合尾部，所有有效消息已提取。
-                        // 或者对齐计算导致了异常大的跳跃。
-                        if (current_position - allocation_alignment >= collection_size) { // 简单判断是否是合理的超出
-                            // std::cerr << "Info: Reached end of message collection due to alignment padding." << std::endl;
-                        } else {
-                            std::cerr << "Warning: Next message position (" << current_position
-                                      << ") unexpectedly jumped far beyond collection size (" << collection_size
-                                      << "). Data structure might be corrupt." << std::endl;
-                        }
+                        // 由于移除了对齐逻辑，这现在只会在数据损坏时发生 (理论上应该被上面的 if 语句捕获)
+                        std::cerr << "Warning: Next message position (" << current_position
+                                  << ") unexpectedly jumped far beyond collection size (" << collection_size
+                                  << "). Data structure might be corrupt." << std::endl;
                         is_interrupted=1;
                         break;
                     }
@@ -1084,8 +1078,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             cv_poll_ready.notify_all();
 
 
-
         }
+
         else if(event_type==Eve::SERVER_RESPONCE_HEARTBEAT){
             int generation_id=mp.read_int();
             bool need_to_join=0;
