@@ -15,7 +15,7 @@
 ## 🚀 架构亮点 (Key Features)
 
 ### 1. 极致 I/O 与存储 (Extreme I/O & Storage)
-* **Zero-Copy with kTLS:** 深度整合 Linux `sendfile` 与 `mmap` 消除内核态/用户态拷贝；引入 **OpenSSL kTLS (Kernel TLS)**，使用DHE-RSA-AES128-SHA256加密算法维护通信安全，将加密卸载至内核，在保障传输安全的同时维持sendfile零拷贝特性。
+* **Zero-Copy with kTLS:** 深度整合 Linux `sendfile` 与 `mmap` 消除内核态/用户态拷贝；引入 **OpenSSL kTLS (Kernel TLS)** 将加密卸载至内核，在保障传输安全的同时维持sendfile零拷贝特性。
 * **Log-Structured Storage:** 采用“日志段 (Log Segment) + 稀疏索引”结构，结合 Linux Page Cache 和页缓存特性实现极速顺序写与 O(logn) 级寻址。
 * **High Compression:** 消息采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，最大化磁盘与带宽利用率。
 
@@ -27,7 +27,11 @@
 ### 3. 分布式与高可用 (Distributed System)
 * **Incremental Cooperative Rebalancing:** 实现了 Kafka 现代版的“增量协作式重平衡”，摒弃传统的 Stop-The-World 机制，确保消费者组在变更时业务不中断。
 * **Group Coordinator:** 内置组协调器协议，自动化管理分区分配、消费者心跳及 Offset 提交。
+
+### 4. 消息安全与可信传输 (Message Security & Trustworthy Transmission)
 * **Data Integrity:** 全链路集成 `CRC32` 校验，保障数据完整性。
+* **Confidentiality & Authentication:** 基于 DHE-RSA-AES128-SHA256 等安全套件，实现双向认证和加密通信，确保数据传输的机密性和身份可信。
+
 
 ## 🛠️ 技术栈 (Tech Stack)
 
