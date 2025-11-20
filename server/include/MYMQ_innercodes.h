@@ -38,7 +38,6 @@
 
 namespace MYMQ { // 推荐使用命名空间进一步封装
 
-constexpr size_t ALLOCATION_ALIGNMENT = alignof(size_t);
 const std::string consumeroffset_name="__consumer_offset";
 const std::string clientid_DEFAULT="Client-1";
 const std::string run_directory_DEFAULT="run";
@@ -424,7 +423,6 @@ struct MessageLocation {
     size_t  length=0;          // 消息长度
     bool    found=0;
     size_t offset_batch_first=0;
-    size_t rear_offset=UINT64_MAX;
 };
 
 class ExpectedMemberList {

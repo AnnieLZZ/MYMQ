@@ -42,6 +42,7 @@ enum class CommonErrorCode : uint16_t {
     // Logsegment 错误
     FULL_SEGMENT=5000,
     FAILED_ALLOCATE=5001,
+    IO_ERROR=5002
 };
 
 // ServerErrorCode 的 to_string 函数

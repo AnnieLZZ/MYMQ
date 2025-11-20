@@ -12,6 +12,7 @@
 #include <optional>
 #include <tbb/tbb.h>
 #include"MYMQ_Publiccodes.h"
+#include"Logsegment.h"
 
 
 using Record=MYMQ::MSG_serial::Record;
@@ -34,895 +35,487 @@ struct Topicmap{
     std::shared_mutex mtx_topic;
 };
 
-Config_manager cm_s("config/storage.properity");
+
 /////函数声明区
 
-class Mmapfile {
-public:
-
-
-
-    Mmapfile(const std::string& filename, size_t init_size = 20 * 1024 * 1024)
-        : filename_(filename), mapped_data_ptr(nullptr) {
-
-
-        fd_ = open(filename.c_str(), O_RDWR | O_CREAT, 0644);
-        if (fd_ == -1) {
-            throw std::runtime_error("Failed to open file: " + filename + " - " + std::strerror(errno));
-        }
-
-        struct stat st;
-        if (fstat(fd_, &st) == -1) {
-            close(fd_);
-            throw std::runtime_error("Failed to get file status for " + filename + ": " + std::strerror(errno));
-        }
-
-        size_t actual_physical_file_size = st.st_size;
-        size_t recovered_curr_used_size = 0;
-
-        // 1. 尝试读取文件头部以恢复 curr_used_size_
-        // 临时映射头部区域以读取持久化的 curr_used_size_
-        void* temp_mapped_ptr = nullptr;
-        if (actual_physical_file_size >= MMAP_HEADER_SIZE) {
-            temp_mapped_ptr = mmap(nullptr, MMAP_HEADER_SIZE, PROT_READ, MAP_SHARED, fd_, 0);
-            if (temp_mapped_ptr == MAP_FAILED) {
-                close(fd_);
-                throw std::runtime_error("Failed to mmap header for " + filename_ + ": " + std::strerror(errno));
-            }
-            recovered_curr_used_size = *static_cast<size_t*>(temp_mapped_ptr);
-            munmap(temp_mapped_ptr, MMAP_HEADER_SIZE); // 解除临时映射
-        }
-
-        // 确保恢复的 curr_used_size_ 不会超过文件实际物理大小
-        recovered_curr_used_size = std::min(recovered_curr_used_size, actual_physical_file_size);
-        // 确保数据区域从 HEADER_SIZE 之后开始
-        if (recovered_curr_used_size < MMAP_HEADER_SIZE) {
-            recovered_curr_used_size = MMAP_HEADER_SIZE;
-        }
-
-        // 2. 将文件物理截断到恢复的 curr_used_size_，满足崩溃恢复时文件大小的保证
-        if (ftruncate(fd_, recovered_curr_used_size) != 0) {
-            close(fd_);
-            throw std::runtime_error("Failed to ftruncate file to recovered size " + std::to_string(recovered_curr_used_size) + ": " + std::strerror(errno));
-        }
-        curr_used_size_.store(recovered_curr_used_size); // 设置实际已使用的大小
-
-        // 3. 确定文件需要映射和预留的容量大小 (capacity)
-        size_t desired_capacity = std::max(curr_used_size_.load(), init_size);
-        // 确保容量至少能容纳头部
-        if (desired_capacity < MMAP_HEADER_SIZE) {
-            desired_capacity = MMAP_HEADER_SIZE;
-        }
-        file_size_ = desired_capacity; // 设置容量
-
-        // 4. 如果容量大于当前实际数据大小，则将物理文件扩容到 desired_capacity
-        if (file_size_ > curr_used_size_.load()) {
-            if (ftruncate(fd_, file_size_) != 0) {
-                close(fd_);
-                throw std::runtime_error("Failed to ftruncate file to desired capacity " + std::to_string(file_size_) + ": " + std::strerror(errno));
-            }
-        }
-
-        // 5. 映射整个容量区域
-        if (file_size_ > 0) {
-            mapped_data_ptr = mmap(nullptr, file_size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-            if (mapped_data_ptr == MAP_FAILED) {
-                close(fd_);
-                throw std::runtime_error("Failed to mmap file " + filename_ + " with initial size " + std::to_string(file_size_) + ": " + std::strerror(errno));
-            }
-        } else {
-            mapped_data_ptr = nullptr;
-        }
-
-        // 6. 确保头部本身已初始化（如果是新文件或恢复大小为0）
-        if (mapped_data_ptr != nullptr) {
-            update_header_curr_used_size(); // 写入当前的 curr_used_size_ 到头部
-        }
-    }
-
-    Mmapfile(const Mmapfile&) = delete;
-    Mmapfile& operator=(const Mmapfile&) = delete;
-
-    Mmapfile(Mmapfile&& other) noexcept
-        : filename_(std::move(other.filename_)),
-          fd_(other.fd_),
-          file_size_(other.file_size_),
-          mapped_data_ptr(other.mapped_data_ptr)
-    {
-        curr_used_size_.store(other.curr_used_size_.load());
-        other.fd_ = -1;
-        other.file_size_ = 0;
-        other.curr_used_size_.store(0);
-        other.mapped_data_ptr = nullptr;
-        other.filename_ = ""; // 清空 other 的文件名
-    }
-
-    Mmapfile& operator=(Mmapfile&& other) noexcept {
-        if (this == &other) {
-            return *this;
-        }
-
-        // 清理当前对象资源，并截断文件到实际使用大小
-        if (mapped_data_ptr != MAP_FAILED && mapped_data_ptr != nullptr) {
-            // 在 munmap 前同步数据和头部
-            if (curr_used_size_.load() > 0) {
-                if (msync(mapped_data_ptr, curr_used_size_.load(), MS_SYNC) != 0) {
-                    std::cerr << "Mmapfile::operator=: ERROR: msync data failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-                }
-            }
-            if (msync(mapped_data_ptr, MMAP_HEADER_SIZE, MS_SYNC) != 0) { // 同步头部
-                std::cerr << "Mmapfile::operator=: ERROR: msync header failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-            }
-            munmap(mapped_data_ptr, file_size_);
-        }
-        if (fd_ != -1) {
-            // 在移动赋值前，将文件截断到实际使用的大小，释放预留但未使用的空间
-            if (ftruncate(fd_, curr_used_size_.load()) != 0) {
-                std::cerr << "Warning: Failed to ftruncate file " << filename_ << " to "
-                          << curr_used_size_.load() << " bytes on move assignment: " << std::strerror(errno) << std::endl;
-            }
-            close(fd_);
-        }
-
-        // 从 other 移动资源
-        filename_ = std::move(other.filename_);
-        fd_ = other.fd_;
-        file_size_ = other.file_size_;
-        curr_used_size_.store(other.curr_used_size_.load());
-        mapped_data_ptr = other.mapped_data_ptr;
-
-        // 使 other 对象无效
-        other.fd_ = -1;
-        other.file_size_ = 0;
-        other.curr_used_size_.store(0);
-        other.mapped_data_ptr = nullptr;
-        other.filename_ = "";
-
-        return *this;
-    }
-
-    ~Mmapfile() {
-        if (mapped_data_ptr != MAP_FAILED && mapped_data_ptr != nullptr) {
-            // 在 munmap 前同步数据和头部
-            if (fd_ != -1) { // 只有 fd 有效时才尝试 msync
-                if (curr_used_size_.load() > 0) {
-                    if (msync(mapped_data_ptr, curr_used_size_.load(), MS_SYNC) != 0) {
-                        std::cerr << "Mmapfile::Destructor: ERROR: msync data failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-                    }
-                }
-                if (msync(mapped_data_ptr, MMAP_HEADER_SIZE, MS_SYNC) != 0) { // 同步头部
-                    std::cerr << "Mmapfile::Destructor: ERROR: msync header failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-                }
-            }
-            munmap(mapped_data_ptr, file_size_); // munmap 整个映射区域
-            mapped_data_ptr = nullptr;
-        }
-        if (fd_ != -1) {
-            // 析构时，将文件截断到实际使用的大小，释放预留但未使用的空间
-            size_t final_size_to_truncate = curr_used_size_.load();
-            if (ftruncate(fd_, final_size_to_truncate) != 0) {
-                std::cerr << "Warning: Failed to ftruncate file " << filename_ << " to "
-                          << final_size_to_truncate << " bytes on close: " << std::strerror(errno) << std::endl;
-            }
-            close(fd_);
-            fd_ = -1;
-        }
-    }
-
-    char* allocate(size_t length) {
-
-        size_t base = curr_used_size_.load();
-
-        // 确保分配从 HEADER_SIZE 之后开始
-        if (base < MMAP_HEADER_SIZE) {
-            base = MMAP_HEADER_SIZE;
-        }
-
-        size_t aligned_offset = (base + alignment - 1) & ~(alignment - 1);
-
-
-        if (aligned_offset + length > file_size_) {
-            throw std::out_of_range("Insufficient capacity to allocate " + std::to_string(length) +
-                                    " bytes. Current file capacity: " + std::to_string(file_size_) +
-                                    ", requested total size (including alignment): " + std::to_string(aligned_offset + length) + ".");
-        }
-
-
-        if (mapped_data_ptr == nullptr) {
-            throw std::runtime_error("Mmapfile is not mapped or in an invalid state for allocation.");
-        }
-
-
-        char* ptr = static_cast<char*>(mapped_data_ptr) + aligned_offset;
-        curr_used_size_.store(aligned_offset + length); // 更新实际使用大小
-        update_header_curr_used_size(); // 持久化新的 curr_used_size_
-        return ptr;
-    }
-
-    // 返回指向数据区域起始的指针 (跳过头部)
-    void* give_mapped_data_ptr() const {
-        if (mapped_data_ptr == nullptr) return nullptr;
-        return static_cast<char*>(mapped_data_ptr) + MMAP_HEADER_SIZE;
-    }
-
-    size_t give_curr_used_size() const { return curr_used_size_.load(); }
-
-    void flush_async() {
-        if (mapped_data_ptr != MAP_FAILED && mapped_data_ptr != nullptr && fd_ != -1) {
-            // 仅同步实际使用的部分
-            if (curr_used_size_.load() > 0) {
-                if (msync(mapped_data_ptr, curr_used_size_.load(), MS_ASYNC) != 0) {
-                    std::cerr << "Mmapfile::flush_async: ERROR: msync data failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-                }
-            }
-            // 同步头部
-            if (msync(mapped_data_ptr, MMAP_HEADER_SIZE, MS_ASYNC) != 0) {
-                std::cerr << "Mmapfile::flush_async: ERROR: msync header failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-            }
-        }
-    }
-
-    void flush_sync() {
-        if (mapped_data_ptr != MAP_FAILED && mapped_data_ptr != nullptr && fd_ != -1) {
-            // 仅同步实际使用的部分
-            if (curr_used_size_.load() > 0) {
-                if (msync(mapped_data_ptr, curr_used_size_.load(), MS_SYNC) != 0) {
-                    std::cerr << "Mmapfile::flush_sync: ERROR: msync data failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-                }
-            }
-            // 同步头部
-            if (msync(mapped_data_ptr, MMAP_HEADER_SIZE, MS_SYNC) != 0) {
-                std::cerr << "Mmapfile::flush_sync: ERROR: msync header failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-            }
-        }
-    }
-
-    void set_curr_used_size(size_t offset) {
-        // 允许设置 curr_used_size_，但不能超过当前容量 file_size_
-        // 且不能小于 HEADER_SIZE
-        if (offset > file_size_) {
-            throw std::out_of_range("Attempted to set curr_used_size_ beyond current file_size_ capacity.");
-        }
-        if (offset < MMAP_HEADER_SIZE && offset != 0) { // 如果设置为0，表示清空，可以小于HEADER_SIZE
-            throw std::out_of_range("Attempted to set curr_used_size_ to a value less than HEADER_SIZE (unless it's 0).");
-        }
-        curr_used_size_.store(offset);
-        update_header_curr_used_size(); // 持久化新的 curr_used_size_
-    }
-
-    int get_fd() const { return fd_; }
-
-    void reset() {
-        if (mapped_data_ptr != MAP_FAILED && mapped_data_ptr != nullptr) {
-            // 在 munmap 前同步数据和头部
-            if (curr_used_size_.load() > 0 && fd_ != -1) {
-                if (msync(mapped_data_ptr, curr_used_size_.load(), MS_SYNC) != 0) {
-                    std::cerr << "Mmapfile::reset: ERROR: msync data failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-                }
-            }
-            if (fd_ != -1) { // 只有 fd 有效时才尝试 msync 头部
-                if (msync(mapped_data_ptr, MMAP_HEADER_SIZE, MS_SYNC) != 0) {
-                    std::cerr << "Mmapfile::reset: ERROR: msync header failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-                }
-            }
-            if (munmap(mapped_data_ptr, file_size_) != 0) {
-                throw std::runtime_error("Failed to munmap during reset for " + filename_ + ": " + std::strerror(errno));
-            }
-            mapped_data_ptr = nullptr;
-        }
-
-        if (fd_ != -1) {
-            // 在关闭文件前截断到实际使用大小
-            size_t final_size_to_truncate = curr_used_size_.load();
-            if (final_size_to_truncate < MMAP_HEADER_SIZE) { // 确保至少保留头部空间
-                final_size_to_truncate = MMAP_HEADER_SIZE;
-            }
-            if (ftruncate(fd_, final_size_to_truncate) != 0) {
-                std::cerr << "Warning: Failed to ftruncate file " << filename_ << " to "
-                          << final_size_to_truncate << " bytes during reset: " << std::strerror(errno) << std::endl;
-            }
-            if (close(fd_) != 0) {
-                throw std::runtime_error("Failed to close file descriptor during reset for " + filename_ + ": " + std::strerror(errno));
-            }
-            fd_ = -1;
-        }
-
-        file_size_ = 0;
-        curr_used_size_.store(0);
-        // filename_ 保持不变，因为在 replace 场景下，target 的文件名是期望的最终文件名。
-        // 如果是完全清空，可以 filename_ = "";
-    }
-
-    void truncate_physical_file_to_curr_used_size() {
-        if (fd_ != -1) {
-            size_t target_size = curr_used_size_.load();
-            if (target_size < MMAP_HEADER_SIZE) { // 确保至少保留头部空间
-                target_size = MMAP_HEADER_SIZE;
-            }
-            if (ftruncate(fd_, target_size) != 0) {
-                std::cerr << "Warning: Failed to ftruncate physical file '" << filename_ << "' to "
-                          << target_size << " bytes: " << std::strerror(errno) << std::endl;
-            }
-        }
-    }
-
-    std::string get_filename() const { return filename_; }
-
-
-    void take_ownership_of_internal(Mmapfile&& other) noexcept {
-        if (this == &other) { return; }
-
-        // 首先，重置当前对象的所有资源，包括截断其文件
-        reset();
-
-        fd_ = other.fd_;
-        file_size_ = other.file_size_;
-        curr_used_size_.store(other.curr_used_size_.load());
-        mapped_data_ptr = other.mapped_data_ptr;
-        filename_ = std::move(other.filename_); // 移动文件名
-
-        // 使 other 对象无效，防止双重释放
-        other.fd_ = -1;
-        other.file_size_ = 0;
-        other.curr_used_size_.store(0);
-        other.mapped_data_ptr = nullptr;
-        other.filename_ = "";
-    }
-
-
-private:
-    // 持久化 curr_used_size_ 到文件头部
-    void update_header_curr_used_size() {
-        if (mapped_data_ptr != nullptr && fd_ != -1) {
-            // 写入当前的 curr_used_size_ 到映射内存的头部
-            *static_cast<size_t*>(mapped_data_ptr) = curr_used_size_.load();
-            // 立即同步头部区域到磁盘，确保崩溃恢复的持久性
-            if (msync(mapped_data_ptr, MMAP_HEADER_SIZE, MS_SYNC) != 0) {
-                std::cerr << "Mmapfile::update_header_curr_used_size: ERROR: msync header failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-            }
-        }
-    }
-
-    // remap 方法现在是私有的，且不再被 allocate 自动调用。
-    // 如果需要扩容，外部需要通过其他机制（例如一个新的公共 resize 方法）来调用它。
-    void remap(size_t new_size) {
-        const size_t MAX_ALLOWED_FILE_SIZE = MYMQ::MAX_ALLOWED_FILE_SIZE; // 2GB
-
-        if (new_size > MAX_ALLOWED_FILE_SIZE) {
-            throw std::runtime_error("Attempted to remap file beyond maximum allowed size (" +
-                                     std::to_string(MAX_ALLOWED_FILE_SIZE / (1024.0 * 1024.0 * 1024.0)) + " GB). Current requested size: " +
-                                     std::to_string(new_size / (1024.0 * 1024.0 * 1024.0)) + " GB.");
-        }
-        // 确保新容量至少能容纳头部
-        if (new_size < MMAP_HEADER_SIZE) {
-            new_size = MMAP_HEADER_SIZE;
-        }
-
-        // 在 munmap 前同步当前数据和头部
-        if (mapped_data_ptr != MAP_FAILED && mapped_data_ptr != nullptr && fd_ != -1) {
-            if (curr_used_size_.load() > 0) {
-                if (msync(mapped_data_ptr, curr_used_size_.load(), MS_SYNC) != 0) { // 同步实际数据
-                    std::cerr << "Mmapfile::remap: ERROR: msync data failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-                }
-            }
-            if (msync(mapped_data_ptr, MMAP_HEADER_SIZE, MS_SYNC) != 0) { // 同步头部
-                std::cerr << "Mmapfile::remap: ERROR: msync header failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-            }
-        }
-
-        if (mapped_data_ptr != MAP_FAILED && mapped_data_ptr != nullptr) {
-            munmap(mapped_data_ptr, file_size_); // 解除旧的映射
-        }
-
-        // 扩容物理文件
-        if (ftruncate(fd_, new_size) != 0) {
-            throw std::runtime_error("Failed to ftruncate file to new size: " + std::to_string(new_size) + " - " + std::string(std::strerror(errno)));
-        }
-
-        if (new_size > 0) {
-            // 重新映射新大小的区域
-            mapped_data_ptr = mmap(nullptr, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-            if (mapped_data_ptr == MAP_FAILED) {
-                throw std::runtime_error("Failed to mmap file after remap: " + std::string(std::strerror(errno)));
-            }
-        } else {
-            mapped_data_ptr = nullptr;
-        }
-        file_size_ = new_size; // 更新内部记录的容量
-
-        // 重新映射后，确保头部在新的映射中也正确设置
-        update_header_curr_used_size();
-    }
-
-
-
-
-    std::string filename_;
-    int fd_{-1};
-    size_t file_size_; // 文件的当前容量 (capacity)，对应 mmap 的大小
-    std::atomic<size_t>  curr_used_size_{0}; // 文件中实际已使用的数据大小 (size)，对应 std::vector::size()
-    void* mapped_data_ptr{nullptr};
-    size_t MMAP_HEADER_SIZE= MYMQ::MMAP_HEADER_SIZE;
-    size_t alignment = MYMQ::ALLOCATION_ALIGNMENT;
-};
-
-class LogSegment {
-
-public:
-    LogSegment(const std::string& log_filepath, const std::string& index_filepath,
-               uint64_t base_offset, size_t max_segment_size = 100 * 1024 * 1024)
-        : base_offset_(base_offset),
-          max_segment_size_(max_segment_size),
-          log_file_(log_filepath),
-          index_file_(index_filepath),
-          next_offset_(base_offset),
-          log_path(log_filepath),
-          index_path(index_filepath),
-          bytes_since_last_index_entry_(0) {
-        init();
-        if(recover()){
-//            out(log_filepath+" : recover successfully");
-        }
-        else{
-            cerr(log_filepath+" : recover failed");
-        }
-    }
-
-
-
-    void replace_mmapfile_content(Mmapfile& m_source, Mmapfile& m_receiver) {
-        m_source.flush_sync();
-        m_receiver.reset();
-        if (std::rename(m_source.get_filename().c_str(), m_receiver.get_filename().c_str()) != 0) {
-            throw std::runtime_error("Failed to rename file from '" + m_source.get_filename() +
-                                     "' to '" + m_receiver.get_filename() + "': " + std::strerror(errno));
-        }
-
-        m_receiver.take_ownership_of_internal(std::move(m_source));
-    }
-
-    std::string get_log_path(){
-        std::shared_lock<std::shared_mutex> slock(rw_mutex_);
-        return log_path;
-    }
-    std::string get_index_path(){
-        std::shared_lock<std::shared_mutex> slock(rw_mutex_);
-        return index_path;
-    }
-
-
-
-    bool recover() {
-        // --- Log File Prepare ---
-        char* log_start = static_cast<char*>(log_file_.give_mapped_data_ptr());
-        size_t log_size_on_disk = log_file_.give_curr_used_size();
-
-        // --- Index File Recovery ---
-        size_t index_size_on_disk = 0;
-        size_t record_num = 0;
-        size_t actual_log_data_end = 0;
-
-        std::string index_path_recover = index_path + ".recover";
-        Mmapfile tmp_mmap(index_path_recover);
-
-        size_t last_phypos = sizeof(size_t);
-        size_t bytes_since_last_index_entry = 0;
-
-
-        if (log_size_on_disk <= sizeof(size_t)) {//如果是等于，说明是个空文件，如果是小于，说明根本连数字都没填就崩溃，那么都用一个全新的空mmap覆盖他
-            next_offset_ = base_offset_; // 偏移量重置为基准偏移
-            tmp_mmap.set_curr_used_size(0); // 确保临时索引文件也是空的
-
-            // 使用 replace_mmapfile_content 替换旧的索引文件
-            try {
-                replace_mmapfile_content(tmp_mmap, index_file_);
-            } catch (const std::runtime_error& e) {
-                cerr("LogSegment::recover: Failed to replace index file for empty log: " + std::string(e.what()));
-                return false;
-            }
-
-            log_file_.flush_sync(); // 确保日志文件状态同步
-            index_file_.flush_sync(); // 确保新索引文件状态同步
-            return true; // 恢复成功
-        }
-
-
-        bool recovery_failed = false; // 标志，用于指示恢复过程中是否遇到错误
-
-        // 遍历日志文件以恢复数据和构建索引
-        while (last_phypos < log_size_on_disk) {
-            uint64_t offset;
-            uint32_t len;
-
-            // 1. 检查消息头 (offset + len) 是否完整
-            if (last_phypos + sizeof(uint64_t) + sizeof(uint32_t) > log_size_on_disk) {
-                std::cerr << "LogSegment::recover: Log file " << log_path << " appears truncated or corrupted at physical position " << last_phypos << " (incomplete header). Stopping recovery." << std::endl;
-                actual_log_data_end = last_phypos; // 截断到当前不完整消息的起始位置
-                recovery_failed = true;
-                break; // 退出循环
-            }
-
-            std::memcpy(&offset, log_start + last_phypos, sizeof(uint64_t));
-            std::memcpy(&len, log_start + last_phypos + sizeof(uint64_t), sizeof(uint32_t));
-            offset = ntohll(offset); // 网络字节序转主机字节序
-            len = ntohl(len);       // 网络字节序转主机字节序
-
-            // 2. 检查消息数据是否完整。
-            // 如果 len 为 0，则视为无效消息，因为日志条目通常不应为空。
-            size_t current_msg_logical_total_size = sizeof(uint64_t) + sizeof(uint32_t) + len;
-            if (len == 0 || last_phypos + current_msg_logical_total_size > log_size_on_disk) {
-                std::cerr << "LogSegment::recover: Log entry with invalid length (" << len << ") or incomplete data detected in " << log_path << " at physical position " << last_phypos << ". Stopping recovery." << std::endl;
-
-                actual_log_data_end = last_phypos; // 截断到当前无效/不完整消息的起始位置
-                recovery_failed = true;
-                break; // 退出循环
-            }
-
-            // 3. 计算下一个消息的对齐起始位置
-            size_t next_aligned_position = (last_phypos + current_msg_logical_total_size + MYMQ::ALLOCATION_ALIGNMENT - 1) & ~(MYMQ::ALLOCATION_ALIGNMENT - 1);
-
-            // 4. 检查消息的对齐填充是否被截断
-            if (next_aligned_position > log_size_on_disk) {
-                std::cerr << "LogSegment::recover: Log entry padding truncated in " << log_path << " at physical position " << last_phypos << ". Truncating log file to " << last_phypos + current_msg_logical_total_size << "." << std::endl;
-                actual_log_data_end = last_phypos + current_msg_logical_total_size; // 截断到消息的逻辑末尾 (数据完整，但填充不完整)
-                recovery_failed = true;
-                break; // 退出循环
-            }
-
-            uint32_t relative_offset = static_cast<uint32_t>(offset - base_offset_);
-            relative_offset = htonl(relative_offset);
-            uint32_t last_phypos_cvd = htonl(static_cast<uint32_t>(last_phypos)); // 索引记录的是消息的实际物理起始位置
-
-            record_num++;
-
-
-            bytes_since_last_index_entry += (next_aligned_position - last_phypos);
-
-
-            char* index_ptr ;
-            if (bytes_since_last_index_entry >= index_build_interval_bytes) {
-                try {
-                    index_ptr = static_cast<char*>(tmp_mmap.allocate(sizeof(uint32_t) * 2));
-                } catch (std::out_of_range& e) {
-                    cerr("LogSegment::recover: FULL SEGMENT");
-
-                }catch(std::runtime_error& e){
-                    cerr("LogSegment::recover: Mmap error");
-                }
-
-                if (!index_ptr) {
-                    cerr("LogSegment::recover: Failed to allocate space for index entry during recovery.");
-                    actual_log_data_end = last_phypos;
-                    recovery_failed = true;
-                    break; // 退出循环
-                }
-                std::memcpy(index_ptr, &relative_offset, sizeof(uint32_t));
-                std::memcpy(index_ptr + sizeof(uint32_t), &last_phypos_cvd, sizeof(uint32_t));
-                bytes_since_last_index_entry = 0; // 重置计数器
-                index_size_on_disk += sizeof(uint32_t) * 2;
-            }
-
-            // 推进到下一个消息的对齐起始位置
-            last_phypos = next_aligned_position;
-        } // while 循环结束
-
-        // 根据 recovery_failed 标志执行不同的逻辑
-        if (recovery_failed) {
-            // --- 恢复失败清理路径 ---
-            // 日志文件被截断到 actual_log_data_end 指示的位置。
-            log_file_.set_curr_used_size(actual_log_data_end);
-            log_file_.flush_sync(); // 确保截断操作同步到磁盘
-
-            // 清理临时索引文件
-            if (std::remove(index_path_recover.c_str()) != 0 && errno != ENOENT) {
-                cerr("LogSegment::recover: Failed to remove temporary index file " + index_path_recover + " after recovery failure: " + strerror(errno));
-            }
-            return false; // 恢复失败
-        } else {
-            // --- 恢复成功路径 ---
-            // 如果循环正常完成 (没有遇到截断或损坏)，则 actual_log_data_end 就是最后一个完整消息的下一个对齐起始位置
-            actual_log_data_end = last_phypos;
-
-            log_file_.set_curr_used_size(actual_log_data_end); // 确认日志文件大小
-            next_offset_ = record_num + base_offset_; // 更新下一个可用偏移量
-
-            // 使用 replace_mmapfile_content 替换旧的索引文件
-            try {
-                replace_mmapfile_content(tmp_mmap, index_file_);
-            } catch (const std::runtime_error& e) {
-                return false; // 恢复失败
-            }
-
-            // index_file_ 已经被替换，其内部状态（包括文件名）已更新
-            index_file_.set_curr_used_size(index_size_on_disk); // 更新索引文件实际使用大小
-
-            // 确保所有更改都同步到磁盘
-            log_file_.flush_sync();
-            index_file_.flush_sync();
-
-            return true; // 恢复成功
-        }
-    }
-
-
-    std::pair<uint64_t, Err> append(std::vector<unsigned char>& msg) {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-
-        uint64_t current_offset = next_offset_;
-
-        uint32_t msg_size = static_cast<uint32_t>(msg.size());
-        size_t total_log_entry_size = sizeof(uint64_t) + sizeof(uint32_t) + msg_size;
-
-        if (log_file_.give_curr_used_size() + total_log_entry_size > max_segment_size_) {
-            return {0, Err::FULL_SEGMENT};
-        }
-
-        // --- 写入日志文件 ---
-        char* log_ptr =nullptr;
-        try {
-            log_ptr =    static_cast<char*>(log_file_.allocate(total_log_entry_size));
-        } catch (std::out_of_range& e_full) {
-            std::cerr << ("Logfile allocate failed at " + log_path);
-            return {0, Err::FULL_SEGMENT};
-        }
-        catch (std::runtime_error& e_allo) {
-            std::cerr << ("Logfile allocate failed at " + log_path);
-            return {0, Err::FAILED_ALLOCATE};
-        }
-
-
-
-        uint32_t encoded_size = htonl(msg_size);
-        uint64_t curr_off = htonll(current_offset);
-        std::memcpy(msg.data(), &curr_off, sizeof(uint64_t));//与实际业务有关，因为需要将开头的整个batch的baseoffset字段占位符改成该分区的全局偏移
-        size_t msg_num;
-        std::memcpy(&msg_num, msg.data()+sizeof(uint64_t),sizeof(uint64_t) );
-        msg_num= ntohll(msg_num);
-
-        std::memcpy(log_ptr, &curr_off, sizeof(uint64_t));
-        std::memcpy(log_ptr + sizeof(uint64_t), &encoded_size, sizeof(uint32_t));
-        std::memcpy(log_ptr + sizeof(uint64_t) + sizeof(uint32_t), msg.data(), msg_size);
-
-        // 累加自上次创建索引条目以来写入日志文件的字节数
-        bytes_since_last_index_entry_ += total_log_entry_size;
-        log_bytes_since_last_flush += total_log_entry_size;
-
-        bool create_index_entry = false;
-        if (current_offset == base_offset_ || bytes_since_last_index_entry_ >= index_build_interval_bytes) {
-            create_index_entry = true;
-        }
-
-        if (create_index_entry) {
-            char* index_ptr = nullptr;
-            try {
-                index_ptr =static_cast<char*>(index_file_.allocate(sizeof(uint32_t) * 2));
-            } catch (std::runtime_error& e_allo) {
-                log_file_.set_curr_used_size(log_file_.give_curr_used_size() - total_log_entry_size);
-                cerr("Indexfile allocate failed at " + index_path);
-                return {0, Err::FAILED_ALLOCATE};
-            }catch(std::out_of_range& e_full){
-                log_file_.set_curr_used_size(log_file_.give_curr_used_size() - total_log_entry_size);
-                cerr("Indexfile allocate failed at " + index_path);
-                return {0, Err::FULL_SEGMENT};
-            }
-            uint32_t relative_offset = static_cast<uint32_t>(current_offset - base_offset_); // 确保为 uint32_t
-            uint32_t physical_pos = static_cast<uint32_t>(log_ptr - static_cast<char*>(log_file_.give_mapped_data_ptr())); // 转换为 uint32_t
-            uint32_t encoded_relative = htonl(relative_offset);
-            uint32_t encoded_physical = htonl(physical_pos);
-            std::memcpy(index_ptr, &encoded_relative, sizeof(uint32_t));
-            std::memcpy(index_ptr + sizeof(uint32_t), &encoded_physical, sizeof(uint32_t));
-
-            bytes_since_last_index_entry_ = 0;
-        }
-
-        if (log_bytes_since_last_flush.load() >= LOG_FLUSH_BYTES_INTERVAL) {
-            flush();
-        }
-
-        next_offset_+=msg_num;
-        return {current_offset, Err::NULL_ERROR};
-    }
-
-    void flush() {
-        log_file_.flush_sync();
-        index_file_.flush_sync();
-
-        log_bytes_since_last_flush.store(0);
-    }
-
-
-    MesLoc find(uint64_t target_offset, size_t byte_need) {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-        MesLoc loc{};
-
-        // 检查目标偏移是否在当前段的有效范围内
-        if (target_offset < base_offset_ || target_offset >= next_offset_.load()) {
-            return loc; // 不在有效范围内
-        }
-
-        uint32_t relative_offset = static_cast<uint32_t>(target_offset - base_offset_); // 更改为 uint32_t
-        char* index_start = static_cast<char*>(index_file_.give_mapped_data_ptr());
-        size_t index_size = index_file_.give_curr_used_size();
-        size_t num_entries = index_size / (sizeof(uint32_t) * 2); // 更改为 size_t，并使用 sizeof(uint32_t)*2
-
-        uint32_t phy_pos = 0;
-        if (num_entries != 0) {
-            int low = 0, high = static_cast<int>(num_entries - 1), found_idx = -1;
-            while (low <= high) {
-                int mid = low + (high - low) / 2;
-                uint32_t current_relative;
-
-                if ((size_t)mid * (sizeof(uint32_t) * 2) + sizeof(uint32_t) > index_size) {
-                    std::cerr << "Warning: Corrupt index entry detected during find in " << index_path << std::endl;
-                    return loc;
-                }
-                std::memcpy(&current_relative, index_start + mid * (sizeof(uint32_t) * 2), sizeof(uint32_t)); // 更改 8 为 sizeof(uint32_t)*2
-                current_relative = ntohl(current_relative);
-
-                if (current_relative <= relative_offset) {
-                    found_idx = mid;
-                    low = mid + 1;
-                } else {
-                    high = mid - 1;
-                }
-            }
-
-            if (found_idx == -1) {
-                return loc;
-            }
-
-            if ((size_t)found_idx * (sizeof(uint32_t) * 2) + sizeof(uint32_t) + sizeof(uint32_t) > index_size) {
-                return loc;
-            }
-
-            std::memcpy(&phy_pos, index_start + found_idx * (sizeof(uint32_t) * 2) + sizeof(uint32_t), sizeof(uint32_t));
-            phy_pos = ntohl(phy_pos);
-        }
-
-        // 从日志文件中读取消息大小
-        char* log_start = static_cast<char*>(log_file_.give_mapped_data_ptr());
-        uint32_t record_size;
-
-        auto logsize = log_file_.give_curr_used_size();
-        // 检查读取 record_size 的边界
-        if (phy_pos > logsize) {
-            cerr("Warning: Corrupt index entry (physical pos) detected during find in " + index_path);
-            return loc;
-        }
-
-        static constexpr size_t MMAP_HEADER_SIZE = sizeof(size_t);
-        uint64_t offset_in_log;
-        while (MMAP_HEADER_SIZE+static_cast<size_t>(phy_pos) + sizeof(uint64_t) + sizeof(uint32_t) <= logsize) {
-            std::memcpy(&offset_in_log, log_start + phy_pos, sizeof(uint64_t));
-            std::memcpy(&record_size, log_start + phy_pos + sizeof(uint64_t), sizeof(uint32_t));
-            offset_in_log = ntohll(offset_in_log);
-            record_size = ntohl(record_size);
-
-            if (record_size == 0 || static_cast<size_t>(phy_pos) + sizeof(uint64_t) + sizeof(uint32_t) + record_size > logsize) {
-                return loc;
-            }
-
-            if (offset_in_log >= target_offset) {
-                loc.file_descriptor = log_file_.get_fd();
-                loc.offset_in_file = static_cast<off_t>(MMAP_HEADER_SIZE+phy_pos);
-
-
-                size_t current_total_length = 0;
-                size_t current_scan_position = phy_pos;
-                size_t offset_first = offset_in_log;
-                uint64_t rear_offset = offset_in_log;
-
-                while (current_total_length < byte_need) {
-                    if (current_scan_position + sizeof(uint64_t) + sizeof(uint32_t) > logsize) {
-                        break;
-                    }
-
-                    uint64_t current_msg_offset;
-                    uint32_t current_msg_len;
-
-                    std::memcpy(&current_msg_offset, log_start + current_scan_position, sizeof(uint64_t));
-                    std::memcpy(&current_msg_len, log_start + current_scan_position + sizeof(uint64_t), sizeof(uint32_t));
-
-                    current_msg_len = ntohl(current_msg_len);
-                    current_msg_offset=ntohll(current_msg_offset);
-
-                    if (current_msg_len == 0 || current_scan_position + sizeof(uint64_t) + sizeof(uint32_t) + current_msg_len > logsize) {
-                        cerr("LogSegment::find: Invalid message length or data truncation during scan. Stopping read.");
-                        break;
-                    }
-
-                    // 计算当前消息的逻辑总长度
-                    size_t current_msg_logical_total_size = sizeof(uint64_t) + sizeof(uint32_t) + current_msg_len;
-                    // 计算下一个消息的对齐起始位置
-                    constexpr size_t allocation_alignment = MYMQ::ALLOCATION_ALIGNMENT;
-                    size_t next_aligned_position = (current_scan_position + current_msg_logical_total_size + allocation_alignment - 1) & ~(allocation_alignment - 1);
-
-                    current_total_length += (next_aligned_position - current_scan_position); // 累加实际占用的空间，包括填充
-                    current_scan_position = next_aligned_position; // 跳转到下一个对齐的消息起始位置
-                    rear_offset = current_msg_offset;
-                }
-                loc.length = current_total_length;
-                loc.offset_batch_first = offset_first;
-                loc.rear_offset = rear_offset;
-                loc.found=1;
-
-                return loc;
-            } else {
-                size_t current_record_logical_end = static_cast<size_t>(phy_pos) + sizeof(uint64_t) + sizeof(uint32_t) + record_size;
-                constexpr size_t allocation_alignment = MYMQ::ALLOCATION_ALIGNMENT;   // !!!!!!!!!!!!!!!!!!!!!Mmapfile::allocate 使用的对齐值
-                phy_pos = (current_record_logical_end + allocation_alignment - 1) & ~(allocation_alignment - 1);
-
-                // 检查新的 phy_pos 是否超出文件范围
-                if (phy_pos >= logsize) {
-                    return loc; // 没有更多有效的消息可扫描
-                }
-            }
-        }
-        return loc;
-    }
-
-    uint64_t base_offset() const { return base_offset_; }
-    uint64_t next_offset() const { return next_offset_.load(); }
-
-    static std::string compute_filename(size_t base_offset) {
-        std::string base_string = std::to_string(base_offset);
-
-        std::string prev_zero;
-        if (base_string.length() < 20) {
-            prev_zero.append(20 - base_string.length(), '0');
-        }
-        return prev_zero + base_string;
-    }
-
-    size_t get_this_seg_maxsize() {
-        return max_segment_size_;
-    }
-
-    void clear() {
-        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
-
-        log_file_.reset();
-        index_file_.reset();
-        next_offset_ = base_offset_;
-
-        log_bytes_since_last_flush.store(0);
-        bytes_since_last_index_entry_ = 0;
-    }
-
-private:
-    void init(){
-        auto log_flush_period=cm_s.get_size_t("LOG_FLUSH_BYTES_INTERVAL");
-        if(!inrange(log_flush_period,256,1048576)){
-            log_flush_period=MYMQ::LOG_FLUSH_BYTES_INTERVAL_DEFAULT;
-        }
-        LOG_FLUSH_BYTES_INTERVAL=log_flush_period;
-        auto index_build_interval=cm_s.get_size_t("index_build_interval_bytes");
-        if(!inrange(index_build_interval,256,1048576)){
-            index_build_interval=MYMQ::index_build_interval_bytes_DEFAULT;
-
-        }
-        index_build_interval_bytes=index_build_interval;
-
-
-    }
-
-    bool inrange(size_t obj,size_t min,size_t max){
-        return (obj<=max&&obj>=min);
-    }
-private:
-    std::shared_mutex rw_mutex_;
-    const uint64_t base_offset_;
-    const size_t max_segment_size_;
-    std::atomic<uint64_t> next_offset_;
-    Mmapfile log_file_;
-    Mmapfile index_file_;
-    std::atomic<size_t> log_bytes_since_last_flush{0};
-    size_t LOG_FLUSH_BYTES_INTERVAL;
-    size_t index_build_interval_bytes;
-    std::string log_path;
-    std::string index_path;
-    size_t bytes_since_last_index_entry_;
-};
+
+//class LogSegment {
+
+//public:
+//    LogSegment(const std::string& log_filepath, const std::string& index_filepath,
+//               uint64_t base_offset, size_t max_segment_size = 100 * 1024 * 1024)
+//        : base_offset_(base_offset),
+//          max_segment_size_(max_segment_size),
+//          log_file_(log_filepath),
+//          index_file_(index_filepath),
+//          next_offset_(base_offset),
+//          log_path(log_filepath),
+//          index_path(index_filepath),
+//          bytes_since_last_index_entry_(0) {
+//        init();
+//        if(recover()){
+////            out(log_filepath+" : recover successfully");
+//        }
+//        else{
+//            cerr(log_filepath+" : recover failed");
+//        }
+//    }
+
+
+
+//    void replace_mmapfile_content(Mmapfile& m_source, Mmapfile& m_receiver) {
+//        m_source.flush_sync();
+//        m_receiver.reset();
+//        if (std::rename(m_source.get_filename().c_str(), m_receiver.get_filename().c_str()) != 0) {
+//            throw std::runtime_error("Failed to rename file from '" + m_source.get_filename() +
+//                                     "' to '" + m_receiver.get_filename() + "': " + std::strerror(errno));
+//        }
+
+//        m_receiver.take_ownership_of_internal(std::move(m_source));
+//    }
+
+//    std::string get_log_path(){
+//        std::shared_lock<std::shared_mutex> slock(rw_mutex_);
+//        return log_path;
+//    }
+//    std::string get_index_path(){
+//        std::shared_lock<std::shared_mutex> slock(rw_mutex_);
+//        return index_path;
+//    }
+
+
+
+//    bool recover() {
+//        // --- Log File Prepare ---
+//        char* log_start = static_cast<char*>(log_file_.give_mapped_data_ptr());
+//        size_t log_size_on_disk = log_file_.give_curr_used_size();
+
+//        // --- Index File Recovery ---
+//        size_t index_size_on_disk = 0;
+//        size_t record_num = 0;
+//        size_t actual_log_data_end = 0;
+
+//        std::string index_path_recover = index_path + ".recover";
+//        Mmapfile tmp_mmap(index_path_recover);
+
+//        size_t last_phypos = sizeof(size_t);
+//        size_t bytes_since_last_index_entry = 0;
+
+
+//        if (log_size_on_disk <= sizeof(size_t)) {//如果是等于，说明是个空文件，如果是小于，说明根本连数字都没填就崩溃，那么都用一个全新的空mmap覆盖他
+//            next_offset_ = base_offset_; // 偏移量重置为基准偏移
+//            tmp_mmap.set_curr_used_size(0); // 确保临时索引文件也是空的
+
+//            // 使用 replace_mmapfile_content 替换旧的索引文件
+//            try {
+//                replace_mmapfile_content(tmp_mmap, index_file_);
+//            } catch (const std::runtime_error& e) {
+//                cerr("LogSegment::recover: Failed to replace index file for empty log: " + std::string(e.what()));
+//                return false;
+//            }
+
+//            log_file_.flush_sync(); // 确保日志文件状态同步
+//            index_file_.flush_sync(); // 确保新索引文件状态同步
+//            return true; // 恢复成功
+//        }
+
+
+//        bool recovery_failed = false; // 标志，用于指示恢复过程中是否遇到错误
+
+//        // 遍历日志文件以恢复数据和构建索引
+//        while (last_phypos < log_size_on_disk) {
+//            uint64_t offset;
+//            uint32_t len;
+
+//            // 1. 检查消息头 (offset + len) 是否完整
+//            if (last_phypos + sizeof(uint64_t) + sizeof(uint32_t) > log_size_on_disk) {
+//                std::cerr << "LogSegment::recover: Log file " << log_path << " appears truncated or corrupted at physical position " << last_phypos << " (incomplete header). Stopping recovery." << std::endl;
+//                actual_log_data_end = last_phypos; // 截断到当前不完整消息的起始位置
+//                recovery_failed = true;
+//                break; // 退出循环
+//            }
+
+//            std::memcpy(&offset, log_start + last_phypos, sizeof(uint64_t));
+//            std::memcpy(&len, log_start + last_phypos + sizeof(uint64_t), sizeof(uint32_t));
+//            offset = ntohll(offset); // 网络字节序转主机字节序
+//            len = ntohl(len);       // 网络字节序转主机字节序
+
+//            // 2. 检查消息数据是否完整。
+//            // 如果 len 为 0，则视为无效消息，因为日志条目通常不应为空。
+//            size_t current_msg_logical_total_size = sizeof(uint64_t) + sizeof(uint32_t) + len;
+//            if (len == 0 || last_phypos + current_msg_logical_total_size > log_size_on_disk) {
+//                std::cerr << "LogSegment::recover: Log entry with invalid length (" << len << ") or incomplete data detected in " << log_path << " at physical position " << last_phypos << ". Stopping recovery." << std::endl;
+
+//                actual_log_data_end = last_phypos; // 截断到当前无效/不完整消息的起始位置
+//                recovery_failed = true;
+//                break; // 退出循环
+//            }
+
+//            // 3. 计算下一个消息的对齐起始位置
+//            size_t next_aligned_position = (last_phypos + current_msg_logical_total_size + MYMQ::ALLOCATION_ALIGNMENT - 1) & ~(MYMQ::ALLOCATION_ALIGNMENT - 1);
+
+//            // 4. 检查消息的对齐填充是否被截断
+//            if (next_aligned_position > log_size_on_disk) {
+//                std::cerr << "LogSegment::recover: Log entry padding truncated in " << log_path << " at physical position " << last_phypos << ". Truncating log file to " << last_phypos + current_msg_logical_total_size << "." << std::endl;
+//                actual_log_data_end = last_phypos + current_msg_logical_total_size; // 截断到消息的逻辑末尾 (数据完整，但填充不完整)
+//                recovery_failed = true;
+//                break; // 退出循环
+//            }
+
+//            uint32_t relative_offset = static_cast<uint32_t>(offset - base_offset_);
+//            relative_offset = htonl(relative_offset);
+//            uint32_t last_phypos_cvd = htonl(static_cast<uint32_t>(last_phypos)); // 索引记录的是消息的实际物理起始位置
+
+//            record_num++;
+
+
+//            bytes_since_last_index_entry += (next_aligned_position - last_phypos);
+
+
+//            char* index_ptr ;
+//            if (bytes_since_last_index_entry >= index_build_interval_bytes) {
+//                try {
+//                    index_ptr = static_cast<char*>(tmp_mmap.allocate(sizeof(uint32_t) * 2));
+//                } catch (std::out_of_range& e) {
+//                    cerr("LogSegment::recover: FULL SEGMENT");
+
+//                }catch(std::runtime_error& e){
+//                    cerr("LogSegment::recover: Mmap error");
+//                }
+
+//                if (!index_ptr) {
+//                    cerr("LogSegment::recover: Failed to allocate space for index entry during recovery.");
+//                    actual_log_data_end = last_phypos;
+//                    recovery_failed = true;
+//                    break; // 退出循环
+//                }
+//                std::memcpy(index_ptr, &relative_offset, sizeof(uint32_t));
+//                std::memcpy(index_ptr + sizeof(uint32_t), &last_phypos_cvd, sizeof(uint32_t));
+//                bytes_since_last_index_entry = 0; // 重置计数器
+//                index_size_on_disk += sizeof(uint32_t) * 2;
+//            }
+
+//            // 推进到下一个消息的对齐起始位置
+//            last_phypos = next_aligned_position;
+//        } // while 循环结束
+
+//        // 根据 recovery_failed 标志执行不同的逻辑
+//        if (recovery_failed) {
+//            // --- 恢复失败清理路径 ---
+//            // 日志文件被截断到 actual_log_data_end 指示的位置。
+//            log_file_.set_curr_used_size(actual_log_data_end);
+//            log_file_.flush_sync(); // 确保截断操作同步到磁盘
+
+//            // 清理临时索引文件
+//            if (std::remove(index_path_recover.c_str()) != 0 && errno != ENOENT) {
+//                cerr("LogSegment::recover: Failed to remove temporary index file " + index_path_recover + " after recovery failure: " + strerror(errno));
+//            }
+//            return false; // 恢复失败
+//        } else {
+//            // --- 恢复成功路径 ---
+//            // 如果循环正常完成 (没有遇到截断或损坏)，则 actual_log_data_end 就是最后一个完整消息的下一个对齐起始位置
+//            actual_log_data_end = last_phypos;
+
+//            log_file_.set_curr_used_size(actual_log_data_end); // 确认日志文件大小
+//            next_offset_ = record_num + base_offset_; // 更新下一个可用偏移量
+
+//            // 使用 replace_mmapfile_content 替换旧的索引文件
+//            try {
+//                replace_mmapfile_content(tmp_mmap, index_file_);
+//            } catch (const std::runtime_error& e) {
+//                return false; // 恢复失败
+//            }
+
+//            // index_file_ 已经被替换，其内部状态（包括文件名）已更新
+//            index_file_.set_curr_used_size(index_size_on_disk); // 更新索引文件实际使用大小
+
+//            // 确保所有更改都同步到磁盘
+//            log_file_.flush_sync();
+//            index_file_.flush_sync();
+
+//            return true; // 恢复成功
+//        }
+//    }
+
+
+//    std::pair<uint64_t, Err> append(std::vector<unsigned char>& msg) {
+//        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+//        uint64_t current_offset = next_offset_;
+
+//        uint32_t msg_size = static_cast<uint32_t>(msg.size());
+//        size_t total_log_entry_size = sizeof(uint64_t) + sizeof(uint32_t) + msg_size;
+
+//        if (log_file_.give_curr_used_size() + total_log_entry_size > max_segment_size_) {
+//            return {0, Err::FULL_SEGMENT};
+//        }
+
+//        // --- 写入日志文件 ---
+//        char* log_ptr =nullptr;
+//        try {
+//            log_ptr =    static_cast<char*>(log_file_.allocate(total_log_entry_size));
+//        } catch (std::out_of_range& e_full) {
+//            std::cerr << ("Logfile allocate failed at " + log_path);
+//            return {0, Err::FULL_SEGMENT};
+//        }
+//        catch (std::runtime_error& e_allo) {
+//            std::cerr << ("Logfile allocate failed at " + log_path);
+//            return {0, Err::FAILED_ALLOCATE};
+//        }
+
+
+
+//        uint32_t encoded_size = htonl(msg_size);
+//        uint64_t curr_off = htonll(current_offset);
+//        std::memcpy(msg.data(), &curr_off, sizeof(uint64_t));//与实际业务有关，因为需要将开头的整个batch的baseoffset字段占位符改成该分区的全局偏移
+//        size_t msg_num;
+//        std::memcpy(&msg_num, msg.data()+sizeof(uint64_t),sizeof(uint64_t) );
+//        msg_num= ntohll(msg_num);
+
+//        std::memcpy(log_ptr, &curr_off, sizeof(uint64_t));
+//        std::memcpy(log_ptr + sizeof(uint64_t), &encoded_size, sizeof(uint32_t));
+//        std::memcpy(log_ptr + sizeof(uint64_t) + sizeof(uint32_t), msg.data(), msg_size);
+
+//        // 累加自上次创建索引条目以来写入日志文件的字节数
+//        bytes_since_last_index_entry_ += total_log_entry_size;
+//        log_bytes_since_last_flush += total_log_entry_size;
+
+//        bool create_index_entry = false;
+//        if (current_offset == base_offset_ || bytes_since_last_index_entry_ >= index_build_interval_bytes) {
+//            create_index_entry = true;
+//        }
+
+//        if (create_index_entry) {
+//            char* index_ptr = nullptr;
+//            try {
+//                index_ptr =static_cast<char*>(index_file_.allocate(sizeof(uint32_t) * 2));
+//            } catch (std::runtime_error& e_allo) {
+//                log_file_.set_curr_used_size(log_file_.give_curr_used_size() - total_log_entry_size);
+//                cerr("Indexfile allocate failed at " + index_path);
+//                return {0, Err::FAILED_ALLOCATE};
+//            }catch(std::out_of_range& e_full){
+//                log_file_.set_curr_used_size(log_file_.give_curr_used_size() - total_log_entry_size);
+//                cerr("Indexfile allocate failed at " + index_path);
+//                return {0, Err::FULL_SEGMENT};
+//            }
+//            uint32_t relative_offset = static_cast<uint32_t>(current_offset - base_offset_); // 确保为 uint32_t
+//            uint32_t physical_pos = static_cast<uint32_t>(log_ptr - static_cast<char*>(log_file_.give_mapped_data_ptr())); // 转换为 uint32_t
+//            uint32_t encoded_relative = htonl(relative_offset);
+//            uint32_t encoded_physical = htonl(physical_pos);
+//            std::memcpy(index_ptr, &encoded_relative, sizeof(uint32_t));
+//            std::memcpy(index_ptr + sizeof(uint32_t), &encoded_physical, sizeof(uint32_t));
+
+//            bytes_since_last_index_entry_ = 0;
+//        }
+
+//        if (log_bytes_since_last_flush.load() >= LOG_FLUSH_BYTES_INTERVAL) {
+//            flush();
+//        }
+
+//        next_offset_+=msg_num;
+//        return {current_offset, Err::NULL_ERROR};
+//    }
+
+//    void flush() {
+//        log_file_.flush_sync();
+//        index_file_.flush_sync();
+
+//        log_bytes_since_last_flush.store(0);
+//    }
+
+
+//    MesLoc find(uint64_t target_offset, size_t byte_need) {
+//        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+//        MesLoc loc{};
+
+//        // 检查目标偏移是否在当前段的有效范围内
+//        if (target_offset < base_offset_ || target_offset >= next_offset_.load()) {
+//            return loc; // 不在有效范围内
+//        }
+
+//        uint32_t relative_offset = static_cast<uint32_t>(target_offset - base_offset_); // 更改为 uint32_t
+//        char* index_start = static_cast<char*>(index_file_.give_mapped_data_ptr());
+//        size_t index_size = index_file_.give_curr_used_size();
+//        size_t num_entries = index_size / (sizeof(uint32_t) * 2); // 更改为 size_t，并使用 sizeof(uint32_t)*2
+
+//        uint32_t phy_pos = 0;
+//        if (num_entries != 0) {
+//            int low = 0, high = static_cast<int>(num_entries - 1), found_idx = -1;
+//            while (low <= high) {
+//                int mid = low + (high - low) / 2;
+//                uint32_t current_relative;
+
+//                if ((size_t)mid * (sizeof(uint32_t) * 2) + sizeof(uint32_t) > index_size) {
+//                    std::cerr << "Warning: Corrupt index entry detected during find in " << index_path << std::endl;
+//                    return loc;
+//                }
+//                std::memcpy(&current_relative, index_start + mid * (sizeof(uint32_t) * 2), sizeof(uint32_t)); // 更改 8 为 sizeof(uint32_t)*2
+//                current_relative = ntohl(current_relative);
+
+//                if (current_relative <= relative_offset) {
+//                    found_idx = mid;
+//                    low = mid + 1;
+//                } else {
+//                    high = mid - 1;
+//                }
+//            }
+
+//            if (found_idx == -1) {
+//                return loc;
+//            }
+
+//            if ((size_t)found_idx * (sizeof(uint32_t) * 2) + sizeof(uint32_t) + sizeof(uint32_t) > index_size) {
+//                return loc;
+//            }
+
+//            std::memcpy(&phy_pos, index_start + found_idx * (sizeof(uint32_t) * 2) + sizeof(uint32_t), sizeof(uint32_t));
+//            phy_pos = ntohl(phy_pos);
+//        }
+
+//        // 从日志文件中读取消息大小
+//        char* log_start = static_cast<char*>(log_file_.give_mapped_data_ptr());
+//        uint32_t record_size;
+
+//        auto logsize = log_file_.give_curr_used_size();
+//        // 检查读取 record_size 的边界
+//        if (phy_pos > logsize) {
+//            cerr("Warning: Corrupt index entry (physical pos) detected during find in " + index_path);
+//            return loc;
+//        }
+
+//        static constexpr size_t MMAP_HEADER_SIZE = sizeof(size_t);
+//        uint64_t offset_in_log;
+//        while (MMAP_HEADER_SIZE+static_cast<size_t>(phy_pos) + sizeof(uint64_t) + sizeof(uint32_t) <= logsize) {
+//            std::memcpy(&offset_in_log, log_start + phy_pos, sizeof(uint64_t));
+//            std::memcpy(&record_size, log_start + phy_pos + sizeof(uint64_t), sizeof(uint32_t));
+//            offset_in_log = ntohll(offset_in_log);
+//            record_size = ntohl(record_size);
+
+//            if (record_size == 0 || static_cast<size_t>(phy_pos) + sizeof(uint64_t) + sizeof(uint32_t) + record_size > logsize) {
+//                return loc;
+//            }
+
+//            if (offset_in_log >= target_offset) {
+//                loc.file_descriptor = log_file_.get_fd();
+//                loc.offset_in_file = static_cast<off_t>(MMAP_HEADER_SIZE+phy_pos);
+
+
+//                size_t current_total_length = 0;
+//                size_t current_scan_position = phy_pos;
+//                size_t offset_first = offset_in_log;
+//                uint64_t rear_offset = offset_in_log;
+
+//                while (current_total_length < byte_need) {
+//                    if (current_scan_position + sizeof(uint64_t) + sizeof(uint32_t) > logsize) {
+//                        break;
+//                    }
+
+//                    uint64_t current_msg_offset;
+//                    uint32_t current_msg_len;
+
+//                    std::memcpy(&current_msg_offset, log_start + current_scan_position, sizeof(uint64_t));
+//                    std::memcpy(&current_msg_len, log_start + current_scan_position + sizeof(uint64_t), sizeof(uint32_t));
+
+//                    current_msg_len = ntohl(current_msg_len);
+//                    current_msg_offset=ntohll(current_msg_offset);
+
+//                    if (current_msg_len == 0 || current_scan_position + sizeof(uint64_t) + sizeof(uint32_t) + current_msg_len > logsize) {
+//                        cerr("LogSegment::find: Invalid message length or data truncation during scan. Stopping read.");
+//                        break;
+//                    }
+
+//                    // 计算当前消息的逻辑总长度
+//                    size_t current_msg_logical_total_size = sizeof(uint64_t) + sizeof(uint32_t) + current_msg_len;
+//                    // 计算下一个消息的对齐起始位置
+//                    constexpr size_t allocation_alignment = MYMQ::ALLOCATION_ALIGNMENT;
+//                    size_t next_aligned_position = (current_scan_position + current_msg_logical_total_size + allocation_alignment - 1) & ~(allocation_alignment - 1);
+
+//                    current_total_length += (next_aligned_position - current_scan_position); // 累加实际占用的空间，包括填充
+//                    current_scan_position = next_aligned_position; // 跳转到下一个对齐的消息起始位置
+//                    rear_offset = current_msg_offset;
+//                }
+//                loc.length = current_total_length;
+//                loc.offset_batch_first = offset_first;
+//                loc.rear_offset = rear_offset;
+//                loc.found=1;
+
+//                return loc;
+//            } else {
+//                size_t current_record_logical_end = static_cast<size_t>(phy_pos) + sizeof(uint64_t) + sizeof(uint32_t) + record_size;
+//                constexpr size_t allocation_alignment = MYMQ::ALLOCATION_ALIGNMENT;   // !!!!!!!!!!!!!!!!!!!!!Mmapfile::allocate 使用的对齐值
+//                phy_pos = (current_record_logical_end + allocation_alignment - 1) & ~(allocation_alignment - 1);
+
+//                // 检查新的 phy_pos 是否超出文件范围
+//                if (phy_pos >= logsize) {
+//                    return loc; // 没有更多有效的消息可扫描
+//                }
+//            }
+//        }
+//        return loc;
+//    }
+
+//    uint64_t base_offset() const { return base_offset_; }
+//    uint64_t next_offset() const { return next_offset_.load(); }
+
+//    static std::string compute_filename(size_t base_offset) {
+//        std::string base_string = std::to_string(base_offset);
+
+//        std::string prev_zero;
+//        if (base_string.length() < 20) {
+//            prev_zero.append(20 - base_string.length(), '0');
+//        }
+//        return prev_zero + base_string;
+//    }
+
+//    size_t get_this_seg_maxsize() {
+//        return max_segment_size_;
+//    }
+
+//    void clear() {
+//        std::unique_lock<std::shared_mutex> lock(rw_mutex_);
+
+//        log_file_.reset();
+//        index_file_.reset();
+//        next_offset_ = base_offset_;
+
+//        log_bytes_since_last_flush.store(0);
+//        bytes_since_last_index_entry_ = 0;
+//    }
+
+//private:
+//    void init(){
+//        auto log_flush_period=cm_s.get_size_t("LOG_FLUSH_BYTES_INTERVAL");
+//        if(!inrange(log_flush_period,256,1048576)){
+//            log_flush_period=MYMQ::LOG_FLUSH_BYTES_INTERVAL_DEFAULT;
+//        }
+//        LOG_FLUSH_BYTES_INTERVAL=log_flush_period;
+//        auto index_build_interval=cm_s.get_size_t("index_build_interval_bytes");
+//        if(!inrange(index_build_interval,256,1048576)){
+//            index_build_interval=MYMQ::index_build_interval_bytes_DEFAULT;
+
+//        }
+//        index_build_interval_bytes=index_build_interval;
+
+
+//    }
+
+//    bool inrange(size_t obj,size_t min,size_t max){
+//        return (obj<=max&&obj>=min);
+//    }
+//private:
+//    std::shared_mutex rw_mutex_;
+//    const uint64_t base_offset_;
+//    const size_t max_segment_size_;
+//    std::atomic<uint64_t> next_offset_;
+//    Mmapfile log_file_;
+//    Mmapfile index_file_;
+//    std::atomic<size_t> log_bytes_since_last_flush{0};
+//    size_t LOG_FLUSH_BYTES_INTERVAL;
+//    size_t index_build_interval_bytes;
+//    std::string log_path;
+//    std::string index_path;
+//    size_t bytes_since_last_index_entry_;
+//};
 
 class PartitionStorage: public std::enable_shared_from_this<PartitionStorage> {
 public:
@@ -990,7 +583,8 @@ public:
             if (auto self = weak_self.lock()) {
                 std::unique_lock<std::shared_mutex> ulock(self->mtx_file);
                 for(auto& seg:self->segments_){
-                    seg->flush();
+                    seg->flush_log();
+                    seg->flush_index();
                 }
 
             }
@@ -1130,6 +724,7 @@ private:
 private:
     void init(){
 
+        Config_manager cm_s("config/storage.properity");
         auto LOG_FLUSH_INTERVAL_MS_tmp=cm_s.get_size_t("LOG_FLUSH_INTERVAL_MS");
         if(!inrange(LOG_FLUSH_INTERVAL_MS_tmp,60000,144000000)){
             LOG_FLUSH_INTERVAL_MS_tmp=MYMQ::LOG_FLUSH_INTERVAL_MS;
