@@ -16,7 +16,7 @@
 
 ### 1. 极致 I/O 与存储 (Extreme I/O & Storage)
 * **Zero-Copy with kTLS:** 深度整合 Linux `sendfile` 与 `mmap` 消除内核态/用户态拷贝；引入 **OpenSSL kTLS (Kernel TLS)**，使用DHE-RSA-AES128-SHA256加密算法维护通信安全，将加密卸载至内核，在保障传输安全的同时维持sendfile零拷贝特性。
-* **Log-Structured Storage:** 采用“日志段 (Log Segment) + 稀疏索引”结构，结合 Linux Page Cache 和页缓存特性实现极速顺序写与 O(1) 级消息寻址。
+* **Log-Structured Storage:** 采用“日志段 (Log Segment) + 稀疏索引”结构，结合 Linux Page Cache 和页缓存特性实现极速顺序写与 O(logn) 级寻址。
 * **High Compression:** 消息采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，最大化磁盘与带宽利用率。
 
 ### 2. 工业级并发模型 (Industry-Grade Concurrency)
