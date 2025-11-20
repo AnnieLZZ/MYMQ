@@ -3,42 +3,46 @@
 > A C++ distributed messaging system benchmarked against Apache Kafka's architecture.
 > **Role:** Core Developer | **Lang:** C++17
 
+---
+
 ## ⚡ 核心性能 (Performance Benchmark)
 
-在单机单分区 (Single Node, Single Partition) 环境下，处理 200~300B 消息体：
+单机单分区 (Single Node, Single Partition) 环境，消息体大小 200~300B：
 
 | Metric | Throughput |
 | :--- | :--- |
 | **Push (Producer)** | **> 100,000 msg/s** |
 | **Poll (Consumer)** | **> 95,000 msg/s** |
 
-## 🚀 架构亮点 (Key Features)
+## 🚀 架构设计 (Architecture Features)
 
-### 1. 极致 I/O 与存储 (Extreme I/O & Storage)
-* **Zero-Copy with kTLS:** 深度整合 Linux `sendfile` 与 `mmap` 消除内核态/用户态拷贝；引入 **OpenSSL kTLS (Kernel TLS)** 将加密卸载至内核，在保障传输安全的同时维持sendfile零拷贝特性。
-* **Log-Structured Storage:** 采用“日志段 (Log Segment) + 稀疏索引”结构，结合 Linux Page Cache 和页缓存特性实现极速顺序写与 O(logn) 级寻址。
-* **High Compression:** 消息采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，最大化磁盘与带宽利用率。
+### 1. I/O 与存储优化 (I/O & Storage)
+* **Zero-Copy with kTLS:** 结合 Linux `sendfile` 与 `mmap` 减少内核态/用户态拷贝；引入 **OpenSSL kTLS (Kernel TLS)** 将加密操作卸载至内核，在保障传输安全的同时维持 sendfile 的零拷贝特性。
+* **Page Cache 顺序写优化:** 利用 Linux Page Cache 特性优化写入性能。实际测试中，使用 `write` 和 `writev` 系统调用（大部分场景为 write）替代内存映射进行持久化，在 8KB~32KB 大文件的顺序写场景下，速率相比 mmap 提升 **12倍**。
+* **Log-Structured Storage:** 采用“日志段 (Log Segment) + 稀疏索引”结构，实现 $O(\log n)$ 级寻址。
+* **Compression:** 消息采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，利用 Page Cache 读写优势并提高带宽利用率。
 
-### 2. 工业级并发模型 (Industry-Grade Concurrency)
-* **Lock-Free Architecture:** 通信层采用 `moodycamel::ReaderWriterQueue` (**SPSC 无锁队列**) 彻底消除线程竞争与锁开销。
-* **Concurrent Structures:** 核心索引与元数据管理集成 `Intel TBB` (`concurrent_hash_map`)，确保高并发下的线程安全与访问效率。
-* **Event-Driven Core:** 基于 `epoll` + `Reactor` + `SSL通信` 模式，配合 **有限状态机 (FSM)** 处理海量非阻塞连接与长时任务。
+### 2. 并发模型 (Concurrency Model)
+* **Lock-Free Queue:** 通信层使用 `moodycamel::ReaderWriterQueue` (**SPSC 无锁队列**) 减少线程竞争和锁开销。
+* **Concurrent Structures:** 核心索引与元数据管理使用 `Intel TBB` 保证线程安全。
+* **Event-Driven:** 基于 `epoll` + `Reactor` + `SSL通信` 模式，配合有限状态机 (FSM) 处理并发连接与事务。
 
-### 3. 分布式与高可用 (Distributed System)
-* **Incremental Cooperative Rebalancing:** 实现了 Kafka 现代版的“增量协作式重平衡”，摒弃传统的 Stop-The-World 机制，确保消费者组在变更时业务不中断。
-* **Group Coordinator:** 内置组协调器协议，自动化管理分区分配、消费者心跳及 Offset 提交。
+### 3. 分布式协同 (Distributed Coordination)
+* **Incremental Cooperative Rebalancing:** 实现了 Kafka 版本的“增量协作式重平衡”机制，相比传统停顿方式，提高了不稳定消费者组的协作效率。
+* **Group Coordinator:** 内置组协调器协议，自动管理分区分配、消费者心跳及 Offset 提交。
 
-### 4. 消息安全与可信传输 (Message Security & Trustworthy Transmission)
-* **Data Integrity:** 全链路集成 `CRC32` 校验，保障数据完整性。
-* **Confidentiality & Authentication:** 基于 DHE-RSA-AES128-SHA256 等安全套件，实现双向认证和加密通信，确保数据传输的机密性和身份可信。
-
+### 4. 安全与可靠性 (Security & Reliability)
+* **Data Integrity:** 全链路以及 **RecordBatch** 本体均内嵌 `CRC32` 校验，实现端到端的消息完整性保障（覆盖传输和存储过程）。
+* **SSL/TLS:** 采用 SSL 协议，基于 DHE-RSA-AES128-SHA256 等安全套件，通过双向认证和加密通信确数据的机密性和身份可信。
 
 ## 🛠️ 技术栈 (Tech Stack)
 
 * **Kernel/Network:** `Epoll`, `Reactor`, `Linux sendfile`, `OpenSSL kTLS`
 * **Concurrency:** `Intel TBB`, `moodycamel::ReaderWriterQueue (Lock-Free)`, `C++14 Threads`
-* **Storage/Algo:** `Memory Mapped File (mmap)`, `ZSTD`, `Sparse Indexing`, `CRC32`
+* **Storage/Algo:** `write/writev (Sequential Write)`, `mmap (Read/Zero-Copy)`, `ZSTD`, `Sparse Indexing`, `CRC32`
 * **Build/Test:** `CMake`, `GTest`
+
+---
 
 
 
