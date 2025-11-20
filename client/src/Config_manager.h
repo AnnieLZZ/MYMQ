@@ -99,7 +99,7 @@ public:
                 std::cerr << "A read error (failbit) occurred, but the end of the file has not been reached\n";
             }
         } else {
-            std::cout << "File '" << filename_ << "' Reloaded successfully\n";
+//            std::cout << "File '" << filename_ << "' Reloaded successfully\n";
         }
         return success;
     }
