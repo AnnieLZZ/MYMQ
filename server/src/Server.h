@@ -21,6 +21,7 @@
 #include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include "blockingconcurrentqueue.h"
 
 using Mybyte = std::vector<unsigned char>;
 using Eve= MYMQ::EventType;
@@ -361,7 +362,7 @@ public:
                         SSL_set_fd(ssl, new_socket);
 
                         struct epoll_event client_event;
-                        client_event.events = EPOLLIN | EPOLLET;
+                        client_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
                         client_event.data.fd = new_socket;
 
                         // [安全检查 2] 如果加入 epoll 失败，要释放 SSL 内存
@@ -514,6 +515,7 @@ public:
                 }
 
             }
+
         }
 
 
