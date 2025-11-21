@@ -143,11 +143,6 @@ public:
                 break;
             }
 
-            // -------------------------------------------------------
-            // C. 读取 Batch Count (用于正确计算 next_offset)
-            // -------------------------------------------------------
-            // Payload 内部结构: [BaseOffset(8B)] [BatchCount(8B)] [Records...]
-            // 我们需要读取 payload 的第 8~15 字节
 
             uint64_t current_batch_count = 0;
 
