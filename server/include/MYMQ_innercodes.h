@@ -343,7 +343,7 @@ struct UserInfo
 {
     std::string clientid;
     int sock;
-    UserInfo():sock(-1),clientid(MYMQ::clientid_DEFAULT) {}
+    UserInfo():clientid(MYMQ::clientid_DEFAULT),sock(-1) {}
     UserInfo(const std::string& clientid_,int sock_):sock(sock_),clientid(clientid_){}
 };
 
@@ -417,6 +417,9 @@ struct endoffset_point
 
 namespace MYMQ_Server {
 
+
+
+
 struct MessageLocation {
     int     file_descriptor=-1; // 日志文件的 fd
     off_t   offset_in_file=0;  // 在文件内的物理偏移
@@ -424,6 +427,7 @@ struct MessageLocation {
     bool    found=0;
     size_t offset_batch_first=0;
 };
+
 
 class ExpectedMemberList {
 public:
@@ -469,42 +473,18 @@ private:
 };
 
 
-struct ConsumerGroupState {
-    std::string group_id;
-    std::map<std::string, ConsumerInfo> members; // member_id -> ConsumerInfo
-    ExpectedMemberList  expected_members;
-    std::map<std::string, std::chrono::steady_clock::time_point> last_heartbeat; // member_id -> 最后心跳时间
-    std::map<std::string, std::map<std::string, std::set<size_t>>> assignments; // member_id -> topic -> 分配的分区ID集合
-    int generation_id; // 组的世代ID，每次再平衡后递增
-    std::map<std::string,std::set<std::string>> map_subscribed_topics; // 组内所有消费者订阅的主题映射
-    std::string leader_id;
-    size_t rebalance_timeout_taskid=0;
-    size_t join_collect_timeout_taskid=0;
-
-    // 状态：
-
-    enum GroupState { STABLE, JOIN_COLLECTING, AWAITING_SYNC,EMPTY};
-    GroupState state;
-    std::mutex state_mutex; // 保护组状态的互斥锁
-    std::condition_variable rebalance_cv; // 用于 JoinGroup 阶段等待再平衡准备完成
-    std::condition_variable sync_cv; // 新增：用于 SyncGroup 阶段等待分配结果
-
-    ConsumerGroupState(const std::string& id)
-        : group_id(id),
-        expected_members(std::vector<std::string>{}),
-        state(EMPTY),
-        generation_id(-1)
-
-    {
-        // 可以在这里进行其他初始化
-    }
-    std::atomic<bool> rebalance_should = false;
-    std::atomic<bool> rebalance_ing = false;
-
-
-
-
+struct ConsumerInfo{
+    std::set<std::string> subscribed_topics;
+    std::string memberid;
+    int generation_id;
+    UserInfo userinfo;
+    uint32_t correlation_id_lastjoin;
+    ConsumerInfo(std::set<std::string> topics,std::string memberid,int generation_id,uint32_t correlation_id_lastjoin,std::string clientid=MYMQ::clientid_DEFAULT,int sock=-1)
+        :subscribed_topics(topics),memberid(memberid),generation_id(generation_id),userinfo(clientid,sock),correlation_id_lastjoin(correlation_id_lastjoin){}
+    ConsumerInfo():subscribed_topics(std::set<std::string>()),memberid(std::string()),generation_id(-1),userinfo(MYMQ::clientid_DEFAULT,-1),correlation_id_lastjoin(0){}
 };
+
+
 
 }
 

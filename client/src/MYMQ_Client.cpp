@@ -938,20 +938,11 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             out(std::string{}+"[PULL] Result : "+" State : "+MYMQ_Public::to_string(error));
             if(error==Err::NULL_ERROR){
                 auto message_collection= mp.read_uchar_vector();
-                // Removed: auto allocation_alignment=MYMQ::ALLOCATION_ALIGNMENT;
-
                 size_t current_position = 0;
                 const size_t collection_size = message_collection.size();
 
                 // 消息头部包含一个 uint64_t 的逻辑偏移和一个 uint32_t 的消息实际长度。
                 const size_t RECORD_HEADER_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
-
-                // Removed: 检查对齐值是否有效
-                // if (allocation_alignment == 0 || (allocation_alignment & (allocation_alignment - 1)) != 0) {
-                //     std::cerr << "Error: Invalid allocation_alignment (" << allocation_alignment
-                //             << "). Must be a power of 2 and greater than 0. Cannot extract messages." << std::endl;
-                //     return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
-                // }
 
 
                 bool is_interrupted=0;
@@ -976,6 +967,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     std::memcpy(&record_size, message_collection.data() + current_position + sizeof(uint64_t), sizeof(uint32_t));
 
                     // 将网络字节序转换为宿主字节序
+                    // NOTE: 确保在您的环境中定义了 ntohl/ntohll 或类似的字节序转换函数
                     record_size = ntohl(record_size);
 
                     // 3. 验证消息实际长度，并检查消息数据是否超出集合边界
@@ -1001,7 +993,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     std::memcpy(records_nothandled.data(), message_collection.data() + current_position + RECORD_HEADER_SIZE, record_size);
 
                     {
-
+                        // 消息内容处理...
                         MessageParser mp(records_nothandled);
                         auto base= mp.read_size_t();
                         auto record_num=mp.read_size_t();
@@ -1046,19 +1038,17 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                             }
                         }
                     }
-
+                    if(is_interrupted){
+                        break;
+                    }
 
 
                     size_t current_record_logical_end = current_position + RECORD_HEADER_SIZE + record_size;
 
-                    // Removed: 应用对齐规则：(value + alignment - 1) & ~(alignment - 1)
-                    // size_t next_aligned_position = (current_record_logical_end + allocation_alignment - 1) & ~(allocation_alignment - 1);
-
                     // 6. 更新当前位置以处理下一个消息 (直接跳到当前记录的逻辑末尾)
-                    current_position = current_record_logical_end;
+                    current_position = current_record_logical_end; // <--- 关键修改点：直接使用逻辑末尾
 
                     if (current_position > collection_size) {
-                        // 由于移除了对齐逻辑，这现在只会在数据损坏时发生 (理论上应该被上面的 if 语句捕获)
                         std::cerr << "Warning: Next message position (" << current_position
                                   << ") unexpectedly jumped far beyond collection size (" << collection_size
                                   << "). Data structure might be corrupt." << std::endl;
@@ -1079,7 +1069,6 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
         }
-
         else if(event_type==Eve::SERVER_RESPONCE_HEARTBEAT){
             int generation_id=mp.read_int();
             bool need_to_join=0;
@@ -1230,5 +1219,6 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         autocommit_stop();
         push_perioric_stop();
     }
+
 
 

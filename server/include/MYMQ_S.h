@@ -7,11 +7,8 @@
 #include"MYMQ_innercodes.h"
 
 using Record=MYMQ::MSG_serial::Record;
-using ConsumerInfo=MYMQ::ConsumerInfo;
-using ConsumerGroupState=MYMQ::MYMQ_Server::ConsumerGroupState;
 using HeartbeatResponce=MYMQ::HeartbeatResponce;
 using Err=MYMQ_Public::CommonErrorCode;
-using Gstate=MYMQ::MYMQ_Server::ConsumerGroupState::GroupState;
 using MB= MessageBuilder;
 using MP=MessageParser;
 using MesLoc=MYMQ::MYMQ_Server::MessageLocation;
@@ -49,7 +46,7 @@ public:
 
 
     void clear_partition(const std::string& topicname,size_t partition) ;
-    std::pair<int,Err> joinGroup(const std::string& groupid, ConsumerInfo& inf);
+
     Err leave_group(const std::string& groupid,const std::string& memberid);
 
     std::pair<std::map<std::string, std::set<size_t>>,Err> sync_group(
@@ -62,7 +59,6 @@ public:
 
     HeartbeatResponce heartbeat(const std::string& group_id, const std::string& member_id) ;
 
-    std::pair< ConsumerGroupState::GroupState,bool> get_SpecificState(const std::string& groupid);
 
 
 
