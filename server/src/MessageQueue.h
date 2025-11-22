@@ -13,19 +13,21 @@
 #include <tbb/tbb.h>
 #include"MYMQ_Publiccodes.h"
 #include"Logsegment.h"
+#include"MYMQ_innercodes.h"
 
 
 using Record=MYMQ::MSG_serial::Record;
-using ConsumerInfo=MYMQ::ConsumerInfo;
-using ConsumerGroupState=MYMQ::MYMQ_Server::ConsumerGroupState;
+
+
 using HeartbeatResponce=MYMQ::HeartbeatResponce;
 using Err=MYMQ_Public::CommonErrorCode;
-using Gstate=MYMQ::MYMQ_Server::ConsumerGroupState::GroupState;
+
 using MB= MessageBuilder;
 using MP=MessageParser;
 using MesLoc=MYMQ::MYMQ_Server::MessageLocation;
 using Mybyte=std::vector<unsigned char>;
 using Eve=MYMQ::EventType;
+
 
 class Topic;
 class Mmapfile;
@@ -35,7 +37,55 @@ struct Topicmap{
     std::shared_mutex mtx_topic;
 };
 
+struct ServerConsumerInfo{
+    std::set<std::string> subscribed_topics;
+    std::string memberid;
+    int generation_id;
+    TcpSession session;
+    uint32_t correlation_id_lastjoin;
+    std::string clientid;
+    ServerConsumerInfo(std::set<std::string> topics,std::string memberid,int generation_id,uint32_t correlation_id_lastjoin,TcpSession session_,std::string clientid_=MYMQ::clientid_DEFAULT)
+        :subscribed_topics(topics),memberid(memberid),generation_id(generation_id),session(session_),correlation_id_lastjoin(correlation_id_lastjoin),clientid(clientid_){}
+    ServerConsumerInfo():subscribed_topics(std::set<std::string>()),memberid(std::string()),generation_id(-2),clientid(MYMQ::clientid_DEFAULT),correlation_id_lastjoin(0),session(nullptr){}
+};
 
+struct ConsumerGroupState {
+    std::string group_id;
+    std::map<std::string, ServerConsumerInfo> members; // member_id -> ConsumerInfo
+    MYMQ::MYMQ_Server:: ExpectedMemberList  expected_members;
+    std::map<std::string, std::chrono::steady_clock::time_point> last_heartbeat; // member_id -> 最后心跳时间
+    std::map<std::string, std::map<std::string, std::set<size_t>>> assignments; // member_id -> topic -> 分配的分区ID集合
+    int generation_id; // 组的世代ID，每次再平衡后递增
+    std::map<std::string,std::set<std::string>> map_subscribed_topics; // 组内所有消费者订阅的主题映射
+    std::string leader_id;
+    size_t rebalance_timeout_taskid=0;
+    size_t join_collect_timeout_taskid=0;
+
+    // 状态：
+
+    enum GroupState { STABLE, JOIN_COLLECTING, AWAITING_SYNC,EMPTY};
+    GroupState state;
+    std::mutex state_mutex; // 保护组状态的互斥锁
+    std::condition_variable rebalance_cv; // 用于 JoinGroup 阶段等待再平衡准备完成
+    std::condition_variable sync_cv; // 新增：用于 SyncGroup 阶段等待分配结果
+
+    ConsumerGroupState(const std::string& id)
+        : group_id(id),
+        expected_members(std::vector<std::string>{}),
+        state(EMPTY),
+        generation_id(-1)
+
+    {
+        // 可以在这里进行其他初始化
+    }
+    std::atomic<bool> rebalance_should = false;
+    std::atomic<bool> rebalance_ing = false;
+
+
+
+
+};
+using Gstate=ConsumerGroupState::GroupState;
 /////函数声明区
 
 
@@ -516,11 +566,7 @@ public:
         return 1;
     }
 
-    using Groupcoordinator_cb=std::function<void(int sock,uint32_t correlation_id,Eve event_type, const Mybyte msg)>;
-    void set_callback(const Groupcoordinator_cb& cb){
-        std::unique_lock<std::shared_mutex> ulock(mtx_callback);
-        callback_=cb;
-    }
+
 
 
     Err send_notice(const std::string& groupid,uint32_t correlation_id,const std::string& memberid,Eve event_type,const Mybyte& msg_){
@@ -533,47 +579,11 @@ public:
         std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
         global_lock.unlock();
 
-        int client_fd=-1;
-        auto inf_pair= group_state.members.find(memberid);
-        if(inf_pair!=group_state.members.end()){
-            client_fd=  inf_pair->second.userinfo.sock;
-        }
-        else{
-            return Err::MEMBER_NOT_FOUND;
-        }
-
-        group_lock.unlock();
-
-
-
-        Groupcoordinator_cb curr_cb;
-        {
-            std::shared_lock<std::shared_mutex> slock(mtx_callback);
-            curr_cb=callback_;
-        }
-        if(curr_cb){
-            ThreadPool::instance().commit([curr_cb,client_fd,event_type,msg_,correlation_id]{
-                curr_cb(client_fd,correlation_id,event_type,std::move(msg_) );
-            });
-        }
 
   return Err::NULL_ERROR;
 
     }
-    void send_notice_internal(int client_fd,uint32_t correlation_id ,Eve event_type,const Mybyte& msg_){
-        Groupcoordinator_cb curr_cb;
-        {
-            std::shared_lock<std::shared_mutex> slock(mtx_callback);
-            curr_cb=callback_;
-        }
-        if(curr_cb){
-            ThreadPool::instance().commit([curr_cb,client_fd,event_type,msg_,correlation_id]{
-                curr_cb(client_fd,correlation_id,event_type,std::move(msg_) );
-            });
 
-
-        }
-    }
 
     void initialize() {
         if(!init_ed){
@@ -596,7 +606,7 @@ public:
 
 
     // 1. JoinGroup: 消费者加入组
-    std::pair<int,Err>  joinGroup(const std::string& group_id, ConsumerInfo& consumer_info) {
+    std::pair<int,Err>  joinGroup(const std::string& group_id, ServerConsumerInfo& consumer_info) {
         std::pair<int,Err> res{-1,Err::NULL_ERROR};
         std::string member_id = consumer_info.memberid.empty() ? uuid_gen_str() : consumer_info.memberid;
         consumer_info.memberid=std::move(member_id) ;
@@ -618,7 +628,7 @@ public:
         }
         else{
             group_lock.unlock();
-            ConsumerInfo captured_consumer_info = consumer_info;
+            ServerConsumerInfo captured_consumer_info = consumer_info;
             triggerRebalance(group_id, captured_consumer_info);
             return res;
         }
@@ -669,7 +679,10 @@ public:
             group_state.assignments = leader_assignments;
             group_state.state = ConsumerGroupState::STABLE;
             group_state.rebalance_ing.store(0);
-            cerr("SYNC RESULT : "+member_id+ " Leader sync successfully");
+            timer.cancel_task(group_state.rebalance_timeout_taskid);
+            timer.cancel_task(group_state.join_collect_timeout_taskid);
+
+            cerr("SYNC RESULT : Leader '"+member_id+ "' submitted the assignment");
 
 
 
@@ -693,6 +706,7 @@ public:
         // 返回该成员的分配
         auto member_assignments_it = group_state.assignments.find(member_id);
         if (member_assignments_it != group_state.assignments.end()) {
+            out("'"+member_id+"' sync successfully");
             return {member_assignments_it->second,Err::NULL_ERROR};
         } else {
             // 领导者提交后，可能某个成员没有分配到分区（例如，没有订阅任何主题或所有分区都被其他成员分配）
@@ -987,6 +1001,13 @@ private:
     }
 
     void Rebalance(const std::string& group_id) {
+
+        struct NotifyTask {
+                uint32_t correlation_id;
+                std::vector<unsigned char> data;
+                TcpSession session;
+            };
+            std::vector<NotifyTask> notifications;
         std::unique_lock<std::shared_mutex> global_lock(group_states_mutex_);
         auto it = group_states_.find(group_id);
         if (it == group_states_.end()) {
@@ -1020,6 +1041,7 @@ private:
         cerr("Rebalance: Group " + group_id +" (gen " +std::to_string( group_state.generation_id) + ") moved to state 'AWAITING_SYNC' . Leader: " + group_state.leader_id);
 
 
+        notifications.reserve(group_state.members.size());
         std::vector<std::pair<std::string, std::string>> members_to_notify;
         for(const auto& member_pair : group_state.members){
             MB mb;
@@ -1030,21 +1052,32 @@ private:
             else{
                 mb.append(Mybyte{});
             }
-            send_notice_internal( member_pair.second.userinfo.sock,member_pair.second.correlation_id_lastjoin, Eve::SERVER_RESPONSE_JOIN_REQUEST_HANDLED,mb.data );
+            notifications.push_back({
+
+                            member_pair.second.correlation_id_lastjoin,
+                            std::move(mb.data),
+                            member_pair.second.session
+                        });
         }
 
+        group_lock.unlock();
+        for(auto task : notifications) {
+            task.session.send(Eve::SERVER_RESPONSE_JOIN_REQUEST_HANDLED,task.correlation_id,UINT16_MAX,task.data);
+
+            }
 
 
 
     }
-    void loadConsumerinf(ConsumerGroupState& group_state, const ConsumerInfo& inf){
+
+    void loadConsumerinf(ConsumerGroupState& group_state, const ServerConsumerInfo& inf){
         group_state.members.insert({inf.memberid,inf});
         group_state.map_subscribed_topics[inf.memberid]=inf.subscribed_topics;
         group_state.last_heartbeat[inf.memberid]=std::chrono::steady_clock::now();
     }
 
     // 触发重平衡
-    int triggerRebalance(const std::string& group_id,const ConsumerInfo& inf=ConsumerInfo()){
+    int triggerRebalance(const std::string& group_id,const ServerConsumerInfo& inf=ServerConsumerInfo()){
 
         std::unique_lock<std::shared_mutex> global_lock(group_states_mutex_);
         auto it = group_states_.find(group_id);
@@ -1059,6 +1092,7 @@ private:
         global_lock.unlock();
 
 
+         int generation_return=group_state.generation_id;
         // 如果已经在重平衡任务调度过程中，则不再重复调度
         std::weak_ptr<GroupCoordinator> weak_self = shared_from_this();
         if (!group_state.rebalance_ing.load()) {
@@ -1076,20 +1110,25 @@ private:
             group_state.assignments.clear();
 
             std::cerr << "TriggerRebalance: Group " << group_id << " entering PREPARING_REBALANCE (new gen: " << group_state.generation_id << ")" << std::endl;
+            generation_return=group_state.generation_id;
 
-            if(inf.userinfo.sock!=-1){
+            if(inf.generation_id!=-2){//离组时默认构造的inf，世代会是-2，仅仅是个标识，实际也用不到这个inf
                 loadConsumerinf(group_state,inf);
                 auto res= group_state.expected_members.callandcheck(inf.memberid);
-                group_lock.unlock();
+
                 if(res){
                     if (auto self = weak_self.lock()) {
-                        self->Rebalance(group_id);
+                           group_lock.unlock();
+                   self->Rebalance(group_id);
+
                     }
+
                 }
                 else{
                     group_state.join_collect_timeout_taskid=timer.commit_ms(
                                 [weak_self, group_id]() {
                         if (auto self = weak_self.lock()) {
+
                             self->Rebalance(group_id);
                         }
                     },
@@ -1099,9 +1138,7 @@ private:
                     );
                 }
             }
-            else{
-                group_lock.unlock();
-            }
+
 
             group_state.rebalance_timeout_taskid=timer.commit_ms(
                         [weak_self, group_id]() {
@@ -1118,18 +1155,17 @@ private:
             if(group_state.state==Gstate::JOIN_COLLECTING){
                 loadConsumerinf(group_state,inf);
                 auto res= group_state.expected_members.callandcheck(inf.memberid);
-                group_lock.unlock();
+
                 if(res){
+
                     if (auto self = weak_self.lock()) {
-                        self->Rebalance(group_id);
+                 group_lock.unlock();
+                     self->Rebalance(group_id);
                     }
+
                 }
             }
-            else{
-                group_lock.unlock();
-            }
         }
-        int generation_return=group_state.generation_id;
         return generation_return;
     }
 
@@ -1147,14 +1183,14 @@ private:
     int join_collect_timeout_ms_ = MYMQ::join_collect_timeout_ms; // 重平衡join窗口期
     int rebalance_timeout_ms=MYMQ::rebalance_timeout_ms; // 重平衡超时时长
     bool init_ed{0};
-    Groupcoordinator_cb callback_;
-    std::shared_mutex mtx_callback;
+
     Topicmap& topics_map;
 
 };
 
 
 class MessageQueue : public std::enable_shared_from_this<MessageQueue> {
+
 public:
     explicit MessageQueue(const std::string& data_root_dir = "./data/")
         : data_root_dir_(data_root_dir),
@@ -1381,7 +1417,7 @@ public:
         }
     }
 
-    std::pair<int,Err> joinGroup(const std::string& groupid, ConsumerInfo& inf){
+    std::pair<int,Err> joinGroup(const std::string& groupid, ServerConsumerInfo& inf){
         for(const auto&it:inf.subscribed_topics){
             create_topic(it);
         }
@@ -1442,14 +1478,15 @@ private:
         return 1;
     }
 
+
     void start_server(){
 
         server_.set_client_message_callback(
-                    [this](int client_fd,std::string clientid, short event_type_short,uint32_t correlation_id,uint16_t ack_level ,const Mybyte msg_body) {
+                    [this](TcpSession session, uint16_t event_type_short,uint32_t correlation_id,uint16_t ack_level ,Mybyte msg_body) {
             MYMQ::EventType type = static_cast<MYMQ::EventType>(event_type_short);
 
             auto decoded_msg=std::move(msg_body) ;
-            cerr("["+std::to_string(correlation_id)+"]["+clientid+"]"+ MYMQ::to_string(static_cast<Eve>(event_type_short))+" called.");
+//            cerr("["+std::to_string(correlation_id)+"]["+clientid+"]"+ MYMQ::to_string(static_cast<Eve>(event_type_short))+" called.");
 
 
             MessageParser mp(decoded_msg);
@@ -1463,17 +1500,18 @@ private:
                 auto res= pull(offset,groupid,topicname,partition,bytes_need);
                 bool failed=1;
                 if(res.second==Err::NULL_ERROR){
-                    auto pullout_res= server_.pull_out(client_fd,correlation_id,ack_level, res.first,topicname,partition) ;
-                    if(pullout_res==Err::NULL_ERROR){
-                        failed=0;
-                    }
+                    SendFileTask file_resp(res.first, topicname, partition,correlation_id,ack_level);
+                    session.send(Eve::SERVER_RESPONSE_PULL_DATA , correlation_id, ack_level, std::move(file_resp));
+
+                    failed=0;
+
                 }
                 if(failed){
 
                     cerr(MYMQ_Public::to_string(static_cast<Err>( res.second)));
                     MB mb;
                     mb.append( static_cast<uint16_t>( res.second),offset,topicname,partition);
-                    send(client_fd,Eve::SERVER_RESPONSE_PULL_DATA,correlation_id,ack_level,mb.data);
+                    session.send(Eve::SERVER_RESPONSE_PULL_DATA,correlation_id,ack_level,std::move(mb.data) );
                     cerr(std::to_string(offset));
                 }
 
@@ -1500,19 +1538,19 @@ private:
                 if(!MYMQ::Crc32::verify_crc32(msg_batch,crc)){
                     cerr("Push CRC verify : Not match , refused to push");
                     mb_res.append_uint16(static_cast<uint16_t>(Err::CRC_VERIFY_FAILED));
-                    send(client_fd,Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
+                   session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
                     return;
                 }
                 if(ack_level==static_cast<uint16_t>(MYMQ::ACK_Level::ACK_PROMISE_ACCEPT)){
                     mb_res.append_uint16(static_cast<uint16_t>(Err::NULL_ERROR));
-                    send(client_fd,Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
+                    session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
                 }
 
                 auto push_res= push(msg_batch,topicname,partition);
 
                 if(ack_level==static_cast<uint16_t>(MYMQ::ACK_Level::ACK_PROMISE_INDISK)){
                     mb_res.append_uint16(static_cast<uint16_t>(push_res));
-                    send(client_fd,Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
+                    session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
                 }
                  cerr("Push result : "+MYMQ_Public::to_string(push_res));
             }
@@ -1529,10 +1567,16 @@ private:
                 MB mb;
                 mb.reserve(sizeof (uint32_t)*2+groupid.size()+topicname.size()+sizeof (size_t)*2+sizeof (uint16_t));
                 mb.append(groupid,topicname,partition,static_cast<uint16_t>(error),offset_digit);
-                send(client_fd,Eve::SERVER_RESPONCE_COMMIT_OFFSET,correlation_id,ack_level,mb.data);
+                session.send(Eve::SERVER_RESPONCE_COMMIT_OFFSET,correlation_id,ack_level,mb.data);
 
 
 
+            }
+            else if(type==MYMQ::EventType::CLIENT_REQUEST_REGISTER){
+                MB mb;
+                mb.append_bool(mp.read_bool());
+                session.send(Eve::SERVER_RESPONSE_REGISTER,correlation_id,ack_level,mb.data);
+                cerr("adsda");
             }
             else if( type==MYMQ::EventType::CLIENT_REQUEST_JOIN_GROUP){
 
@@ -1548,13 +1592,13 @@ private:
                 for(size_t i=0;i<topicsnum;i++){
                     topicset.emplace(mp2.read_string());
                 }
-                ConsumerInfo inf(std::move(topicset),std::move(memberid) , generationid,correlation_id,client_id,client_fd);
+                ServerConsumerInfo inf(std::move(topicset),std::move(memberid) , generationid,correlation_id,session,client_id);
                 auto res= joinGroup(groupid,inf);
 
                 if(res.second!=Err::NULL_ERROR){
                     MessageBuilder mb;
                     mb.append(static_cast<uint16_t>(res.second),groupid,res.first);
-                    send(client_fd,Eve::SERVER_RESPONSE_JOIN_REQUEST_HANDLED,correlation_id,ack_level,mb.data);
+                    session.send(Eve::SERVER_RESPONSE_JOIN_REQUEST_HANDLED,correlation_id,ack_level,mb.data);
                 }
 
 
@@ -1565,7 +1609,7 @@ private:
                 auto res=  leave_group(groupid,memberid);
                 MB mb;
                 mb.append(static_cast<uint16_t>(res),groupid);
-                send(client_fd,Eve::SERVER_RESPONCE_LEAVE_GROUP,correlation_id,ack_level,mb.data);
+               session.send(Eve::SERVER_RESPONCE_LEAVE_GROUP,correlation_id,ack_level,mb.data);
             }
             else if(type==MYMQ::EventType::CLIENT_REQUEST_SYNC_GROUP){
 
@@ -1611,7 +1655,7 @@ private:
 
 
 
-                send(client_fd,Eve::SERVER_RESPONSE_SYNC_GROUP_ACK,correlation_id,ack_level,mb.data);
+                session.send(Eve::SERVER_RESPONSE_SYNC_GROUP_ACK,correlation_id,ack_level,mb.data);
             }
             else if(type==MYMQ::EventType::CLIENT_REQUEST_HEARTBEAT){
                 auto groupid=mp.read_string();
@@ -1619,7 +1663,7 @@ private:
                 auto res= heartbeat(groupid,memberid);
                 MB mb;
                 mb.append(res.generation_id,res.groupstate_digit);
-                send(client_fd,Eve::SERVER_RESPONCE_HEARTBEAT,correlation_id,ack_level,mb.data);
+               session.send(Eve::SERVER_RESPONCE_HEARTBEAT,correlation_id,ack_level,mb.data);
 
 
             }
@@ -1629,7 +1673,7 @@ private:
                 auto res= create_topic(topicname,num);
                 MB mb;
                 mb.append(res);
-                send(client_fd,Eve::SERVER_RESPONSE_CREATE_TOPIC,correlation_id,ack_level,mb.data);
+                session.send(Eve::SERVER_RESPONSE_CREATE_TOPIC,correlation_id,ack_level,mb.data);
 
             }
 
@@ -1643,9 +1687,6 @@ private:
     }
 
 
-    void send(int target_fd,Eve event_type,uint32_t correlation_id,uint16_t ack_level,const Mybyte& msg_body){
-        server_.send_msg(target_fd,event_type,correlation_id,ack_level,msg_body);
-    }
 
     void start_groupcoordinator(){
         // 在使用之前检查 consumer_offset_manager_ptr_ 是否有效
@@ -1653,10 +1694,7 @@ private:
             throw std::runtime_error("ConsumerOffset manager not initialized before starting GroupCoordinator.");
         }
         groupcoordinator_ = std::make_shared<GroupCoordinator>(consumer_offset_manager_ptr_, topicmap);
-        groupcoordinator_->set_callback([this](int client_fd,uint32_t correlation_id_lastjoin,Eve event_type, Mybyte msg){
-            uint16_t placehold2=UINT16_MAX;
-            server_.send_msg(client_fd,event_type,correlation_id_lastjoin,placehold2, msg);
-        });
+
         timer_.commit_ms([this]{
             start_group_checkliveness();
         },

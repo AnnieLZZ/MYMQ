@@ -53,10 +53,6 @@ void MYMQ_S::clear_partition(const std::string& topicname, size_t partition)
     pimpl->clear_partition(topicname, partition);
 }
 
-std::pair<int, Err> MYMQ_S::joinGroup(const std::string& groupid, ConsumerInfo& inf)
-{
-    return pimpl->joinGroup(groupid, inf);
-}
 
 Err MYMQ_S::leave_group(const std::string& groupid, const std::string& memberid)
 {
@@ -77,8 +73,4 @@ HeartbeatResponce MYMQ_S::heartbeat(const std::string& group_id, const std::stri
     return pimpl->heartbeat(group_id, member_id);
 }
 
-std::pair<ConsumerGroupState::GroupState, bool> MYMQ_S::get_SpecificState(const std::string& groupid)
-{
-    return pimpl->get_SpecificState(groupid);
-}
 
