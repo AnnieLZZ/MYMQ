@@ -11,8 +11,8 @@
 
 | Metric | Throughput |
 | :--- | :--- |
-| **Push (Producer)** | **> 100,000 msg/s** |
-| **Poll (Consumer)** | **> 95,000 msg/s** |
+| **Push (Producer)** | **> 133,000 msg/s** |
+| **Poll (Consumer)** | **> 109,000 msg/s** |
 
 ## 🚀 架构设计 (Architecture Features)
 
@@ -23,8 +23,12 @@
 * **Compression:** 消息采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，利用 Page Cache 读写优势并提高带宽利用率。
 
 ### 2. 并发模型 (Concurrency Model)
+* **FD-Sharded Thread Pool:** 引入基于客户端文件描述符 (FD) 的**分片式线程池**。通过将不同客户端连接哈希分片至特定线程处理，显著减少了线程间的上下文切换与锁竞争，大幅提升了多连接并发场景下的处理效率。
+* **Session-Based Decoupling:** 封装 `TcpSession` 类作为网络层与业务层的交互桥梁，实现了**状态机与业务逻辑的彻底解耦**：
+    * **封装性:** 业务层无需感知底层通信状态机 (FSM) 细节，仅需通过 Session 对象即可安全地发送响应。
+    * **生命周期管理:** Session 内部持有状态机的 `shared_ptr`。业务层通过拷贝 Session 对象（而非引用）即可在任意上下文（包括异步延时任务、长耗时任务）中安全回调。
+    * **无锁化优化:** 该机制避免了长时业务任务长时间占用 TBB Map 的桶元素，消除了对其他线程查找连接映射的性能干扰 (Bucket Contention)，保证了高并发下核心索引的高效访问。
 * **Lock-Free Queue:** 通信层使用 `moodycamel::ReaderWriterQueue` (**SPSC 无锁队列**) 减少线程竞争和锁开销。
-* **Concurrent Structures:** 核心索引与元数据管理使用 `Intel TBB` 保证线程安全。
 * **Event-Driven:** 基于 `epoll` + `Reactor` + `SSL通信` 模式，配合有限状态机 (FSM) 处理并发连接与事务。
 
 ### 3. 分布式协同 (Distributed Coordination)
@@ -38,13 +42,11 @@
 ## 🛠️ 技术栈 (Tech Stack)
 
 * **Kernel/Network:** `Epoll`, `Reactor`, `Linux sendfile`, `OpenSSL kTLS`
-* **Concurrency:** `Intel TBB`, `moodycamel::ReaderWriterQueue (Lock-Free)`, `C++14 Threads`
+* **Concurrency:** `Intel TBB`, `FD-Sharding Pool`, `moodycamel::ReaderWriterQueue (Lock-Free)`, `C++14 Threads`
 * **Storage/Algo:** `write/writev (Sequential Write)`, `mmap (Read/Zero-Copy)`, `ZSTD`, `Sparse Indexing`, `CRC32`
 * **Build/Test:** `CMake`, `GTest`
 
 ---
-
-
 
 ## 📖 如何使用 (How to Use)
 
