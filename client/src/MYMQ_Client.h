@@ -4,7 +4,7 @@
 #include "MurmurHash2.h"
 #include"MYMQ_innercodes.h"
 #include"MYMQ_PublicCodes.h"
-
+#include"SharedThreadPool.h"
 #include"Timer.h"
 #include <unordered_set>
 
@@ -177,6 +177,7 @@ private:
     ZSTD_DCtx* dctx;
     MYMQ::ACK_Level ack_level_;
 
+    ShardedThreadPool& pool_=ShardedThreadPool::instance(8);
 };
 
 

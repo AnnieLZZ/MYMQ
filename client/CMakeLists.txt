@@ -2,7 +2,6 @@ cmake_minimum_required(VERSION 3.10)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
 # 定义版本号
 project(MYMQ VERSION 1.0.0 LANGUAGES CXX)
 
@@ -47,6 +46,7 @@ target_include_directories(mymq_lib
         "${TP_DIR}/openssl3/include"
         "${TP_DIR}/readerwriterqueue/include"
         "${TP_DIR}/nlohmann"
+        "${TP_DIR}/concurrentqueue/include"
 )
 
 target_link_libraries(mymq_lib
