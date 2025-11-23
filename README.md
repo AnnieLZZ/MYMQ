@@ -6,45 +6,38 @@
 ---
 
 
-## ⚡ 核心性能 (Performance Benchmark)
-
-单机单分区 (Single Node, Single Partition) 环境，消息体大小 200~300B：
-
-| Metric | Throughput |
-| :--- | :--- |
-| **Push (Producer)** | **> 133,000 msg/s** |
-| **Poll (Consumer)** | **> 109,000 msg/s** |
-
 ## 🚀 架构设计 (Architecture Features)
 
 ### 1. I/O 与存储优化 (I/O & Storage)
-* **Zero-Copy with kTLS:** 结合 Linux `sendfile` 与 `mmap` 减少内核态/用户态拷贝；引入 **OpenSSL kTLS (Kernel TLS)** 将加密操作卸载至内核，在保障传输安全的同时维持 sendfile 的零拷贝特性。
-* **Page Cache 顺序写优化:** 利用 Linux Page Cache 特性优化写入性能。实际测试中，使用 `write` 和 `writev` 系统调用（大部分场景为 write）替代内存映射进行持久化，在 8KB~32KB 大文件的顺序写场景下，速率相比 mmap 提升 **12倍**。
-* **Log-Structured Storage:** 采用“日志段 (Log Segment) + 稀疏索引”结构，实现 $O(\log n)$ 级寻址。
-* **Compression:** 消息采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，利用 Page Cache 读写优势并提高带宽利用率。
+* **Zero-Copy with kTLS:** 结合 `sendfile` 实现零拷贝传输；引入 **OpenSSL kTLS (Kernel TLS)** 将加密卸载至内核态，解决了传统 SSL 在用户态加密导致无法利用 sendfile 的痛点，显著减少内核/用户态上下文切换。
+* **Hybrid Storage Strategy (混合存储策略):** * **Log Segment (日志段):** 采用标准 `write` 系统调用进行 Append-only 追加写。利用 Linux Page Cache 的顺序写合并机制，避免了 `mmap` 在处理变长文件追加时频繁触发的缺页中断 (Page Faults) 和 TLB 刷新。实测在 8KB~32KB 顺序写场景下，`write` 吞吐量相比 `mmap` 提升约 **12倍**。
+    * **Sparse Index (稀疏索引):** 采用 `mmap` 内存映射。针对固定步长的索引文件，利用内存映射避免读取时的 buffer 拷贝，实现高效的 $O(\log n)$ 二分查找。
+* **Log-Structured:** 采用标准“分段日志 + 稀疏索引”结构，支持按时间或大小滚动切分，保证了写入性能的线性扩展。
+* **Compression:** 消息体采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，有效降低网络带宽与磁盘 I/O 压力。
 
 ### 2. 并发模型 (Concurrency Model)
-* **FD-Sharded Thread Pool:** 引入基于客户端FD的**分片式线程池**，底层任务队列采用 `moodycamel::BlockingConcurrentQueue`。相比于自旋锁或非阻塞队列，该设计有效避免了线程空闲时的 CPU 空转，降低了系统资源消耗。结合连接哈希分片策略，显著减少了线程间的上下文切换与锁竞争，提升多连接场景下的处理效率。
-* **Session-Based Decoupling:** 封装 `TcpSession` 类作为网络层与业务层的交互桥梁，实现**状态机与业务逻辑的解耦**：
-    * **封装性:** 业务层无需感知底层通信状态机 (FSM) 细节，仅需通过 Session 对象即可安全地发送响应。
-    * **生命周期管理:** Session 内部持有状态机的 `shared_ptr`。业务层通过拷贝 Session 对象即可在任意上下文（包括异步延时任务、长耗时任务）中安全回调。
-    * **无锁化优化:** 避免长时业务任务长时间占用 TBB Map 的桶元素，消除了对其他线程查找连接映射的性能干扰，保证了高并发下核心索引的高效访问。
-* **Lock-Free Queue:** 通信层使用 `moodycamel::ReaderWriterQueue` (**SPSC 无锁队列**) 减少线程竞争和锁开销。
-* **Event-Driven:** 基于 `epoll` + `Reactor` + `SSL通信` 模式，配合有限状态机 (FSM) 处理并发连接与事务。
+* **FD-Sharded Thread Pool:** 引入基于连接 FD 哈希的**分片式线程池**，底层使用 `moodycamel::BlockingConcurrentQueue`。该设计保证了同一连接的请求处理具备 CPU 亲和性 (Affinity)，大幅减少线程间的上下文切换与锁竞争。
+* **Session-Based Decoupling:** 封装 `TcpSession` 实现网络层 (Reactor) 与业务层的解耦：
+    * 利用 `shared_ptr` 延长 Session 生命周期，确保在异步/长耗时任务回调中对象的安全性。
+    * 业务层通过持有 Session 副本发送响应，无需长时间占用全局连接表 (TBB Map) 的锁资源，保障了高并发下核心索引的访问效率。
+* **Lock-Free Queue:** 通信层内部使用 `moodycamel::ReaderWriterQueue` (**SPSC**) 处理单生产者单消费者场景，最小化线程同步开销。
+* **Event-Driven:** 基于 `epoll` (ET模式) + `Reactor` 模式，配合非阻塞 I/O 与有限状态机 (FSM) 处理高并发连接。
 
 ### 3. 分布式协同 (Distributed Coordination)
-* **Incremental Cooperative Rebalancing:** 实现了 Kafka 版本的“增量协作式重平衡”机制，相比传统停顿方式，提高了不稳定消费者组的协作效率。
-* **Group Coordinator:** 内置组协调器协议，自动管理分区分配、消费者心跳及 Offset 提交。
+* **Incremental Cooperative Rebalancing:** 实现了 Kafka 协议的“增量协作式重平衡”。相比传统的 Eager Rebalancing，该机制允许消费者在重平衡期间保留部分分区所有权，消除了“Stop-the-world”带来的消费停顿。
+* **Group Coordinator:** 内置组协调器，管理消费者组状态、分区分配策略、心跳检测及 Offset 提交。
 
 ### 4. 安全与可靠性 (Security & Reliability)
-* **Data Integrity:** 全链路以及 **RecordBatch** 本体均内嵌 `CRC32` 校验，实现端到端的消息完整性保障（覆盖传输和存储过程）。
-* **SSL/TLS:** 采用 SSL 协议，基于 DHE-RSA-AES128-SHA256 等安全套件，通过双向认证和加密通信确数据的机密性和身份可信。
+* **Data Integrity:** 实现了端到端的 **CRC32** 校验（覆盖 RecordBatch 生成、传输、落盘全链路），防止网络翻转或磁盘静默错误导致的数据损坏。
+* **SSL/TLS:** 支持双向认证，基于 DHE-RSA-AES128-SHA256 等安全套件保障通信机密性。
+
+---
 
 ## 🛠️ 技术栈 (Tech Stack)
 
-* **Kernel/Network:** `Epoll`, `Reactor`, `Linux sendfile`, `OpenSSL kTLS`
-* **Concurrency:** `Intel TBB`, `FD-Sharding Pool`, `moodycamel::BlockingConcurrentQueue`, `moodycamel::ReaderWriterQueue (Lock-Free)`, `C++14 Threads`
-* **Storage/Algo:** `write/writev (Sequential Write)`, `mmap (Read/Zero-Copy)`, `ZSTD`, `Sparse Indexing`, `CRC32`
+* **Kernel/Network:** `Epoll (ET)`, `Reactor Pattern`, `Linux sendfile`, `OpenSSL kTLS`
+* **Concurrency:** `Intel TBB`, `FD-Sharding`, `moodycamel::ConcurrentQueue`, `C++17`
+* **Storage/Algo:** `write (Sequential Log)`, `mmap (Index)`, `ZSTD`, `Sparse Indexing`, `CRC32`
 * **Build/Test:** `CMake`, `GTest`
 
 ---
