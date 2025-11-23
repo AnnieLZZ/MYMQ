@@ -5,6 +5,12 @@
 
 ---
 
+根据您的要求，我将重点放在**FD-Sharded Thread Pool**的描述中，融入关于 `moodycamel::BlockingConcurrentQueue` 的使用及其对 CPU 资源的优化（避免空转）。同时，我也更新了底部的技术栈列表以保持一致。
+
+以下是修改后的完整文案，保持了朴素、专业的工程化描述风格：
+
+***
+
 ## ⚡ 核心性能 (Performance Benchmark)
 
 单机单分区 (Single Node, Single Partition) 环境，消息体大小 200~300B：
@@ -23,11 +29,11 @@
 * **Compression:** 消息采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，利用 Page Cache 读写优势并提高带宽利用率。
 
 ### 2. 并发模型 (Concurrency Model)
-* **FD-Sharded Thread Pool:** 引入基于客户端文件描述符 (FD) 的**分片式线程池**。通过将不同客户端连接哈希分片至特定线程处理，显著减少了线程间的上下文切换与锁竞争，大幅提升了多连接并发场景下的处理效率。
-* **Session-Based Decoupling:** 封装 `TcpSession` 类作为网络层与业务层的交互桥梁，实现了**状态机与业务逻辑的彻底解耦**：
+* **FD-Sharded Thread Pool:** 引入基于客户端FD的**分片式线程池**，底层任务队列采用 `moodycamel::BlockingConcurrentQueue`。相比于自旋锁或非阻塞队列，该设计有效避免了线程空闲时的 CPU 空转，降低了系统资源消耗。结合连接哈希分片策略，显著减少了线程间的上下文切换与锁竞争，提升多连接场景下的处理效率。
+* **Session-Based Decoupling:** 封装 `TcpSession` 类作为网络层与业务层的交互桥梁，实现**状态机与业务逻辑的解耦**：
     * **封装性:** 业务层无需感知底层通信状态机 (FSM) 细节，仅需通过 Session 对象即可安全地发送响应。
-    * **生命周期管理:** Session 内部持有状态机的 `shared_ptr`。业务层通过拷贝 Session 对象（而非引用）即可在任意上下文（包括异步延时任务、长耗时任务）中安全回调。
-    * **无锁化优化:** 该机制避免了长时业务任务长时间占用 TBB Map 的桶元素，消除了对其他线程查找连接映射的性能干扰 (Bucket Contention)，保证了高并发下核心索引的高效访问。
+    * **生命周期管理:** Session 内部持有状态机的 `shared_ptr`。业务层通过拷贝 Session 对象即可在任意上下文（包括异步延时任务、长耗时任务）中安全回调。
+    * **无锁化优化:** 避免长时业务任务长时间占用 TBB Map 的桶元素，消除了对其他线程查找连接映射的性能干扰，保证了高并发下核心索引的高效访问。
 * **Lock-Free Queue:** 通信层使用 `moodycamel::ReaderWriterQueue` (**SPSC 无锁队列**) 减少线程竞争和锁开销。
 * **Event-Driven:** 基于 `epoll` + `Reactor` + `SSL通信` 模式，配合有限状态机 (FSM) 处理并发连接与事务。
 
@@ -42,7 +48,7 @@
 ## 🛠️ 技术栈 (Tech Stack)
 
 * **Kernel/Network:** `Epoll`, `Reactor`, `Linux sendfile`, `OpenSSL kTLS`
-* **Concurrency:** `Intel TBB`, `FD-Sharding Pool`, `moodycamel::ReaderWriterQueue (Lock-Free)`, `C++14 Threads`
+* **Concurrency:** `Intel TBB`, `FD-Sharding Pool`, `moodycamel::BlockingConcurrentQueue`, `moodycamel::ReaderWriterQueue (Lock-Free)`, `C++14 Threads`
 * **Storage/Algo:** `write/writev (Sequential Write)`, `mmap (Read/Zero-Copy)`, `ZSTD`, `Sparse Indexing`, `CRC32`
 * **Build/Test:** `CMake`, `GTest`
 
