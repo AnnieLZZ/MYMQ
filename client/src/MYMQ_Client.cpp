@@ -1,6 +1,4 @@
 #include"MYMQ_Client.h"
-
-
 MYMQ_clientuse::MYMQ_clientuse(const std::string& clientid,uint8_t ack_level):path_(MYMQ::run_directory_DEFAULT),cmc_(MYMQ::run_directory_DEFAULT){
 
     Config_manager::ensure_path_existed(MYMQ::run_directory_DEFAULT);
@@ -931,142 +929,154 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
             auto pull_inf_additional=mp.read_uchar_vector();
             MP mp_pull_inf_additional(pull_inf_additional);
+            auto topicname_=mp_pull_inf_additional.read_string();
+            auto partition_=mp_pull_inf_additional.read_size_t();
+            auto shared_key_raw=topicname_+std::to_string(partition_);
+            auto shared_key= MurmurHash2::hash(shared_key_raw,0x9747b28c);
             auto error=static_cast<Err>(mp_pull_inf_additional.read_uint16()) ;
             auto offset_batch_first=mp_pull_inf_additional.read_size_t();
-            auto topicname=mp_pull_inf_additional.read_string();
-            auto partition=mp_pull_inf_additional.read_size_t();
-            out("[PULL] Messages batch from (TOPIC '"+topicname+"' PARTITION '"+std::to_string(partition)+") responce reached. ");
+
+
+            out("[PULL] Messages batch from (TOPIC '"+topicname_+"' PARTITION '"+std::to_string(partition_)+") responce reached. ");
             out(std::string{}+"[PULL] Result : "+" State : "+MYMQ_Public::to_string(error));
             if(error==Err::NULL_ERROR){
-                auto message_collection= mp.read_uchar_vector();
-                size_t current_position = 0;
-                const size_t collection_size = message_collection.size();
+                 auto message_collection_= mp.read_uchar_vector();
+                ShardedThreadPool::instance().submit(shared_key,[this,topicname=std::move(topicname_),partition=partition_,message_collection=std::move(message_collection_)]{
+                    size_t current_position = 0;
+                    const size_t collection_size = message_collection.size();
 
-                // 消息头部包含一个 uint64_t 的逻辑偏移和一个 uint32_t 的消息实际长度。
-                const size_t RECORD_HEADER_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
+                    // 消息头部包含一个 uint64_t 的逻辑偏移和一个 uint32_t 的消息实际长度。
+                    const size_t RECORD_HEADER_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
 
 
-                bool is_interrupted=0;
-                while (current_position < collection_size) {
-                    // 1. 检查是否有足够的空间读取消息头部 (uint64_t + uint32_t)
-                    if (current_position + RECORD_HEADER_SIZE > collection_size) {
-                        // 这可能是集合的末尾，只剩下了部分头部，或者数据损坏。
-                        // 如果集合不为空，且当前位置在头部大小之内，则可能是数据不完整。
-                        if (collection_size > 0 && current_position < collection_size) {
-                            std::cerr << "Warning: Partial message header detected at end of collection (position "
-                                      << current_position << "). Stopping extraction." << std::endl;
+                    bool is_interrupted=0;
+                    while (current_position < collection_size) {
+                        // 1. 检查是否有足够的空间读取消息头部 (uint64_t + uint32_t)
+                        if (current_position + RECORD_HEADER_SIZE > collection_size) {
+                            // 这可能是集合的末尾，只剩下了部分头部，或者数据损坏。
+                            // 如果集合不为空，且当前位置在头部大小之内，则可能是数据不完整。
+                            if (collection_size > 0 && current_position < collection_size) {
+                                std::cerr << "Warning: Partial message header detected at end of collection (position "
+                                          << current_position << "). Stopping extraction." << std::endl;
+                            }
+                            is_interrupted=1;
+                            break;
                         }
-                        is_interrupted=1;
-                        break;
-                    }
 
 
-                    uint32_t record_size;
+                        uint32_t record_size;
 
-                    // 2. 从当前位置读取逻辑偏移和消息实际长度
-                    // 注意：这里假设数据是以网络字节序存储的，需要转换为宿主字节序。
-                    std::memcpy(&record_size, message_collection.data() + current_position + sizeof(uint64_t), sizeof(uint32_t));
+                        // 2. 从当前位置读取逻辑偏移和消息实际长度
+                        // 注意：这里假设数据是以网络字节序存储的，需要转换为宿主字节序。
+                        std::memcpy(&record_size, message_collection.data() + current_position + sizeof(uint64_t), sizeof(uint32_t));
 
-                    // 将网络字节序转换为宿主字节序
-                    // NOTE: 确保在您的环境中定义了 ntohl/ntohll 或类似的字节序转换函数
-                    record_size = ntohl(record_size);
+                        // 将网络字节序转换为宿主字节序
+                        // NOTE: 确保在您的环境中定义了 ntohl/ntohll 或类似的字节序转换函数
+                        record_size = ntohl(record_size);
 
-                    // 3. 验证消息实际长度，并检查消息数据是否超出集合边界
-                    if (record_size == 0) {
+                        // 3. 验证消息实际长度，并检查消息数据是否超出集合边界
+                        if (record_size == 0) {
 
-                        std::cerr << "Warning: Message with zero length found at position " << current_position
-                                  << ". This might indicate end of valid data or corruption. Stopping extraction." << std::endl;
-                        is_interrupted=1;
-                        break;
-                    }
+                            std::cerr << "Warning: Message with zero length found at position " << current_position
+                                      << ". This might indicate end of valid data or corruption. Stopping extraction." << std::endl;
+                            is_interrupted=1;
+                            break;
+                        }
 
-                    if (current_position + RECORD_HEADER_SIZE + record_size > collection_size) {
-                        // 消息数据超出了集合的实际大小，表明数据损坏。
-                        std::cerr << "Error: Message data truncated or record_size too large at position "
-                                  << current_position << ". Expected at least " << current_position + RECORD_HEADER_SIZE + record_size
-                                  << " bytes, but collection has only " << collection_size << " bytes. Stopping extraction." << std::endl;
-                        is_interrupted=1;
-                        break;
-                    }
+                        if (current_position + RECORD_HEADER_SIZE + record_size > collection_size) {
+                            // 消息数据超出了集合的实际大小，表明数据损坏。
+                            std::cerr << "Error: Message data truncated or record_size too large at position "
+                                      << current_position << ". Expected at least " << current_position + RECORD_HEADER_SIZE + record_size
+                                      << " bytes, but collection has only " << collection_size << " bytes. Stopping extraction." << std::endl;
+                            is_interrupted=1;
+                            break;
+                        }
 
-                    // 4. 提取消息数据
-                    std::vector<unsigned char> records_nothandled(record_size);
-                    std::memcpy(records_nothandled.data(), message_collection.data() + current_position + RECORD_HEADER_SIZE, record_size);
+                        // 4. 提取消息数据
+                        std::vector<unsigned char> records_nothandled(record_size);
+                        std::memcpy(records_nothandled.data(), message_collection.data() + current_position + RECORD_HEADER_SIZE, record_size);
 
-                    {
-                        // 消息内容处理...
-                        MessageParser mp(records_nothandled);
-                        auto base= mp.read_size_t();
-                        auto record_num=mp.read_size_t();
-                        auto records_nozstd=MYMQ::ZSTD::zstd_decompress( dctx,mp.read_uchar_vector());
-                        MessageParser mp_records_serial(records_nozstd);
-                        for(size_t i=0;i<record_num;i++){
-                            auto record_serial=mp_records_serial.read_uchar_vector();
-                            std::string key;
-                            std::string value;
-                            int64_t time;
-                            try {
-                                if (record_serial.empty()) {
-                                    throw std::out_of_range("EMPTY RECORD");
-                                }
-
-                                MessageParser mp(record_serial);
-                                auto crc=mp.read_uint32();
-                                auto msg=mp.read_uchar_vector();
-                                if(!MYMQ::Crc32::verify_crc32(msg,crc)){
-                                    throw std::out_of_range("Crc verify failed");
-                                }
+                        {
+                            // 消息内容处理...
+                            MessageParser mp(records_nothandled);
+                            auto base= mp.read_size_t();
+                            auto record_num=mp.read_size_t();
+                            auto records_nozstd=MYMQ::ZSTD::zstd_decompress( dctx,mp.read_uchar_vector());
+                            MessageParser mp_records_serial(records_nozstd);
+                            for(size_t i=0;i<record_num;i++){
+                                auto record_serial=mp_records_serial.read_uchar_vector();
+                                std::string key;
+                                std::string value;
+                                int64_t time;
                                 try {
-                                    MessageParser mp2(msg);
-                                    key=mp2.read_string();
-                                    value=mp2.read_string();
-                                    time=mp2.read_int64();
+                                    if (record_serial.empty()) {
+                                        throw std::out_of_range("EMPTY RECORD");
+                                    }
 
-                                } catch (std::exception& e) {
+                                    MessageParser mp(record_serial);
+                                    auto crc=mp.read_uint32();
+                                    auto msg=mp.read_uchar_vector();
+                                    if(!MYMQ::Crc32::verify_crc32(msg,crc)){
+                                        throw std::out_of_range("Crc verify failed");
+                                    }
+                                    try {
+                                        MessageParser mp2(msg);
+                                        key=mp2.read_string();
+                                        value=mp2.read_string();
+                                        time=mp2.read_int64();
 
-                                    throw std::out_of_range("UNKNOWN ERROR IN RECORD PARASE");
+                                    } catch (std::exception& e) {
+
+                                        throw std::out_of_range("UNKNOWN ERROR IN RECORD PARASE");
+                                    }
+                                } catch (std::out_of_range& e) {
+                                    is_interrupted=1;
+                                    break;
                                 }
-                            } catch (std::out_of_range& e) {
-                                is_interrupted=1;
-                                break;
-                            }
-                            if (!poll_queue.try_emplace(std::move(MYMQ_Public::ConsumerRecord(
-                                    topicname,partition,key,value,time,base+i)) )) {
+                                if (!poll_queue.try_emplace(std::move(MYMQ_Public::ConsumerRecord(
+                                        topicname,partition,key,value,time,base+i)) )) {
 
-                                cerr("Poll result : Poll queue full .");
-                                is_interrupted=1;
-                                break;
+                                    cerr("Poll result : Poll queue full .");
+                                    is_interrupted=1;
+                                    break;
+                                }
                             }
+                        }
+                        if(is_interrupted){
+                            break;
+                        }
+
+
+                        size_t current_record_logical_end = current_position + RECORD_HEADER_SIZE + record_size;
+
+                        // 6. 更新当前位置以处理下一个消息 (直接跳到当前记录的逻辑末尾)
+                        current_position = current_record_logical_end; // <--- 关键修改点：直接使用逻辑末尾
+
+                        if (current_position > collection_size) {
+                            std::cerr << "Warning: Next message position (" << current_position
+                                      << ") unexpectedly jumped far beyond collection size (" << collection_size
+                                      << "). Data structure might be corrupt." << std::endl;
+                            is_interrupted=1;
+                            break;
                         }
                     }
                     if(is_interrupted){
-                        break;
+                        cerr("PULL be interrupt by some error");
                     }
 
+                    poll_ready.store(1);
+                    cv_poll_ready.notify_all();
 
-                    size_t current_record_logical_end = current_position + RECORD_HEADER_SIZE + record_size;
+                });
 
-                    // 6. 更新当前位置以处理下一个消息 (直接跳到当前记录的逻辑末尾)
-                    current_position = current_record_logical_end; // <--- 关键修改点：直接使用逻辑末尾
-
-                    if (current_position > collection_size) {
-                        std::cerr << "Warning: Next message position (" << current_position
-                                  << ") unexpectedly jumped far beyond collection size (" << collection_size
-                                  << "). Data structure might be corrupt." << std::endl;
-                        is_interrupted=1;
-                        break;
-                    }
-                }
-                if(is_interrupted){
-                    cerr("PULL be interrupt by some error");
-                }
 
             }
             else{
 
+                poll_ready.store(1);
+                cv_poll_ready.notify_all();
             }
-            poll_ready.store(1);
-            cv_poll_ready.notify_all();
+
 
 
         }
