@@ -8,19 +8,14 @@
 ## ⚡ 核心性能 (Performance Benchmark)
 
 
+## 📊 单机单分区性能指标 (Single Node, Single Partition)
 
-单机单分区 (Single Node, Single Partition) 环境，消息体大小 200~300B：
-
-
+**消息体大小:** 200~300B
 
 | Metric | Throughput |
-
 | :--- | :--- |
-
 | **Push (Producer)** | **> 133,000 msg/s** |
-
 | **Poll (Consumer)** | **> 109,000 msg/s** |
-
 
 
 ---
