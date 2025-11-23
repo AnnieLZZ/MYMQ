@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # 定义版本号
 project(MYMQ VERSION 1.0.0 LANGUAGES CXX)
 
-set(TP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty")
+
 
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
@@ -18,6 +18,7 @@ set(SRC_FILES
     src/MYMQ_Client.cpp
 )
 
+set(TP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty")
 set(INTERNAL_HEADERS
     src/MYMQ_Client.h
     src/MYMQ_innercodes.h
