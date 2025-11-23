@@ -23,12 +23,19 @@
 
 ## 🚀 架构设计 (Architecture Features)
 
+
 ### 1. I/O 与存储优化 (I/O & Storage)
-* **Zero-Copy with kTLS:** 结合 `sendfile` 实现零拷贝传输；引入 **OpenSSL kTLS (Kernel TLS)** 将加密卸载至内核态，解决了传统 SSL 在用户态加密导致无法利用 sendfile 的痛点，显著减少内核/用户态上下文切换。
-* **Hybrid Storage Strategy (混合存储策略):** * **Log Segment (日志段):** 采用标准 `write` 系统调用进行 Append-only 追加写。利用 Linux Page Cache 的顺序写合并机制，避免了 `mmap` 在处理变长文件追加时频繁触发的缺页中断 (Page Faults) 和 TLB 刷新。实测在 8KB~32KB 顺序写场景下，`write` 吞吐量相比 `mmap` 提升约 **12倍**。
-    * **Sparse Index (稀疏索引):** 采用 `mmap` 内存映射。针对固定步长的索引文件，利用内存映射避免读取时的 buffer 拷贝，实现高效的 $O(\log n)$ 二分查找。
-* **Log-Structured:** 采用标准“分段日志 + 稀疏索引”结构，支持按时间或大小滚动切分，保证了写入性能的线性扩展。
-* **Compression:** 消息体采用紧凑二进制排布，支持 **Batch 聚合** 与 **ZSTD** 压缩，有效降低网络带宽与磁盘 I/O 压力。
+* **Zero-Copy with kTLS:** 结合 `sendfile` 实现零拷贝传输；引入 **OpenSSL kTLS** 将加密卸载至内核态，解决了传统 SSL 在用户态加密导致无法利用 sendfile 的痛点，显著减少内核/用户态上下文切换。
+* **混合存储策略:**
+    * **日志段:** 采用标准 `write` 系统调用进行 Append-only 追加写。利用 Linux Page Cache 的顺序写合并机制，避免了 `mmap` 在处理变长文件追加时频繁触发的**缺页中断**和 TLB 刷新。实测在 8KB~32KB 顺序写场景下，`write` 吞吐量相比 `mmap` 提升约 **12倍**。
+    * **稀疏索引:** 采用 `mmap` 内存映射。针对固定步长的索引文件，利用内存映射避免读取时的 buffer 拷贝，实现高效的 $O(\log n)$ 二分查找。
+* **Log-Structured:** 采用标准“分段日志 + 稀疏索引”结构。**基于 Base Offset 命名日志段**，支持**按段大小自动滚动**，保证了磁盘空间的有序管理与写入性能的线性扩展。
+* **原生批量架构:**
+    * **强制聚合:** 摒弃单条消息传输，**强制**采用 RecordBatch 形式进行全链路传输与存储。
+    * **设计考量:**
+        1. **I/O 吞吐:** 配合 Linux Page Cache 机制，大块数据的顺序 `write` 能极大提升内核写缓冲效率与磁盘带宽利用率。
+        2. **ZSTD 压缩收益:** 大块数据提供了更丰富的上下文，显著提升 **ZSTD** 的字典匹配效率与压缩比，克服了小包压缩率低的缺陷。
+        3. **网络效率:** 均摊了系统调用开销，显著减少网络往返与 TCP 包头开销。
 
 ### 2. 并发模型 (Concurrency Model)
 * **FD-Sharded Thread Pool:** 引入基于连接 FD 哈希的**分片式线程池**，底层使用 `moodycamel::BlockingConcurrentQueue`。该设计保证了同一连接的请求处理具备 CPU 亲和性 (Affinity)，大幅减少线程间的上下文切换与锁竞争。
