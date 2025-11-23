@@ -87,7 +87,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         }
 
 
-        auto msg=MYMQ::MSG_serial:: build_Record(key,value);
+        std::vector<unsigned char> msg;
+        msg=std::move(MYMQ::MSG_serial:: build_Record(key,value)) ;
 
         auto& curr_queue=push_queue.queue_;
 

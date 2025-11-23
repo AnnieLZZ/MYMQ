@@ -4,6 +4,7 @@
 #include "MurmurHash2.h"
 #include"MYMQ_innercodes.h"
 #include"MYMQ_PublicCodes.h"
+
 #include"Timer.h"
 #include <unordered_set>
 
@@ -11,7 +12,6 @@ using ConsumerInfo=MYMQ::ConsumerInfo;
 using Consumerbasicinfo=MYMQ::MYMQ_Client::Consumerbasicinfo;
 using Eve=MYMQ::EventType;
 using Err=MYMQ_Public::CommonErrorCode;
-using Gstate=MYMQ::MYMQ_Server::ConsumerGroupState::GroupState;
 using MB=MessageBuilder;
 using Err_Client=MYMQ_Public::ClientErrorCode;
 using Mybyte=std::vector<unsigned char>;
