@@ -14,77 +14,28 @@
 #include"MYMQ_Publiccodes.h"
 #include"Logsegment.h"
 #include"MYMQ_innercodes.h"
+#include"MYMQ_Server_ns.h"
 
 
 using Record=MYMQ::MSG_serial::Record;
-
-
 using HeartbeatResponce=MYMQ::HeartbeatResponce;
 using Err=MYMQ_Public::CommonErrorCode;
-
 using MB= MessageBuilder;
 using MP=MessageParser;
-using MesLoc=MYMQ::MYMQ_Server::MessageLocation;
+using MesLoc=MYMQ_Server::MessageLocation;
 using Mybyte=std::vector<unsigned char>;
 using Eve=MYMQ::EventType;
+using ConsumerGroupState=MYMQ_Server::ConsumerGroupState;
+using ServerConsumerInfo=MYMQ_Server::ServerConsumerInfo;
 
 
 class Topic;
-class Mmapfile;
-
 struct Topicmap{
     std::unordered_map<std::string,std::unique_ptr<Topic>> topics_;
     std::shared_mutex mtx_topic;
 };
 
-struct ServerConsumerInfo{
-    std::set<std::string> subscribed_topics;
-    std::string memberid;
-    int generation_id;
-    TcpSession session;
-    uint32_t correlation_id_lastjoin;
-    std::string clientid;
-    ServerConsumerInfo(std::set<std::string> topics,std::string memberid,int generation_id,uint32_t correlation_id_lastjoin,TcpSession session_,std::string clientid_=MYMQ::clientid_DEFAULT)
-        :subscribed_topics(topics),memberid(memberid),generation_id(generation_id),session(session_),correlation_id_lastjoin(correlation_id_lastjoin),clientid(clientid_){}
-    ServerConsumerInfo():subscribed_topics(std::set<std::string>()),memberid(std::string()),generation_id(-2),clientid(MYMQ::clientid_DEFAULT),correlation_id_lastjoin(0),session(nullptr){}
-};
 
-struct ConsumerGroupState {
-    std::string group_id;
-    std::map<std::string, ServerConsumerInfo> members; // member_id -> ConsumerInfo
-    MYMQ::MYMQ_Server:: ExpectedMemberList  expected_members;
-    std::map<std::string, std::chrono::steady_clock::time_point> last_heartbeat; // member_id -> 最后心跳时间
-    std::map<std::string, std::map<std::string, std::set<size_t>>> assignments; // member_id -> topic -> 分配的分区ID集合
-    int generation_id; // 组的世代ID，每次再平衡后递增
-    std::map<std::string,std::set<std::string>> map_subscribed_topics; // 组内所有消费者订阅的主题映射
-    std::string leader_id;
-    size_t rebalance_timeout_taskid=0;
-    size_t join_collect_timeout_taskid=0;
-
-    // 状态：
-
-    enum GroupState { STABLE, JOIN_COLLECTING, AWAITING_SYNC,EMPTY};
-    GroupState state;
-    std::mutex state_mutex; // 保护组状态的互斥锁
-    std::condition_variable rebalance_cv; // 用于 JoinGroup 阶段等待再平衡准备完成
-    std::condition_variable sync_cv; // 新增：用于 SyncGroup 阶段等待分配结果
-
-    ConsumerGroupState(const std::string& id)
-        : group_id(id),
-        expected_members(std::vector<std::string>{}),
-        state(EMPTY),
-        generation_id(-1)
-
-    {
-        // 可以在这里进行其他初始化
-    }
-    std::atomic<bool> rebalance_should = false;
-    std::atomic<bool> rebalance_ing = false;
-
-
-
-
-};
 using Gstate=ConsumerGroupState::GroupState;
 /////函数声明区
 
@@ -1486,7 +1437,7 @@ private:
             MYMQ::EventType type = static_cast<MYMQ::EventType>(event_type_short);
 
             auto decoded_msg=std::move(msg_body) ;
-//            cerr("["+std::to_string(correlation_id)+"]["+clientid+"]"+ MYMQ::to_string(static_cast<Eve>(event_type_short))+" called.");
+            cerr("["+std::to_string(correlation_id)+"]["+session.get_clientid()+"]"+ MYMQ::to_string(static_cast<Eve>(event_type_short))+" called.");
 
 
             MessageParser mp(decoded_msg);

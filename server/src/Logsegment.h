@@ -5,8 +5,9 @@
 #include"MYMQ_Publiccodes.h"
 #include <sys/uio.h>
 #include"CONFIG_MANAGER.h"
+#include"MYMQ_Server_ns.h"
 using Err=MYMQ_Public::CommonErrorCode;
-using MesLoc=MYMQ::MYMQ_Server::MessageLocation;
+using MesLoc=MYMQ_Server::MessageLocation;
 
 
 class LogSegment {

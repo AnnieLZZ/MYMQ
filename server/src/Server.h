@@ -22,13 +22,15 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include"SharedThreadPool.h"
-
-
+#include"MYMQ_Server_ns.h"
 
 using Mybyte = std::vector<unsigned char>;
 using Eve= MYMQ::EventType;
-using MesLoc=MYMQ::MYMQ_Server::MessageLocation;
+using MesLoc=MYMQ_Server::MessageLocation;
 using Err=MYMQ_Public::CommonErrorCode;
+using ClientState=MYMQ_Server::ClientState;
+using TcpSession=MYMQ_Server::TcpSession;
+using SendFileTask=MYMQ_Server::SendFileTask;
 
 
 // 辅助函数（保持不变）
@@ -83,164 +85,6 @@ std::string now_ms_time_gen_str() {
 
 
 
-struct SendFileTask {
-    int in_fd;           // 文件描述符
-    off_t offset;        // 初始偏移量
-    size_t length;       // 发送长度
-    size_t sent_so_far;  // 已发送字节数
-
-
-     bool header_sent=0;
-     std::vector<unsigned char>   header_data;
-     size_t header_send_offset=0;
-    // 下面这些仅作记录用，如果不需要可以删掉
-    size_t offset_batch_first;
-    std::string topicname;
-    size_t partition;
-    uint32_t correlation_id;
-    uint16_t ack_level;
-
-    SendFileTask(int fd, off_t off, size_t len, size_t first_off, const std::string& topic, size_t par, uint32_t cid, uint16_t ack)
-        : in_fd(fd), offset(off), length(len), sent_so_far(0),
-          offset_batch_first(first_off), topicname(topic), partition(par), correlation_id(cid), ack_level(ack) {}
-    SendFileTask(MYMQ::MYMQ_Server::MessageLocation mesloc, const std::string& topic, size_t par, uint32_t cid, uint16_t ack)
-        : in_fd(mesloc.file_descriptor), offset(mesloc.offset_in_file), length(mesloc.length), sent_so_far(0),
-          offset_batch_first(mesloc.offset_batch_first), topicname(topic), partition(par),correlation_id(cid),ack_level(ack) {}
-};
-
-class ClientState {
-    public:
-    enum State {
-        READING_HEADER,
-        READING_BODY
-    };
-
-    // 状态管理
-    State current_state = READING_HEADER;
-
-    // 接收缓冲区
-    std::vector<unsigned char> header_buffer;
-    size_t bytes_read_in_header = 0;
-
-    std::vector<unsigned char> body_buffer;
-    size_t bytes_read_in_body = 0;
-
-    // 协议解析字段
-    uint32_t expected_body_length = 0;
-    uint16_t event_type = 0;
-    uint32_t correlation_id = 0;
-    uint16_t ack_level = 0;
-
-    // 基础资源
-    std::mutex mtx; // 通用锁 (如有需要)
-    std::atomic<bool> is_closing{false};
-    int fd = -1;
-
-    bool id_registered = false;
-    std::string clientid = "UNKNOWN";
-
-    SSL* ssl = nullptr;
-    bool is_handshake_complete = false;
-    bool enable_sendfile = false;
-
-    // --- 发送相关结构 ---
-
-    // 文件发送任务 (精简版：只存文件元数据，不存 Header)
-
-
-    // 发送队列元素：可以是普通字节(Mybyte) 或 文件任务
-    using SendItem = std::variant<std::vector<unsigned char>, SendFileTask>;
-
-    std::deque<SendItem> send_queue;
-    size_t current_vec_send_offset = 0; // 如果队首是 vector，记录发送到了哪里
-    bool is_writing = false;
-    std::mutex send_queue_mtx; // 专门锁队列的锁
-
-    // 构造函数
-    ClientState(size_t header_size) : header_buffer(header_size) {}
-    ClientState() = default;
-
-
-    bool is_closed(){
-    return  this->is_closing.load();
-        }
-    int get_fd(){
-        return this->fd;
-    }
-
-    // --- 核心入队函数 ---
-    // 统一处理 ResponsePayload (可能是字节，也可能是文件)
-    void enqueue_message(uint16_t event_type, uint32_t correlation_id, uint16_t ack_level,  std::variant<std::vector<unsigned char>, SendFileTask> payload) {
-
-        short event_type_s = static_cast<short>(event_type);
-
-        // -------------------------------------------------------
-        // 情况 A: 发送普通字节消息
-        // -------------------------------------------------------
-        if (std::holds_alternative<std::vector<unsigned char>>(payload)) {
-            auto& msg_body = std::get<std::vector<unsigned char>>(payload);
-
-            MessageBuilder mb;
-            uint32_t total_length = static_cast<uint32_t>(MYMQ::HEADER_SIZE + sizeof(uint32_t) + msg_body.size());
-
-            mb.reserve(total_length);
-            mb.append_uint32(total_length);
-            mb.append_uint16(event_type_s);
-            mb.append_uint32(correlation_id);
-            mb.append_uint16(ack_level);
-            mb.append_uchar_vector(msg_body); // 拷贝 body
-
-            std::vector<unsigned char> full_message = std::move(mb.data);
-
-            {
-                std::unique_lock<std::mutex> statelock(this->send_queue_mtx);
-                this->send_queue.emplace_back(std::move(full_message));
-                if (!this->send_queue.empty()) this->is_writing = true;
-            }
-        }
-        // -------------------------------------------------------
-        // 情况 B: 发送文件 (Zero-Copy)
-        // -------------------------------------------------------
-        else if (std::holds_alternative<SendFileTask>(payload)) {
-            auto& file_task = std::get<SendFileTask>(payload);
-
-            {
-                std::unique_lock<std::mutex> statelock(this->send_queue_mtx);
-
-                // 再放文件任务
-                this->send_queue.emplace_back(std::move(file_task));
-
-                if (!this->send_queue.empty()) this->is_writing = true;
-            }
-        }
-    }
-
-};
-
-class TcpSession {
-public:
-    TcpSession(std::shared_ptr<ClientState> state) : state_(state) {}
-
-    void send(MYMQ::EventType type, uint32_t cid, uint16_t ack, std::variant<std::vector<unsigned char>, SendFileTask> payload) {
-            auto state = state_.lock();
-            if (!state || state->is_closed()) return;
-            state->enqueue_message(static_cast<uint16_t>( type), cid, ack, std::move(payload));
-        }
-    int fd() const {
-        auto state = state_.lock();
-        return state ? state->get_fd() : -1;
-    }
-
-    // 检查连接是否有效
-    bool is_connected() const {
-        auto state = state_.lock();
-        return state && !state->is_closed();
-    }
-
-
-private:
-    std::weak_ptr<ClientState> state_;
-};
 
 using ClientStateMap = tbb::concurrent_hash_map<int, std::shared_ptr<ClientState>>;
 
@@ -1026,18 +870,8 @@ private:
     }
 
     void process_message( int sock, Mybyte&& body,std::shared_ptr<ClientState> state) {
-        uint32_t coid=UINT32_MAX;
-        bool id_registered=0;
-        uint16_t eventtype=UINT16_MAX;
-        uint16_t ack_level;
-        std::string clientid ;
 
-            id_registered=state->id_registered;
-            coid=state->correlation_id;
-            eventtype=state->event_type;
-            ack_level = state->ack_level;
-            clientid = state->clientid;
-
+        uint16_t eventtype=state->event_type;
 
             std::vector<unsigned char> real_body;
         if (static_cast<Eve>(eventtype) == MYMQ::EventType::CLIENT_REQUEST_REGISTER) {

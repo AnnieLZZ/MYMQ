@@ -5,13 +5,14 @@
 #include <memory> // 为了 std::unique_ptr
 #include "MYMQ_Publiccodes.h" // 包含公共定义
 #include"MYMQ_innercodes.h"
+#include"MYMQ_Server_ns.h"
 
 using Record=MYMQ::MSG_serial::Record;
 using HeartbeatResponce=MYMQ::HeartbeatResponce;
 using Err=MYMQ_Public::CommonErrorCode;
 using MB= MessageBuilder;
 using MP=MessageParser;
-using MesLoc=MYMQ::MYMQ_Server::MessageLocation;
+using MesLoc=MYMQ_Server::MessageLocation;
 using Mybyte=std::vector<unsigned char>;
 using Eve=MYMQ::EventType;
 class MessageQueue;
