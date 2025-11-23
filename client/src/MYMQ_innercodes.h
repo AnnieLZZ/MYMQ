@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include<memory>
 #include <errno.h>
 #include<iostream>
 #include <cstdint>
@@ -27,10 +28,11 @@
 #include <string>
 #include"zlib.h"
 #include"zstd.h"
-#include"Serialize.h"
+#include"../src/Serialize.h"
 #include <ctime>
 #include <iomanip>
-#include"MYMQ_PublicCodes.h"
+#include<functional>
+#include"MYMQ_Publiccodes.h"
 
 
 
@@ -341,7 +343,7 @@ struct UserInfo
 {
     std::string clientid;
     int sock;
-    UserInfo():sock(-1),clientid(MYMQ::clientid_DEFAULT) {}
+    UserInfo():clientid(MYMQ::clientid_DEFAULT),sock(-1) {}
     UserInfo(const std::string& clientid_,int sock_):sock(sock_),clientid(clientid_){}
 };
 
@@ -413,102 +415,11 @@ struct endoffset_point
 
 }
 
-namespace MYMQ_Server {
-
-struct MessageLocation {
-    int     file_descriptor=-1; // 日志文件的 fd
-    off_t   offset_in_file=0;  // 在文件内的物理偏移
-    size_t  length=0;          // 消息长度
-    bool    found=0;
-    size_t offset_batch_first=0;
-};
-
-class ExpectedMemberList {
-public:
-
-    ExpectedMemberList(const std::vector<std::string> & initial_consumers) {
-        reset(initial_consumers);
-    }
-
-    void reset(const std::vector<std::string> & new_consumers) {
-        people_status_.clear();
-        uncalled_count_.store( 0);
-        for(const auto& name:new_consumers){
-            people_status_.emplace(name, false);
-            uncalled_count_.fetch_add(1);
-        }
-
-
-    }
-
-
-    bool callandcheck(const std::string& name) {
-        auto it = people_status_.find(name);
-        if (it != people_status_.end()) {
-            if (!it->second) {
-                it->second = true;
-                uncalled_count_.fetch_sub(1);
-
-            }
-
-        }
-        return areAllCalled();
-    }
-
-
-
-private:
-    bool areAllCalled() const {
-        return uncalled_count_.load() <= 0;
-    }
-private:
-    std::unordered_map<std::string, bool> people_status_;
-    std::atomic<size_t>  uncalled_count_ = 0;
-};
-
-
-struct ConsumerGroupState {
-    std::string group_id;
-    std::map<std::string, ConsumerInfo> members; // member_id -> ConsumerInfo
-    ExpectedMemberList  expected_members;
-    std::map<std::string, std::chrono::steady_clock::time_point> last_heartbeat; // member_id -> 最后心跳时间
-    std::map<std::string, std::map<std::string, std::set<size_t>>> assignments; // member_id -> topic -> 分配的分区ID集合
-    int generation_id; // 组的世代ID，每次再平衡后递增
-    std::map<std::string,std::set<std::string>> map_subscribed_topics; // 组内所有消费者订阅的主题映射
-    std::string leader_id;
-    size_t rebalance_timeout_taskid=0;
-    size_t join_collect_timeout_taskid=0;
-
-    // 状态：
-
-    enum GroupState { STABLE, JOIN_COLLECTING, AWAITING_SYNC,EMPTY};
-    GroupState state;
-    std::mutex state_mutex; // 保护组状态的互斥锁
-    std::condition_variable rebalance_cv; // 用于 JoinGroup 阶段等待再平衡准备完成
-    std::condition_variable sync_cv; // 新增：用于 SyncGroup 阶段等待分配结果
-
-    ConsumerGroupState(const std::string& id)
-        : group_id(id),
-        expected_members(std::vector<std::string>{}),
-        state(EMPTY),
-        generation_id(-1)
-
-    {
-        // 可以在这里进行其他初始化
-    }
-    std::atomic<bool> rebalance_should = false;
-    std::atomic<bool> rebalance_ing = false;
-
-
-
-
-};
-
-}
-
 
 
 
 }
+
+
 
 #endif // MYMQ_INNERCODES_H

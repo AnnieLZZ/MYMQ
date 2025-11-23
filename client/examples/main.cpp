@@ -10,6 +10,7 @@
 #include<memory>
 #include<condition_variable>
 #include<mutex>
+#include "version.h"
 
 void cerr(const std::string& str){
    std::cout<<str<<std::endl;
@@ -110,11 +111,11 @@ std::queue<std::string> generateRandomStringQueue(
 
 
 int main(){
-
+      std::cout << "MYMQ Client: Current Version: " << MYMQ_VERSION_STRING << std::endl;
     // --- 吞吐量测试配置 ---
-    const int NUM_MESSAGES_TO_TEST = 5000000; // Number of messages to push and pull
-    const int MESSAGE_MIN_LENGTH = 999;     // Minimum length of random message values
-    const int MESSAGE_MAX_LENGTH = 1000;    // Maximum length of random message values
+    const int NUM_MESSAGES_TO_TEST = 50000; // Number of messages to push and pull
+    const int MESSAGE_MIN_LENGTH = 200;     // Minimum length of random message values
+    const int MESSAGE_MAX_LENGTH = 300;    // Maximum length of random message values
     const std::string TOPIC_NAME = "testtopic";
 
     // -------------------------------------
@@ -209,8 +210,8 @@ int main(){
                 pull_start_time =std::chrono::steady_clock::now();
             }
 
-            auto msg_first=pull_result.first.front();
-            auto msg_back=pull_result.first.back();
+            auto& msg_first=pull_result.first.front();
+            auto& msg_back=pull_result.first.back();
             auto msg_num=pull_result.first.size();
             auto baseoffset=msg_first.getOffset();
             auto rearoffset=msg_back.getOffset();
