@@ -15,7 +15,7 @@
 | Metric | Throughput |
 | :--- | :--- |
 | **Push (Producer)** | **> 133,000 msg/s** |
-| **Poll (Consumer)** | **> 109,000 msg/s** |
+| **Poll (Consumer)** | **> 126,011 msg/s** |
 
 
 ---
