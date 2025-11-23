@@ -5,11 +5,6 @@
 
 ---
 
-根据您的要求，我将重点放在**FD-Sharded Thread Pool**的描述中，融入关于 `moodycamel::BlockingConcurrentQueue` 的使用及其对 CPU 资源的优化（避免空转）。同时，我也更新了底部的技术栈列表以保持一致。
-
-以下是修改后的完整文案，保持了朴素、专业的工程化描述风格：
-
-***
 
 ## ⚡ 核心性能 (Performance Benchmark)
 
