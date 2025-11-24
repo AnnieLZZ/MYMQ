@@ -375,10 +375,10 @@ private:
         if (mapped_data_ptr != nullptr && fd_ != -1) {
             // 写入当前的 curr_used_size_ 到映射内存的头部
             *static_cast<size_t*>(mapped_data_ptr) = curr_used_size_.load();
-            // 立即同步头部区域到磁盘，确保崩溃恢复的持久性
-            if (msync(mapped_data_ptr, MMAP_HEADER_SIZE, MS_SYNC) != 0) {
-                std::cerr << "Mmapfile::update_header_curr_used_size: ERROR: msync header failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
-            }
+//            // 立即同步头部区域到磁盘，确保崩溃恢复的持久性
+//            if (msync(mapped_data_ptr, MMAP_HEADER_SIZE, MS_SYNC) != 0) {
+//                std::cerr << "Mmapfile::update_header_curr_used_size: ERROR: msync header failed for '" << filename_ << "': " << std::strerror(errno) << std::endl;
+//            }
         }
     }
 

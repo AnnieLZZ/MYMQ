@@ -240,7 +240,6 @@ public:
             // 刷盘
             flush_log();
             flush_index();
-            index_file_.flush_sync();
 
             // 同步内存中的文件大小记录
             actual_physical_file_size = actual_log_data_end;
@@ -328,10 +327,10 @@ public:
         }
 
         if (log_bytes_since_last_flush.load() >= LOG_FLUSH_BYTES_INTERVAL) {
-            flush_log();
+//            flush_log();
         }
         if(bytes_last_index_entry_>index_build_interval_bytes){
-            flush_index();
+//            flush_index();
         }
 
         next_offset_ += msg_num;

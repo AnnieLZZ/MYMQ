@@ -726,7 +726,7 @@ public:
                 state.send_queue.clear();
                 state.is_writing = false;
 
-          update_epoll_events(SSL_get_fd(ssl), EPOLLIN | EPOLLET);
+//          update_epoll_events(SSL_get_fd(ssl), EPOLLIN | EPOLLET);
 
                 return false; // Signal to close connection
             }
@@ -748,7 +748,7 @@ public:
         // We can unregister for EPOLLOUT.
         state.is_writing = false;
 
-update_epoll_events(SSL_get_fd(ssl), EPOLLIN | EPOLLET);
+//update_epoll_events(SSL_get_fd(ssl), EPOLLIN | EPOLLET);
 
         return true; // Connection is alive
     }
