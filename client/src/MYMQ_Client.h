@@ -47,7 +47,7 @@ public:
     Err_Client push(const MYMQ_Public::TopicPartition& tp,const std::string& key,const std::string& value
                     ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant) ;
 
-    std::pair<std::queue<MYMQ_Public::ConsumerRecord>, Err_Client> pull(const MYMQ_Public::TopicPartition& tp) ;
+    Err_Client pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch) ;
     void create_topic(const std::string& topicname,size_t parti_num=1);
     void set_pull_bytes(size_t bytes);
 
@@ -171,7 +171,7 @@ private:
     std::atomic<bool> poll_ready{0};
     std::mutex mtx_poll_ready;
 
-    moodycamel::ReaderWriterQueue<MYMQ_Public::ConsumerRecord> poll_queue;
+    moodycamel::ReaderWriterQueue<std::vector< MYMQ_Public::ConsumerRecord>> poll_queue;
 
 
     ZSTD_DCtx* dctx;

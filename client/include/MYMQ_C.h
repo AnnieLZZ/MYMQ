@@ -37,7 +37,7 @@ public:
 
     ClientErrorCode push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value
                          ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant);
-    std::pair<std::queue<ConsumerRecord>, ClientErrorCode> pull(const MYMQ_Public::TopicPartition& tp);
+    ClientErrorCode pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch);
 
     ClientErrorCode commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant);
     void create_topic(const std::string& topicname, size_t parti_num = 1);

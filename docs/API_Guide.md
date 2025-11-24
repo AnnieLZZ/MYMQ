@@ -56,45 +56,56 @@ mc.join_group("testgroup");
   * 请检查控制台输出 "JoinGroup success" 字样。
   * 加入成功后，你可以调用 `get_assigned_partition()` 方法来获取你被分配到的分区列表。
 
-### 2.2 拉取消息 (Pull)
+#### 2.2 拉取消息 (Pull)
 
-拉取消息是一个**阻塞**操作，它将等待服务器返回数据。
+拉取消息是一个**阻塞**操作（直到超时或有数据），它通过引用参数返回数据，函数返回值用于指示状态。
 
 ```cpp
 // 1. 定义你要拉取的分区
 MYMQ_Public::TopicPartition tp("testtopic", 0);
 
-// 2. 执行拉取 (从全局偏移量 0 开始)
-auto res = mc.pull(tp, 0);
+// 2. 准备接收数据的容器
+std::vector<MYMQ_Public::ConsumerRecord> res;
 
-// 3. 检查拉取结果
-if (res.second == Err_Client::NULL_ERROR) {
-    // 拉取成功
-    // res.first 是一个 std::queue<MYMQ::MYMQ_Client::ConsumerRecord>
-} else {
-    // 拉取失败, res.second 包含错误码
+// 3. 执行拉取
+// 注意：新版 API 不再需要手动传入 offset，客户端内部会自动管理
+auto pull_result = mc.pull(tp, res);
+
+// 4. 检查拉取结果
+if (pull_result == Err_Client::PULL_TIMEOUT) {
+    // 拉取超时，没有新消息
+    std::cout << "pull timeout" << std::endl;
+} 
+else if (pull_result == Err_Client::NULL_ERROR) {
+    // 拉取成功，res 中包含消息批次
+} 
+else {
+    // 处理其他错误
 }
 ```
 
-### 2.3 处理消息 (Process Records)
+#### 2.3 处理消息 (Process Records)
 
-拉取是以批次 (Batch) 为单位的，一次 `pull` 可能返回一个包含多条消息的队列。
+拉取是以批次 (Batch) 为单位的，`pull` 接口会将多条消息填充到传入的 `std::vector` 中。
 
 ```cpp
 // (续上一步)
-std::queue<MYMQ::MYMQ_Client::ConsumerRecord> msg_queue = res.first;
-
-if (!msg_queue.empty()) {
-    // 获取队列中的第一条消息
-    auto msg1 = msg_queue.front(); // msg1 是 ConsumerRecord 对象
+if (!res.empty()) {
+    // 获取批次中的第一条和最后一条消息
+    auto& msg_first = res.front();
+    auto& msg_back  = res.back();
     
-    // 调用方法查看消息详情
-    std::string topic = msg1.getTopic();
-    size_t partition  = msg1.getPartition();
-    size_t offset     = msg1.getOffset();
-    std::string key   = msg1.getKey();
-    std::string value = msg1.getValue();
-    int64_t time      = msg1.getTime();
+    // 获取基本信息
+    std::cout << "Batch size: " << res.size() << std::endl;
+    std::cout << "First Offset: " << msg_first.getOffset() << std::endl;
+    std::cout << "Last Offset:  " << msg_back.getOffset()  << std::endl;
+
+    // 遍历处理所有消息
+    for (const auto& msg : res) {
+        std::string key = msg.getKey();
+        std::string val = msg.getValue();
+        // 业务逻辑...
+    }
 }
 ```
 
