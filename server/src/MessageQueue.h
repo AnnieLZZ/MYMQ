@@ -1486,7 +1486,7 @@ private:
                 mb_res.reserve(sizeof (uint32_t)+topicname.size()+sizeof(size_t)+sizeof (uint16_t));
                 mb_res.append(topicname,partition);
 
-                if(!MYMQ::Crc32::verify_crc32(msg_batch,crc)){
+                if(!MYMQ::Crc32::verify_crc32(msg_batch.data(),msg_batch.size(),crc)){
                     cerr("Push CRC verify : Not match , refused to push");
                     mb_res.append_uint16(static_cast<uint16_t>(Err::CRC_VERIFY_FAILED));
                    session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);

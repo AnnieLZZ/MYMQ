@@ -58,7 +58,7 @@ constexpr size_t LOG_FLUSH_BYTES_INTERVAL_DEFAULT=65536;
 constexpr size_t index_build_interval_bytes_DEFAULT=4096;
 constexpr size_t LOG_FLUSH_INTERVAL_MS=360000;
 constexpr size_t LOG_CLEAN_S_DEFAULT=144000;
-constexpr size_t session_timeout_ms_=5000000;
+constexpr uint16_t session_timeout_ms_=10000;
 
 enum class EventType : uint16_t {
     // 客户端请求事件
@@ -191,6 +191,34 @@ inline std::vector<unsigned char> zstd_compress(
 }
 
 // 解压缩函数 (使用上下文)
+
+inline std::vector<unsigned char> zstd_decompress_using_view(
+    ZSTD_DCtx* dctx, // 传入预创建的上下文
+    const unsigned char* data, size_t length
+    ) {
+    unsigned long long const decompressed_size = ZSTD_getFrameContentSize(data, length);
+
+    if (decompressed_size == ZSTD_CONTENTSIZE_ERROR) {
+        throw std::runtime_error("ZSTD_getFrameContentSize returned an error.");
+    }
+    if (decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+        throw std::runtime_error("Original size unknown, cannot decompress with simple API.");
+    }
+
+    std::vector<unsigned char> decompressed_data(decompressed_size);
+
+    size_t const actual_decompressed_size = ZSTD_decompressDCtx(
+        dctx,
+        decompressed_data.data(), decompressed_size,
+        data, length
+        );
+    check_zstd_error(actual_decompressed_size);
+
+    decompressed_data.resize(actual_decompressed_size);
+    return decompressed_data;
+}
+
+
 inline std::vector<unsigned char> zstd_decompress(
     ZSTD_DCtx* dctx, // 传入预创建的上下文
     const std::vector<unsigned char>& compressed_data
@@ -234,9 +262,17 @@ inline uint32_t calculate_crc32(const std::string& data)
     return calculate_crc32_impl(reinterpret_cast<const unsigned char*>(data.data()), data.length());
 }
 
-inline uint32_t calculate_crc32(const std::vector<unsigned char>& data)
-{
-    return calculate_crc32_impl(data.data(), data.size());
+inline uint32_t calculate_crc32(const unsigned char* data, size_t length) {
+    if (length == 0 || data == nullptr) {
+        return UINT32_MAX;
+    }
+    return calculate_crc32_impl(data, length);
+}
+
+//
+inline bool verify_crc32(const unsigned char* data, size_t length, uint32_t expected_crc) {
+    uint32_t calculated_crc = calculate_crc32(data, length);
+    return calculated_crc == expected_crc;
 }
 
 inline bool verify_crc32(const std::string& data, uint32_t expected_crc)//return 1表示没损坏
@@ -245,11 +281,7 @@ inline bool verify_crc32(const std::string& data, uint32_t expected_crc)//return
     return calculated_crc == expected_crc;
 }
 
-inline bool verify_crc32(const std::vector<unsigned char>& data, uint32_t expected_crc)
-{
-    uint32_t calculated_crc = calculate_crc32(data);
-    return calculated_crc == expected_crc;
-}
+
 
 }
 
@@ -269,7 +301,7 @@ inline std::vector<unsigned char> build_Record(const std::string& key,const std:
     MessageBuilder mb;
     mb.reserve(2*sizeof(uint32_t)+key.size()+value.size()+sizeof(int64_t));
     mb.append(key,value,current_time_ms);
-    uint32_t crc= MYMQ::Crc32::calculate_crc32(mb.data);
+    uint32_t crc= MYMQ::Crc32::calculate_crc32(mb.data.data(),mb.data.size());
     MessageBuilder mb2;
     mb2.append(crc,mb.data);
 
@@ -280,7 +312,7 @@ inline std::vector<unsigned char> build_Record(const Record& unpacked_msg) {
     MessageBuilder mb;
     mb.reserve(2*sizeof(uint32_t)+unpacked_msg.key.size()+unpacked_msg.value.size()+sizeof(int64_t));
     mb.append(unpacked_msg.key,unpacked_msg.value,unpacked_msg.time);
-    uint32_t crc= MYMQ::Crc32::calculate_crc32(mb.data);
+    uint32_t crc= MYMQ::Crc32::calculate_crc32(mb.data.data(),mb.data.size());
     MessageBuilder mb2;
     mb2.append(crc,mb.data);
 
@@ -295,7 +327,7 @@ inline Record parase_Record(const std::vector<unsigned char>& binary_data) {
     MessageParser mp(binary_data);
     auto crc=mp.read_uint32();
     auto msg=mp.read_uchar_vector();
-    if(!MYMQ::Crc32::verify_crc32(msg,crc)){
+    if(!MYMQ::Crc32::verify_crc32(msg.data(),msg.size(),crc)){
         throw std::out_of_range("Crc verify failed");
     }
     try {

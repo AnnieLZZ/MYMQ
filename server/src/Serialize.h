@@ -192,6 +192,7 @@ public:
 
     MessageParser(const std::vector<unsigned char>& msg_data) : data(msg_data), offset(0) {}
 
+
     void read_bytes(void* buffer, size_t count) {
         if (offset + count > data.size()) {
             throw std::out_of_range("Not enough data to read.");
@@ -290,6 +291,50 @@ public:
         return vec;
     }
 
+
+    // 【新增 API 1】零拷贝读取字符串
+    // 返回 std::string_view，它只是一个指针+长度的轻量级对象
+    std::string_view read_string_view() {
+        uint32_t network_length;
+        // 注意：这里 peek 或者 read 都可以，只要保证 offset 正确移动
+        // 假设 read_bytes 会移动 offset，我们需要先读长度
+        read_bytes(&network_length, sizeof(network_length));
+        uint32_t length = ntohl(network_length);
+
+        if (offset + length > data.size()) {
+            throw std::out_of_range("Not enough data to read string_view.");
+        }
+
+        // 获取原始数据的指针
+        const char* ptr = reinterpret_cast<const char*>(data.data() + offset);
+
+        // 移动 offset
+        offset += length;
+
+        // 返回视图（不发生内存拷贝）
+        return std::string_view(ptr, length);
+    }
+
+    // 【新增 API 2】零拷贝读取二进制块 (用于 CRC, ZSTD)
+    // 返回 {指针, 长度}，完全避免 vector 的构造
+    std::pair<const unsigned char*, uint32_t> read_bytes_view() {
+        uint32_t network_length;
+        read_bytes(&network_length, sizeof(network_length));
+        uint32_t length = ntohl(network_length);
+
+        if (offset + length > data.size()) {
+            throw std::out_of_range("Not enough data to read bytes view.");
+        }
+
+        // 获取当前 payload 的起始地址
+        const unsigned char* ptr = data.data() + offset;
+
+        // 移动 offset
+        offset += length;
+
+        return {ptr, length};
+    }
+
     long long read_ll() {
         return static_cast<long long>(read_int64());
     }
@@ -309,5 +354,4 @@ private:
         }
     }
 };
-
 #endif
