@@ -26,8 +26,8 @@ MYMQ_Client::ClientErrorCode MYMQ_Client::push(const MYMQ_Public::TopicPartition
     return pimpl->push(tp, key, value,cb);
 }
 
-std::pair<std::queue<MYMQ_Client::ConsumerRecord>, MYMQ_Client::ClientErrorCode> MYMQ_Client::pull(const MYMQ_Public::TopicPartition& tp) {
-    return pimpl->pull(tp);
+MYMQ_Client::ClientErrorCode MYMQ_Client::pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch) {
+    return pimpl->pull(tp,record_batch);
 }
 
 void MYMQ_Client::create_topic(const std::string& topicname, size_t parti_num) {

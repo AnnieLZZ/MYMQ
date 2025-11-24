@@ -182,7 +182,7 @@ int main(){
 
     {
         std::unique_lock<std::mutex> lock(mtx);
-        cv.wait_for(lock, std::chrono::seconds(5));
+        cv.wait_for(lock, std::chrono::seconds(10));
     }
     // --- 拉取和提交吞吐量测试 ---
     out("\n--- Starting Pull and Commit Throughput Test ---"); // 开始拉取和提交吞吐量测试
@@ -192,27 +192,27 @@ int main(){
     bool first=0;
     while (messages_pulled_count < NUM_MESSAGES_TO_TEST) {
 
-        auto pull_result = mc.pull(MYMQ_Public::TopicPartition(TOPIC_NAME,0));
-        if(pull_result.second==Err_Client::PULL_TIMEOUT){
+        std::vector< MYMQ_Public::ConsumerRecord> res;
+        auto pull_result = mc.pull(MYMQ_Public::TopicPartition(TOPIC_NAME,0),res);
+        if(pull_result==Err_Client::PULL_TIMEOUT){
             out("pull timeout");
             continue;
         }
-        else if (pull_result.second != Err_Client::NULL_ERROR && pull_result.first.empty()) {
+        else if (pull_result != Err_Client::NULL_ERROR && res.empty()) {
             // 处理 NO_RECORD 或其他错误，但没有数据
             // 此时什么也不做，不提交，只继续循环
             continue;
         }
 
-        if(!pull_result.first.empty()){
-            // *** 只有在这里才启动计时器 ***
+        if(!res.empty()){
             if(!first){
                 first=1;
                 pull_start_time =std::chrono::steady_clock::now();
             }
 
-            auto& msg_first=pull_result.first.front();
-            auto& msg_back=pull_result.first.back();
-            auto msg_num=pull_result.first.size();
+            auto& msg_first=res.front();
+            auto& msg_back=res.back();
+            auto msg_num=res.size();
             auto baseoffset=msg_first.getOffset();
             auto rearoffset=msg_back.getOffset();
 

@@ -58,46 +58,61 @@ mc.join_group("testgroup");
   * Please check the console output for "JoinGroup success".
   * After successfully joining, you can call the `get_assigned_partition()` method to get the list of partitions assigned to you.
 
-### 2.2 Pull Messages
 
-Pulling messages is a **blocking** operation. It will wait for the server to return data.
+
+-----
+#### 2.2 Pull Messages
+
+Pulling messages is a **blocking** operation (until timeout or data arrives). Data is returned via a reference parameter, and the function return value indicates the status.
 
 ```cpp
 // 1. Define the partition you want to pull from
 MYMQ_Public::TopicPartition tp("testtopic", 0);
 
-// 2. Execute the pull (starting from global offset 0)
-auto res = mc.pull(tp, 0);
+// 2. Prepare a container to receive data
+std::vector<MYMQ_Public::ConsumerRecord> res;
 
-// 3. Check the pull result
-if (res.second == Err_Client::NULL_ERROR) {
-    // Pull successful
-    // res.first is a std::queue<MYMQ::MYMQ_Client::ConsumerRecord>
-} else {
-    // Pull failed, res.second contains the error code
+// 3. Execute the pull
+// Note: The new API does not require passing an offset; the client manages it internally.
+auto pull_result = mc.pull(tp, res);
+
+// 4. Check the pull result
+if (pull_result == Err_Client::PULL_TIMEOUT) {
+    // Pull timed out, no new messages
+    std::cout << "pull timeout" << std::endl;
+} 
+else if (pull_result == Err_Client::NULL_ERROR) {
+    // Pull successful, res contains the batch of messages
+} 
+else {
+    // Handle other errors
 }
 ```
 
-### 2.3 Process Records
+#### 2.3 Process Records
 
-Pulling is done in batches. A single `pull` may return a queue containing multiple messages.
+Pulling is done in batches. The `pull` interface will fill the passed `std::vector` with multiple messages.
 
 ```cpp
 // (Continued from previous step)
-std::queue<MYMQ::MYMQ_Client::ConsumerRecord> msg_queue = res.first;
-
-if (!msg_queue.empty()) {
-    // Get the first message from the queue
-    auto msg1 = msg_queue.front(); // msg1 is a ConsumerRecord object
+if (!res.empty()) {
+    // Get the first and last message in the batch
+    auto& msg_first = res.front();
+    auto& msg_back  = res.back();
     
-    // Call methods to view message details
-    std::string topic = msg1.getTopic();
-    size_t partition  = msg1.getPartition();
-    size_t offset     = msg1.getOffset();
-    std::string key   = msg1.getKey();
-    std::string value = msg1.getValue();
-    int64_t time      = msg1.getTime();
+    // Get basic information
+    std::cout << "Batch size: " << res.size() << std::endl;
+    std::cout << "First Offset: " << msg_first.getOffset() << std::endl;
+    std::cout << "Last Offset:  " << msg_back.getOffset()  << std::endl;
+
+    // Iterate to process all messages
+    for (const auto& msg : res) {
+        std::string key = msg.getKey();
+        std::string val = msg.getValue();
+        // Business logic...
+    }
 }
+```
 ```
 
 ### 2.4 Synchronous Offset Commit (Commit Sync)
