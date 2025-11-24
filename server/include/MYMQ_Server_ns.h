@@ -128,6 +128,8 @@ class ClientState {
     bool is_handshake_complete = false;
     bool enable_sendfile = false;
 
+    uint32_t last_events=UINT32_MAX;
+
     // --- 发送相关结构 ---
 
     // 文件发送任务 (精简版：只存文件元数据，不存 Header)
