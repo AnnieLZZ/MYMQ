@@ -352,16 +352,16 @@ public:
 
                                         // --- 【关键改动 1】: 极短时间的 Map 锁定 ---
                                         {
-                                            ClientStateMap::accessor ac;
+                                            ClientStateMap::const_accessor cac;
                                             // 尝试获取锁并复制 shared_ptr
-                                            if (map_client_states.find(ac, fd)) {
-                                                client = ac->second; // 引用计数 +1
+                                            if (map_client_states.find(cac, fd)) {
+                                                client = cac->second; // 引用计数 +1
                                             } else {
                                                 // 连接可能已经被其他线程关闭或移出
                                                 return;
                                             }
                                         }
-                                        // --- 【关键】此时 ac 析构，Map 锁已释放！其他线程可以操作 Map ---
+                                        // --- 【关键】此时 cac 析构，Map 锁已释放！其他线程可以操作 Map ---
 
                                         // 再次检查原子标记，防止在获取指针后被标记为逻辑死亡
                                         if (client->is_closing.load()) {
@@ -816,7 +816,7 @@ private:
 
 
 
-    void add_clientid(const std::string& id, int sock) {
+    void add_clientid(std::string_view id, int sock) {
         tbb::concurrent_hash_map<int, std::string>::accessor ac;
         if (!map_clientid.find(ac, sock)) {
             map_clientid.insert(ac, sock);
@@ -841,11 +841,11 @@ private:
         }
     }
 
-    bool register_clientid( int sock, Mybyte&& body,std::shared_ptr<ClientState> state) {
+    bool register_clientid( int sock, const Mybyte& body,std::shared_ptr<ClientState> state) {
         MessageParser mp(body);
         bool success = 0;
 
-            std::string userid = mp.read_string();
+            auto userid = mp.read_string_view();
             if (userid.empty()) {
                 cerr("[" + now_ms_time_gen_str() + "] [错误] 客户端 (FD: " +std::to_string( sock) + ") 发送了空的注册ID。" );
             } else {
@@ -876,7 +876,7 @@ private:
             std::vector<unsigned char> real_body;
         if (static_cast<Eve>(eventtype) == MYMQ::EventType::CLIENT_REQUEST_REGISTER) {
             // 可能是客户端崩溃后但tcp检测到断联前再次重连，没必要回绝
-            auto succ =register_clientid( sock, std::move(body),state);
+            auto succ =register_clientid( sock, body,state);
             // --- 准备发送响应 ---
             MessageBuilder mb;
             mb.append(succ);
@@ -995,15 +995,13 @@ private:
                     state->bytes_read_in_body += bytes_read_this_time;
 
                     if (state->bytes_read_in_body == state->expected_body_length) {
-                        auto completed_body = std::move(state->body_buffer);
+
 
                         state->current_state = ClientState::READING_HEADER;
                         state->bytes_read_in_header = 0;
                         state->bytes_read_in_body = 0;
                         state->expected_body_length = 0;
-
-                        // 【改动 3】调用 process_message，传入 shared_ptr state
-                        process_message(sock, std::move(completed_body), state);
+                        process_message(sock, std::move(state->body_buffer), state);
 
                         return IOStatus::OK_COMPLETED;
                     }
@@ -1031,7 +1029,6 @@ private:
 
         return IOStatus::OK_WAITING;
     }
-
 
     void handle_event(std::shared_ptr<ClientState> state, Mybyte msg_body) {
 
