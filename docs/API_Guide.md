@@ -168,7 +168,7 @@ Err_Client err = mc.push(tp, key1, val1);
 
 ### 3.2 异步推送 (Push with Callback)
 
-此方法**不会**阻塞。你可以在第5个参数传入一个回调函数（类型为 `MYMQ_Public::SupportedCallbacks`），以便在推送完成时收到通知。
+此方法**不会**阻塞。你可以在第4个参数传入一个回调函数（类型为 `MYMQ_Public::SupportedCallbacks`），以便在推送完成时收到通知。
 
 ```cpp
 MYMQ_Public::TopicPartition tp("testtopic", 0);
