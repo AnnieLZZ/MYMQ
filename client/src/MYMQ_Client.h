@@ -82,7 +82,7 @@ private:
     void timer_commit_async();
 
 
-    void send(MYMQ::EventType event_type, const Mybyte& msg_body,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant);
+    void send(MYMQ::EventType event_type, const Mybyte& msg_body,std::deque<MYMQ_Public::SupportedCallbacks> cbs_=std::deque<MYMQ_Public::SupportedCallbacks>());
     std::map<std::string, std::map<std::string, std::set<size_t>>> assign_leaderdo(
         const std::unordered_map<std::string, std::set<std::string>>& member_to_topics,
         const std::unordered_map<std::string, size_t>& topic_num_map) ;

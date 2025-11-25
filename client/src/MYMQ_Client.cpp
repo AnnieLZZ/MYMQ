@@ -85,10 +85,11 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         }
 
 
-        std::vector<unsigned char> msg;
-        msg=std::move(MYMQ::MSG_serial:: build_Record(key,value)) ;
+
+        auto msg=MYMQ::MSG_serial:: build_Record(key,value) ;
 
         auto& curr_queue=push_queue.queue_;
+        auto& curr_cb_queue=push_queue.callbacks_;
 
 
         size_t curr_capacity=sizeof(uint64_t)+sizeof(size_t)+curr_queue.size()*sizeof(uint32_t)
@@ -119,8 +120,9 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             mb_batch.reserve(sizeof(uint32_t)+tp.topic.size()+sizeof(size_t)+sizeof(uint32_t)+sizeof(uint32_t)+records_with_header.data.size());
             mb_batch.append(tp.topic,tp.partition,crc_batch,records_with_header.data);
 
+            curr_cb_queue.emplace_back(std::move(cb));
             if(ack_level_!=MYMQ::ACK_Level::ACK_NORESPONCE){
-              send(Eve::CLIENT_REQUEST_PUSH,mb_batch.data,cb);
+                send(Eve::CLIENT_REQUEST_PUSH,mb_batch.data,std::move(curr_cb_queue));
             }
             else{
                send(Eve::CLIENT_REQUEST_PUSH,mb_batch.data);
@@ -131,6 +133,14 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         else{
             push_queue.since_last_send+=msg.size() ;
             curr_queue.emplace_back(std::move(msg) );
+            if(ack_level_!=MYMQ::ACK_Level::ACK_NORESPONCE){
+            curr_cb_queue.emplace_back(std::move(cb));
+            }
+            else{
+                curr_cb_queue.emplace_back(MYMQ_Public::CallbackNoop{});
+                cerr("Warning :Invalid callback setting.");
+            }
+
 
         }
 
@@ -558,51 +568,64 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         }
     }
 
-    void MYMQ_clientuse::send(MYMQ::EventType event_type, const Mybyte& msg_body,MYMQ_Public::SupportedCallbacks cb) {
-        cmc_.send_msg(static_cast<short>(event_type), msg_body,
-                      [this, cb](uint16_t event_type_responce, const Mybyte& msg_body_responce) {
 
+    void MYMQ_clientuse::send(MYMQ::EventType event_type,const Mybyte& msg_body,std::deque<MYMQ_Public::SupportedCallbacks> cbs_)
+    {
+        cmc_.send_msg(static_cast<short>(event_type), msg_body,
+
+                      [this, saved_cbs = std::move(cbs_)]
+                      (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
+                      {
                           auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
 
-            std::visit([&](auto&& specific_cb) {
-                using CBType = std::decay_t<decltype(specific_cb)>;
+                          // 【修复 4】 遍历回调队列
+                          for (size_t i = 0; i < saved_cbs.size(); ++i) {
 
-                // 1. 处理需要数据结构作为参数的回调 (Push 或 Commit)
-                if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>)
-                {
-                    // 如果 resp 包含 PushResponce 数据，则调用
-                    if (auto* data = std::get_if<MYMQ_Public::PushResponce>(&resp)) {
-                        specific_cb(*data);
-                    }
-                    // 否则 (resp 包含 CommitAsyncResponce 或 CommonErrorCode)，忽略或处理错误
-                }
-                else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>)
-                {
-                    // 如果 resp 包含 CommitAsyncResponce 数据，则调用
-                    if (auto* data = std::get_if<MYMQ_Public::CommitAsyncResponce>(&resp)) {
-                        specific_cb(*data);
-                    }
-                    // 否则，忽略或处理错误
-                }
-                // 2. 处理 CallbackNoop (需要 CommonErrorCode 参数)
-                else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>)
-                {
-                    // 检查 resp 是否包含 CommonErrorCode (即是否是失败状态)
-                    if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
-                        specific_cb(*err); // 传递错误码
-                    } else {
-                        specific_cb(MYMQ_Public::CommonErrorCode::NULL_ERROR);
-                    }
-                }
-                // 3. 处理未知类型
-                else
-                {
-                    static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
-                }
-            }, cb);
+                              // 引用当前的特定回调
+                              auto& current_cb = saved_cbs[i];
+
+                              std::visit([&](auto&& specific_cb) {
+                                  using CBType = std::decay_t<decltype(specific_cb)>;
+
+                                  // --- Push 响应处理 (带 Offset 修正) ---
+                                  if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>)
+                                  {
+                                      if (auto* data = std::get_if<MYMQ_Public::PushResponce>(&resp)) {
+                                          // 【修复 5】 Offset 修正
+                                          // 只有 Push 需要这个逻辑，因为 Push 是 Batch 的
+                                          MYMQ_Public::PushResponce individual_resp = *data;
+                                          individual_resp.base_offset = data->base_offset + i;
+                                          specific_cb(individual_resp);
+                                      }
+                                  }
+                                  // --- Commit 响应处理 ---
+                                  else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>)
+                                  {
+                                      // Commit 通常不涉及 Batch Offset 修正，或者是针对整个 Batch 的
+                                      if (auto* data = std::get_if<MYMQ_Public::CommitAsyncResponce>(&resp)) {
+                                          specific_cb(*data);
+                                      }
+                                  }
+                                  // --- Noop/Error 处理 ---
+                                  else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>)
+                                  {
+                                      if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
+                                          specific_cb(*err);
+                                      } else {
+                                          specific_cb(MYMQ_Public::CommonErrorCode::NULL_ERROR);
+                                      }
+                                  }
+                                  else
+                                  {
+                                      static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
+                                  }
+
+                              }, current_cb); // 访问当前的 cb
+                          }
                       }
                       );
     }
+
 
     std::map<std::string, std::map<std::string, std::set<size_t>>> MYMQ_clientuse::assign_leaderdo(
         const std::unordered_map<std::string, std::set<std::string>>& member_to_topics,
@@ -718,7 +741,9 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         MB mb;
         mb.append(groupid,tp.topic,tp.partition,parid_hash,key_off,next_offset_to_consume);
 
-        send(Eve::CLIENT_REQUEST_COMMIT_OFFSET,mb.data,cb);
+        std::deque<MYMQ_Public::SupportedCallbacks> cbs_;
+        cbs_.emplace_back(std::move(cb));
+        send(Eve::CLIENT_REQUEST_COMMIT_OFFSET,mb.data,std::move(cbs_));
 
         return MYMQ_Public::ClientErrorCode::NULL_ERROR;
     }
@@ -730,7 +755,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             auto topicname=mp.read_string();
             auto partition=mp.read_size_t();
             auto error=static_cast<Err>(mp.read_uint16());
-            return  MYMQ_Public::PushResponce(std::move(topicname),partition,error);
+            auto base=mp.read_size_t();
+            return  MYMQ_Public::PushResponce(std::move(topicname),partition,error,base);
         }
         else if(event_type==Eve::SERVER_RESPONSE_JOIN_REQUEST_HANDLED){
             auto error=static_cast<Err>( mp.read_uint16());
@@ -1158,6 +1184,9 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
             commit_ready.store(1);
             cv_commit_ready.notify_all();
+        }
+        else if(event_type==Eve::EVENTTYPE_NULL){
+            return Err::REQUEST_TIMEOUT;
         }
 
 

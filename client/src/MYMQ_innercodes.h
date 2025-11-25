@@ -87,6 +87,7 @@ enum class EventType : uint16_t {
     SERVER_RESPONCE_HEARTBEAT=2009,
     SERVER_RESPONCE_COMMIT_OFFSET=2010,
     SERVER_RESPONCE_LEAVE_GROUP=2011,
+    EVENTTYPE_NULL=2012,
 
 };
 
@@ -429,9 +430,11 @@ struct Consumerbasicinfo
 };
 
 using TopicPartition=MYMQ_Public::TopicPartition;
+using CallbackQueue = std::deque<MYMQ_Public::SupportedCallbacks>;
 struct  Push_queue{
     std::mutex mtx;
     std::deque<std::vector<unsigned char>> queue_{};
+    CallbackQueue callbacks_;
     std::atomic<size_t>  since_last_send=0;
     ZSTD_CCtx* cctx = ZSTD_createCCtx();
     TopicPartition tp;

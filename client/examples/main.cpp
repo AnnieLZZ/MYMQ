@@ -113,7 +113,7 @@ std::queue<std::string> generateRandomStringQueue(
 int main(){
       std::cout << "MYMQ Client: Current Version: " << CLIENT_VERSION_STRING << std::endl;
     // --- 吞吐量测试配置 ---
-    const int NUM_MESSAGES_TO_TEST = 50000; // Number of messages to push and pull
+    const int NUM_MESSAGES_TO_TEST = 1000000; // Number of messages to push and pull
     const int MESSAGE_MIN_LENGTH = 200;     // Minimum length of random message values
     const int MESSAGE_MAX_LENGTH = 300;    // Maximum length of random message values
     const std::string TOPIC_NAME = "testtopic";

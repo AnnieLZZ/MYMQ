@@ -214,24 +214,57 @@ public:
 
     uint32_t send_msg(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler) {
         MessageBuilder mb;
-        uint32_t coid = Correlation_ID.fetch_add(1); // Get new COID
-        uint32_t total_length_on_wire = static_cast<uint32_t>(HEADER_SIZE +sizeof(uint32_t)+ msg_body.size());
+        // 1. 获取 ID
+        uint32_t coid = Correlation_ID.fetch_add(1);
+
+        uint32_t total_length_on_wire = static_cast<uint32_t>(HEADER_SIZE + sizeof(uint32_t) + msg_body.size());
         mb.reserve(total_length_on_wire);
 
-        ////HEADER
+        //// HEADER 构建
         mb.append_uint32(total_length_on_wire);
         mb.append_uint16(event_type);
         mb.append_uint32(coid);
         mb.append_uint16(static_cast<uint16_t>(ack_level));
-        ////HEADER
+        //// BODY 构建
         mb.append_uchar_vector(msg_body);
 
         auto full_message = mb.data;
 
-        send_queue.try_emplace(std::move(full_message), coid, std::move(handler));
+
+        if (ack_level != MYMQ::ACK_Level::ACK_NORESPONCE) {
+
+            {
+                tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
+                if(map_wait_responces.insert(acc, coid)) {
+                    acc->second = std::move(handler);
+                }
+            }
+
+            // 【步骤 B】立即启动超时定时器
+            // 定时器的语义变为：“从我打算发送开始计时”，这通常更符合用户感知的“超时”
+            timer.commit_s([this, coid] {
+                tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc_timer;
+                // 尝试查找。如果找到了，说明还没收到响应（或者响应处理还没删掉它）
+                if (map_wait_responces.find(acc_timer, coid)) {
+                    cerr( "[Request Time out] Correlationid : " + std::to_string(coid));
+
+                    auto cb = std::move(acc_timer->second);
+                    map_wait_responces.erase(acc_timer);
+                    cb(static_cast<uint16_t>(Eve::EVENTTYPE_NULL) ,Mybyte{} );
+                }
+            }, request_timeout_s,request_timeout_s,1);
+        }
+
+        // 3. 入队发送
+        // 注意：因为 handler 已经被 move 到了 map 里（或者不需要），
+        // 这里传给 send_queue 的 handler 只是一个占位符 (ResponseCallback{})
+        send_queue.try_emplace(std::move(full_message), coid, ResponseCallback{});
+
+        // 4. 唤醒发送线程
         send_pending.store(true);
         return coid;
     }
+
 
     void stop() {
         if (!running_.load()) return;
@@ -325,52 +358,35 @@ private:
             const char* byte_to_send = reinterpret_cast<const char*>(msg.data() + off);
             size_t bytes_remaining = msg.size() - off;
 
-            size_t real_send_bytes=0;
-            int res = SSL_write_ex(ssl_, byte_to_send, static_cast<int>(bytes_remaining),&real_send_bytes);
+            size_t real_send_bytes = 0;
+            int res = SSL_write_ex(ssl_, byte_to_send, static_cast<int>(bytes_remaining), &real_send_bytes);
 
-            if (res==0) {
+            if (res == 0) {
                 int err = SSL_get_error(ssl_, res);
                 if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
-                    // 缓冲区满，退出循环，等待下次 write 事件
+                    // 缓冲区满，等下次 Epoll
                     break;
                 } else {
-                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL_write failed. Error code: " << err << std::endl;
+                    // 真正的错误
+                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL_write failed..." << std::endl;
                     ERR_print_errors_fp(stderr);
 
-                    // 移除坏掉的消息并停止
+
                     PendingMessage dummy;
                     send_queue.try_dequeue(dummy);
+
                     running_.store(false);
                     return;
                 }
             } else {
-                // 发送成功
+                // 发送成功部分或全部
                 off += real_send_bytes;
                 if (off == msg.size()) {
-                    // --- 消息发送完毕逻辑 (保持原样) ---
-                    tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
-                    map_wait_responces.insert(acc, current_msg_ptr->coid);
-                    acc->second = std::move(current_msg_ptr->handler);
-                    acc.release();
-
-                    // 启动定时器
-                    auto coid = current_msg_ptr->coid;
-                    timer.commit_s([this, coid]{
-                        tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc_timer;
-                        if( map_wait_responces.find(acc_timer, coid)){
-                            std::cerr << "[Request Time out] Correlationid : " << std::to_string(coid) << std::endl;
-                            map_wait_responces.erase(acc_timer);
-                        }
-                    }, request_timeout_s, request_timeout_s, 1);
-
-                    // 将消息出队
                     PendingMessage dummy;
                     send_queue.try_dequeue(dummy);
-                }
-                else {
-                    // 没发完 (Partial write)，但 OpenSSL 可能因为底层机制而返回
-                    // 此时不能 continue 死循环，因为如果底层还是满的，会空转 CPU
-                    // 对于 SSL 来说，最好 break 出去重新让 select 调度
+
+                } else {
+
                     break;
                 }
             }

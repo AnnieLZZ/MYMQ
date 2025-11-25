@@ -87,7 +87,8 @@ enum class ClientErrorCode :uint16_t{
     INVALID_PARTITION_OR_TOPIC=1007,
     ZSTD_UNAVAILABLE=1008,
     AUTOCOMMIT_ENABLE=1009,
-    INVALID_GROUPID=1010
+    INVALID_GROUPID=1010,
+    UNKNOWN_ERROR=1011
 
 };
 
@@ -126,8 +127,9 @@ struct TopicPartition
 struct PushResponce {
     TopicPartition tp;
     CommonErrorCode errorcode;
-    PushResponce(std::string topic,size_t partition,CommonErrorCode err):tp(topic,partition),errorcode(err){}
-    PushResponce(const PushResponce& resp):tp(resp.tp),errorcode(resp.errorcode) {}
+    size_t base_offset;
+    PushResponce(std::string topic,size_t partition,CommonErrorCode err,size_t base_offset_):tp(topic,partition),errorcode(err),base_offset(base_offset_){}
+    PushResponce(const PushResponce& resp):tp(resp.tp),errorcode(resp.errorcode),base_offset(resp.base_offset) {}
 };
 struct CommitAsyncResponce {
     std::string groupid;
@@ -219,5 +221,6 @@ struct hash<MYMQ_Public::TopicPartition> {
     }
 };
 } // namespace std
+
 
 #endif // MYMQ_PUBLICCODES_H
