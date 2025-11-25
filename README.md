@@ -11,8 +11,8 @@
 ### 📊 单机单分区性能指标 (Single Node, Single Partition)
 
 **测试环境:** 
-Workload: 1,000,000 msgs | Size: 200~300B | 单分区 (Single Partition)
-Hardware: C端: [CPU: Intel® Core™ i7-12650H (10 Cores, 16 Threads)] | [Disk: NVMe SSD] | [Configuration: I/O Threads set to 10]
+* Workload: 1,000,000 msgs | Size: 200~300B | 单分区 (Single Partition)
+* Hardware: C端: [CPU: Intel® Core™ i7-12650H (10 Cores, 16 Threads)] | [Disk: NVMe SSD] | [Configuration: I/O Threads set to 10]
 
 | Metric | Throughput | Description |
 | :--- | :--- | :--- |
