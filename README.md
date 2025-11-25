@@ -3,26 +3,23 @@
 > A C++ distributed messaging system benchmarked against Apache Kafka's architecture.
 > **Role:** Core Developer | **Lang:** C++17
 
+
 ---
 
 ## ⚡ 核心性能 (Performance Benchmark)
 
+### 📊 单机单分区性能指标 (Single Node, Single Partition)
 
-## 📊 单机单分区性能指标 (Single Node, Single Partition)
+**测试环境:** 1,000,000 条消息 | 消息体大小: 200~300B | 单分区 (Single Partition)
 
-**消息体大小:** 200~300B
-
-| Metric | Throughput |
-| :--- | :--- |
-| **Push (Producer)** | **> 133,000 msg/s** |
-| **Poll (Consumer)** | **> 126,011 msg/s** |
-
+| Metric | Throughput | Description |
+| :--- | :--- | :--- |
+| **Push (Producer)** | **~131,198 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
+| **Poll (Consumer)** | **~147,832 msg/s** | **Fetch & Parse**: Client Response Handling + Message Deserialization |
 
 ---
 
-
 ## 🚀 架构设计 (Architecture Features)
-
 
 ### 1. I/O 与存储优化 (I/O & Storage)
 * **Zero-Copy with kTLS:** 结合 `sendfile` 实现零拷贝传输；引入 **OpenSSL kTLS** 将加密卸载至内核态，解决了传统 SSL 在用户态加密导致无法利用 sendfile 的痛点，显著减少内核/用户态上下文切换。
@@ -38,10 +35,23 @@
         3. **网络效率:** 均摊了系统调用开销，显著减少网络往返与 TCP 包头开销。
 
 ### 2. 并发模型 (Concurrency Model)
+
+#### 服务端 (Broker Side)
 * **FD-Sharded Thread Pool:** 引入基于连接 FD 哈希的**分片式线程池**，底层使用 `moodycamel::BlockingConcurrentQueue`。该设计保证了同一连接的请求处理具备 CPU 亲和性 (Affinity)，大幅减少线程间的上下文切换与锁竞争。
 * **Session-Based Decoupling:** 封装 `TcpSession` 实现网络层 (Reactor) 与业务层的解耦：
     * 利用 `shared_ptr` 延长 Session 生命周期，确保在异步/长耗时任务回调中对象的安全性。
     * 业务层通过持有 Session 副本发送响应，无需长时间占用全局连接表 (TBB Map) 的锁资源，保障了高并发下核心索引的访问效率。
+
+#### 客户端 (Client Side)
+* **Partition-Aware Response Sharding:** 针对 Consumer 的消息拉取（Pull）响应，设计了专用的分片线程池。
+    * **路由策略:** 基于 `Topic + Partition` 组合键计算 **MurmurHash2** (uint32_t)，将同一分区的数据流固定路由至同一工作线程。
+    * **收益:** 实现了消息解析与业务处理的并行化，同时保证了单分区内消息处理的时序性，显著提升了高吞吐场景下的消费速率。
+* **Granular Async Callbacks:** 提供全异步的事件驱动接口。
+    * **Per-Message Callback:** 支持在 `push` 阶段为**每一条**消息单独注册回调函数，而非仅针对 Batch 级别。
+    * **Commit Callback:** `commitAsync` 支持异步回调通知。
+    * **Execution Flow:** 回调函数在客户端接收到服务端 ACK 并完成解析后自动触发，实现了从发送到确认的全链路闭环。
+
+#### 核心组件
 * **Lock-Free Queue:** 通信层内部使用 `moodycamel::ReaderWriterQueue` (**SPSC**) 处理单生产者单消费者场景，最小化线程同步开销。
 * **Event-Driven:** 基于 `epoll` (ET模式) + `Reactor` 模式，配合非阻塞 I/O 与有限状态机 (FSM) 处理高并发连接。
 
@@ -58,10 +68,9 @@
 ## 🛠️ 技术栈 (Tech Stack)
 
 * **Kernel/Network:** `Epoll (ET)`, `Reactor Pattern`, `Linux sendfile`, `OpenSSL kTLS`
-* **Concurrency:** `Intel TBB`, `FD-Sharding`, `moodycamel::ConcurrentQueue`, `C++17`
+* **Concurrency:** `Intel TBB`, `FD-Sharding`, `MurmurHash2`, `moodycamel::ConcurrentQueue`, `C++17`
 * **Storage/Algo:** `write (Sequential Log)`, `mmap (Index)`, `ZSTD`, `Sparse Indexing`, `CRC32`
 * **Build/Test:** `CMake`, `GTest`
-
 ---
 
 ## 📖 如何使用 (How to Use)
