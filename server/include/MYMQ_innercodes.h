@@ -87,6 +87,7 @@ enum class EventType : uint16_t {
     SERVER_RESPONCE_HEARTBEAT=2009,
     SERVER_RESPONCE_COMMIT_OFFSET=2010,
     SERVER_RESPONCE_LEAVE_GROUP=2011,
+    EVENTTYPE_NULL=2012,
 
 };
 
@@ -142,15 +143,13 @@ inline std::string to_string(PullSet pullSet) {
 
 enum class ACK_Level:uint16_t{
     ACK_NORESPONCE=0,
-    ACK_PROMISE_ACCEPT=1,
-    ACK_PROMISE_INDISK=2
+    ACK_PROMISE_INDISK=1,
 };
 
 // 新增：ACK_Level 的 to_string 函数
 inline std::string to_string(ACK_Level ackLevel) {
     switch (ackLevel) {
     case ACK_Level::ACK_NORESPONCE: return "ACK_NORESPONCE";
-    case ACK_Level::ACK_PROMISE_ACCEPT: return "ACK_PROMISE_ACCEPT";
     case ACK_Level::ACK_PROMISE_INDISK: return "ACK_PROMISE_INDISK";
     default: return "UNKNOWN_ACK_LEVEL (" + std::to_string(static_cast<uint16_t>(ackLevel)) + ")";
     }
@@ -429,9 +428,11 @@ struct Consumerbasicinfo
 };
 
 using TopicPartition=MYMQ_Public::TopicPartition;
+using CallbackQueue = std::deque<MYMQ_Public::SupportedCallbacks>;
 struct  Push_queue{
     std::mutex mtx;
     std::deque<std::vector<unsigned char>> queue_{};
+    CallbackQueue callbacks_;
     std::atomic<size_t>  since_last_send=0;
     ZSTD_CCtx* cctx = ZSTD_createCCtx();
     TopicPartition tp;

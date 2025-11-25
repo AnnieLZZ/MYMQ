@@ -265,7 +265,7 @@ public:
         uint32_t encoded_size = htonl(msg_size);
         uint64_t curr_off_net = htonll(current_offset);
 
-        // 修改 msg 内部 BaseOffset (注意：这会修改入参，确保这是预期的副作用)
+        // 修改 msg 内部 BaseOffset (注意：这会修改入参，这是预期的副作用)
         std::memcpy(msg.data(), &curr_off_net, sizeof(uint64_t));
 
         // 解析 msg_num

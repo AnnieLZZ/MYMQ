@@ -1486,21 +1486,25 @@ private:
                 mb_res.reserve(sizeof (uint32_t)+topicname.size()+sizeof(size_t)+sizeof (uint16_t));
                 mb_res.append(topicname,partition);
 
+
                 if(!MYMQ::Crc32::verify_crc32(msg_batch.data(),msg_batch.size(),crc)){
                     cerr("Push CRC verify : Not match , refused to push");
-                    mb_res.append_uint16(static_cast<uint16_t>(Err::CRC_VERIFY_FAILED));
-                   session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
-                    return;
-                }
-                if(ack_level==static_cast<uint16_t>(MYMQ::ACK_Level::ACK_PROMISE_ACCEPT)){
-                    mb_res.append_uint16(static_cast<uint16_t>(Err::NULL_ERROR));
-                    session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
+                    if(ack_level!=static_cast<uint16_t>(MYMQ::ACK_Level::ACK_NORESPONCE)){
+                            mb_res.append_uint16(static_cast<uint16_t>(Err::CRC_VERIFY_FAILED));
+                            session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
+                    }
+                      return ;
                 }
 
+
                 auto push_res= push(msg_batch,topicname,partition);
+                uint64_t baseoffset;
+                std::memcpy(&baseoffset,msg_batch.data(),sizeof(uint64_t));
+                baseoffset=ntohll(baseoffset);
 
                 if(ack_level==static_cast<uint16_t>(MYMQ::ACK_Level::ACK_PROMISE_INDISK)){
                     mb_res.append_uint16(static_cast<uint16_t>(push_res));
+                    mb_res.append_uint64(baseoffset);
                     session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
                 }
                  cerr("Push result : "+MYMQ_Public::to_string(push_res));
