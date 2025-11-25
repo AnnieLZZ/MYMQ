@@ -1531,7 +1531,6 @@ private:
                 MB mb;
                 mb.append_bool(mp.read_bool());
                 session.send(Eve::SERVER_RESPONSE_REGISTER,correlation_id,ack_level,mb.data);
-                cerr("adsda");
             }
             else if( type==MYMQ::EventType::CLIENT_REQUEST_JOIN_GROUP){
 

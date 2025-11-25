@@ -932,10 +932,10 @@ private:
                     }
                     state->expected_body_length = total_length - HEADER_SIZE;
 
-                    if (state->expected_body_length > msg_body_limit) {
-                        std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state->expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
-                        return IOStatus::ERROR_DEAD;
-                    }
+//                    if (state->expected_body_length > msg_body_limit) {
+//                        std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state->expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
+//                        return IOStatus::ERROR_DEAD;
+//                    }
 
                     if (state->expected_body_length == 0) {
                         state->current_state = ClientState::READING_HEADER;
