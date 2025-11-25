@@ -45,7 +45,7 @@ public:
 
 
     Err_Client push(const MYMQ_Public::TopicPartition& tp,const std::string& key,const std::string& value
-                    ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant) ;
+                    ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::CallbackNoop()) ;
 
     Err_Client pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch) ;
     void create_topic(const std::string& topicname,size_t parti_num=1);
@@ -59,7 +59,7 @@ public:
 
 
     Err_Client commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
-                            ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant) ;
+                            ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::CallbackNoop()) ;
 
 
 
@@ -87,7 +87,7 @@ private:
         const std::unordered_map<std::string, std::set<std::string>>& member_to_topics,
         const std::unordered_map<std::string, size_t>& topic_num_map) ;
     std::string weave_assignments_message(const std::map<std::string, std::map<std::string, std::set<size_t>>>& assignments) ;
-    Err_Client commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::DefaultNoopVariant);
+    Err_Client commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::CallbackNoop());
     MYMQ_Public::ResultVariant handle_response(Eve event_type,const Mybyte& msg_body);
     void push_timer_send();
     void out_group_reset();

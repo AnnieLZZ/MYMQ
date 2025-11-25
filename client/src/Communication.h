@@ -228,10 +228,10 @@ public:
         //// BODY 构建
         mb.append_uchar_vector(msg_body);
 
-        auto full_message = mb.data;
 
 
-        if (ack_level != MYMQ::ACK_Level::ACK_NORESPONCE) {
+
+        if (!(event_type==static_cast<uint16_t>(Eve::CLIENT_REQUEST_PUSH)&&ack_level== MYMQ::ACK_Level::ACK_NORESPONCE) ) {
 
             {
                 tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
@@ -255,10 +255,7 @@ public:
             }, request_timeout_s,request_timeout_s,1);
         }
 
-        // 3. 入队发送
-        // 注意：因为 handler 已经被 move 到了 map 里（或者不需要），
-        // 这里传给 send_queue 的 handler 只是一个占位符 (ResponseCallback{})
-        send_queue.try_emplace(std::move(full_message), coid, ResponseCallback{});
+        send_queue.try_emplace(std::move(mb.data), coid, ResponseCallback{});
 
         // 4. 唤醒发送线程
         send_pending.store(true);

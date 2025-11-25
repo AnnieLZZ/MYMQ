@@ -144,7 +144,12 @@ struct CommitAsyncResponce {
 using PushResponceCallback = std::function<void(PushResponce)>;
 using CommitAsyncResponceCallback = std::function<void(CommitAsyncResponce)>;
 
-using CallbackNoop = std::function<void(CommonErrorCode)>;
+struct CallbackNoop {
+    void operator()(CommonErrorCode) const {
+        // 什么都不做，或者打印日志
+    }
+
+};
 
 // 3. SupportedCallbacks 变体
 using SupportedCallbacks = std::variant<
@@ -152,10 +157,7 @@ using SupportedCallbacks = std::variant<
     CommitAsyncResponceCallback,
     CallbackNoop
     >;
-inline const CallbackNoop TheNoopCallback = [](CommonErrorCode ){
-};
 
-inline const SupportedCallbacks DefaultNoopVariant{TheNoopCallback};
 
 using ResultVariant = std::variant<
     PushResponce,
