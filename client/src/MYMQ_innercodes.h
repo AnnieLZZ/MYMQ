@@ -143,15 +143,13 @@ inline std::string to_string(PullSet pullSet) {
 
 enum class ACK_Level:uint16_t{
     ACK_NORESPONCE=0,
-    ACK_PROMISE_ACCEPT=1,
-    ACK_PROMISE_INDISK=2
+    ACK_PROMISE_INDISK=1,
 };
 
 // 新增：ACK_Level 的 to_string 函数
 inline std::string to_string(ACK_Level ackLevel) {
     switch (ackLevel) {
     case ACK_Level::ACK_NORESPONCE: return "ACK_NORESPONCE";
-    case ACK_Level::ACK_PROMISE_ACCEPT: return "ACK_PROMISE_ACCEPT";
     case ACK_Level::ACK_PROMISE_INDISK: return "ACK_PROMISE_INDISK";
     default: return "UNKNOWN_ACK_LEVEL (" + std::to_string(static_cast<uint16_t>(ackLevel)) + ")";
     }

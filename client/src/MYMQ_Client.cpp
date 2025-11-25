@@ -513,7 +513,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             }
 
             auto tmp_ack_level=ack_level;
-            if(!inrange(tmp_ack_level,0,2)){
+            if(!inrange(tmp_ack_level,0,1)){
                 tmp_ack_level=MYMQ::ack_level_DEFAULT;
             }
             cmc_.set_ACK_level(static_cast<MYMQ::ACK_Level>(tmp_ack_level));
@@ -755,7 +755,11 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             auto topicname=mp.read_string();
             auto partition=mp.read_size_t();
             auto error=static_cast<Err>(mp.read_uint16());
-            auto base=mp.read_size_t();
+            size_t base=SIZE_MAX;
+            if(error==Err::NULL_ERROR){
+                base=mp.read_size_t();
+            }
+
             return  MYMQ_Public::PushResponce(std::move(topicname),partition,error,base);
         }
         else if(event_type==Eve::SERVER_RESPONSE_JOIN_REQUEST_HANDLED){

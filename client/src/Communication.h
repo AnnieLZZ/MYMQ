@@ -771,7 +771,7 @@ private:
    std::atomic<bool> connection_established_{false};
     std::atomic<bool> client_id_sent_{false};
 
-    MYMQ::ACK_Level ack_level=MYMQ::ACK_Level::ACK_PROMISE_ACCEPT;
+    MYMQ::ACK_Level ack_level=MYMQ::ACK_Level::ACK_PROMISE_INDISK;
 
     tbb::concurrent_hash_map<uint32_t, ResponseCallback> map_wait_responces;
 
