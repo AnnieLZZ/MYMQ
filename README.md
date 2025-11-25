@@ -16,7 +16,7 @@
 
 | Metric | Throughput | Description |
 | :--- | :--- | :--- |
-| **Push (Producer)** | **~131,198 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCa   che $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
+| **Push (Producer)** | **~131,198 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
 | **Poll (Consumer)** | **~147,832 msg/s** | **Fetch & Parse**: Client Response Handling + Message Deserialization |
 
 ---
