@@ -113,7 +113,7 @@ std::queue<std::string> generateRandomStringQueue(
 int main(){
       std::cout << "MYMQ Client: Current Version: " << CLIENT_VERSION_STRING << std::endl;
     // --- 吞吐量测试配置 ---
-    const int NUM_MESSAGES_TO_TEST = 50000; // Number of messages to push and pull
+    const int NUM_MESSAGES_TO_TEST = 1000000; // Number of messages to push and pull
     const int MESSAGE_MIN_LENGTH = 200;     // Minimum length of random message values
     const int MESSAGE_MAX_LENGTH = 300;    // Maximum length of random message values
     const std::string TOPIC_NAME = "testtopic";
@@ -129,7 +129,7 @@ int main(){
     out("Message generation complete."); // 消息生成完成。
 
 
-    MYMQ_Client mc("test",2);
+    MYMQ_Client mc("test",1);
     mc.subscribe_topic("testtopic");
     mc.create_topic("testtopic");
     mc.join_group("testgroup");
@@ -149,12 +149,15 @@ int main(){
     auto push_start_time = std::chrono::high_resolution_clock::now();
     int messages_pushed = 0;
     for (int i = 0; i < NUM_MESSAGES_TO_TEST; ++i) {
-        Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values.front(),
-                                 [](const MYMQ_Public::PushResponce& resp) {
-            if( resp.errorcode!=MYMQ_Public::CommonErrorCode::NULL_ERROR){
-                cerr(MYMQ_Public::to_string(resp.errorcode));
-            }
-                                 } );
+        // Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values.front(),
+        //                          [](const MYMQ_Public::PushResponce& resp) {
+        //     if( resp.errorcode!=MYMQ_Public::CommonErrorCode::NULL_ERROR){
+        //         cerr(MYMQ_Public::to_string(resp.errorcode));
+        //     }
+        //                          } );
+
+        Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values.front() );
+
         if (err != MYMQ_Public::ClientErrorCode:: NULL_ERROR) {
             cerr("Failed to push message " + std::to_string(i) + ", error code: " + std::to_string(static_cast<int>(err))); // 推送消息 [i] 失败，错误码: [err]
         } else {

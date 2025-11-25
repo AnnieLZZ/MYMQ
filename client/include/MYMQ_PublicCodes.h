@@ -36,6 +36,7 @@ enum class CommonErrorCode : uint16_t {
     CRC_VERIFY_FAILED=4015,
     FAILED_PARASE_PULL_DATA=4016,
     COMMIT_OFFSET_TIMEOUT=4017,
+    REQUEST_TIMEOUT=4018,
 
 
 
@@ -127,8 +128,9 @@ struct TopicPartition
 struct PushResponce {
     TopicPartition tp;
     CommonErrorCode errorcode;
-    PushResponce(std::string topic,size_t partition,CommonErrorCode err):tp(topic,partition),errorcode(err){}
-    PushResponce(const PushResponce& resp):tp(resp.tp),errorcode(resp.errorcode) {}
+    size_t base_offset;
+    PushResponce(std::string topic,size_t partition,CommonErrorCode err,size_t base_offset_):tp(topic,partition),errorcode(err),base_offset(base_offset_){}
+    PushResponce(const PushResponce& resp):tp(resp.tp),errorcode(resp.errorcode),base_offset(resp.base_offset) {}
 };
 struct CommitAsyncResponce {
     std::string groupid;
@@ -142,7 +144,12 @@ struct CommitAsyncResponce {
 using PushResponceCallback = std::function<void(PushResponce)>;
 using CommitAsyncResponceCallback = std::function<void(CommitAsyncResponce)>;
 
-using CallbackNoop = std::function<void(CommonErrorCode)>;
+struct CallbackNoop {
+    void operator()(CommonErrorCode) const {
+        // 什么都不做，或者打印日志
+    }
+
+};
 
 // 3. SupportedCallbacks 变体
 using SupportedCallbacks = std::variant<
@@ -150,10 +157,7 @@ using SupportedCallbacks = std::variant<
     CommitAsyncResponceCallback,
     CallbackNoop
     >;
-inline const CallbackNoop TheNoopCallback = [](CommonErrorCode ){
-};
 
-inline const SupportedCallbacks DefaultNoopVariant{TheNoopCallback};
 
 using ResultVariant = std::variant<
     PushResponce,
