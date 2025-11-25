@@ -14,14 +14,13 @@
 
 ```cpp
 // 参数1: 客户端ID (可选, 默认 "Client-1")
-// 参数2: Push的ACK等级 (可选, 默认 1, 即 ACK_PROMISE_ACCEPT)
+// 参数2: Push的ACK等级 (可选, 默认 1, 即 ACK_PROMISE_INDISK)
 std::string clientid = "my-client";
-MYMQ::ACK_Level acklevel = MYMQ::ACK_Level::ACK_PROMISE_ACCEPT;
 
-MYMQ_Client mc(clientid, acklevel);
+MYMQ_Client mc(clientid, 1);
 ````
 
-  * **ACK 等级 1 (`ACK_PROMISE_ACCEPT`)** 意味着服务器只确认消息已收到且数据没有损坏。
+  * **ACK 等级 1 (`ACK_PROMISE_INDISK`)** 意味着服务确认消息已收到且数据没有损坏并已经写入linux page cache。
 
 ### 1.2 订阅或创建主题
 
