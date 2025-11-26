@@ -624,7 +624,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                           // 【修复 5】 Offset 修正
                                           // 只有 Push 需要这个逻辑，因为 Push 是 Batch 的
                                           MYMQ_Public::PushResponce individual_resp = *data;
-                                          individual_resp.base_offset = data->base_offset + i;
+                                          individual_resp.offset = data->offset + i;
                                           specific_cb(individual_resp);
                                       }
                                   }

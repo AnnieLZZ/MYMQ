@@ -128,9 +128,9 @@ struct TopicPartition
 struct PushResponce {
     TopicPartition tp;
     CommonErrorCode errorcode;
-    size_t base_offset;
-    PushResponce(std::string topic,size_t partition,CommonErrorCode err,size_t base_offset_):tp(topic,partition),errorcode(err),base_offset(base_offset_){}
-    PushResponce(const PushResponce& resp):tp(resp.tp),errorcode(resp.errorcode),base_offset(resp.base_offset) {}
+    size_t offset;
+    PushResponce(std::string topic,size_t partition,CommonErrorCode err,size_t offset_):tp(topic,partition),errorcode(err),offset(offset_){}
+    PushResponce(const PushResponce& resp):tp(resp.tp),errorcode(resp.errorcode),offset(resp.offset) {}
 };
 struct CommitAsyncResponce {
     std::string groupid;
