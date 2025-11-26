@@ -14,6 +14,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 }
 
+
+
     void MYMQ_clientuse::exit_rebalance(){
 
         rebalance_ing.store(0);
@@ -59,6 +61,25 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         },10,10,1);
     }
 
+    Err_Client MYMQ_clientuse::seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume){
+
+            auto key=tp.topic+"_"+std::to_string(tp.partition);
+
+            Endoffsetmap::accessor ac;
+            auto it=map_end_offset.find(ac,key);
+            if(!it){
+                cerr("ERROR :Invalid topic or partition in 'commit_inter' function");
+                return MYMQ_Public::ClientErrorCode::INVALID_PARTITION_OR_TOPIC;
+            }
+            else{
+                ac->second.off=offset_next_to_consume;
+            }
+            ac.release();
+              out("[Seek offset] Current offset : "+std::to_string(offset_next_to_consume));
+             return Err_Client::NULL_ERROR;
+
+
+    }
 
 
 
@@ -82,16 +103,30 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         }
 
         bool need_downgrade_to_noop = false;
+        bool illegal_callback_usage = false;
 
         std::visit([&](auto& func) {
             using T = std::decay_t<decltype(func)>;
-            // 只有当类型不是结构体 Noop 时，才检查是否为空
+            // 只有当类型不是结构体 Noop 时，才进行检查
             if constexpr (!std::is_same_v<T, MYMQ_Public::CallbackNoop>) {
                 if (!func) {
+                    // 如果是空函数指针/空对象，标记降级
                     need_downgrade_to_noop = true;
+                }
+                else {
+                    // <--- 2. 如果是有效函数，且当前是 NORESPONCE 模式，标记为非法用法
+                    if (ack_level_ == MYMQ::ACK_Level::ACK_NORESPONCE) {
+                        illegal_callback_usage = true;
+                    }
                 }
             }
         }, cb);
+
+
+        if (illegal_callback_usage) {
+            cerr ("WARNING: Callback provided but ignored due to ACK_NORESPONCE level.") ;
+            return Err_Client::INVALID_OPRATION;
+        }
 
         // 如果发现空指针，立即退化为 Noop 结构体
         if (need_downgrade_to_noop) {
@@ -99,9 +134,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         }
 
         // ============================================================
-        // 消息构建与逻辑分发
+        // 消息构建与逻辑分发 (之后的代码保持不变)
         // ============================================================
-
         auto msg = MYMQ::MSG_serial::build_Record(key, value);
 
         auto& curr_queue = push_queue.queue_;
@@ -190,6 +224,9 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
     Err_Client MYMQ_clientuse::pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch) {
 
+        if(!record_batch.empty()){
+            return Err_Client::INVALID_OPRATION;
+        }
         if(!is_ingroup.load()){
 
             return  Err_Client::NOT_IN_GROUP;
@@ -238,6 +275,19 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
         if(poll_responced){
             if(poll_queue.try_dequeue(record_batch)){
+
+                if(record_batch.empty()){
+                    return Err_Client::EMPTY_RECORD;
+                }
+                auto&& rear_msg=record_batch.back();
+                Endoffsetmap::accessor ac;
+                 if(!map_end_offset.find(ac,rear_msg.getTopic()+"_"+std::to_string(rear_msg.getPartition()) )){
+                    cerr("[PULL] Auto update local offset failed.");
+                    return Err_Client::INVALID_PARTITION_OR_TOPIC;
+                 }
+                 ac->second.off=rear_msg.getOffset();
+                 out("[PULL] Auto update local offset '"+std::to_string(rear_msg.getOffset()) +"'");
+
                 return Err_Client::NULL_ERROR;
             }
             else{
@@ -1006,6 +1056,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                                          std::vector<MYMQ_Public::ConsumerRecord> CRecordbatch;
                                                          bool is_interrupted = false;
 
+
                                                          while (current_position < collection_size) {
                                                              // 1. 边界检查
                                                              if (current_position + RECORD_HEADER_SIZE > collection_size) {
@@ -1044,23 +1095,14 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                                                  auto base = mp_payload.read_size_t();
                                                                  auto record_num = mp_payload.read_size_t();
 
-                                                                 // ==============================================================
-                                                                 // 【优化点 1】ZSTD 输入端 Zero-Copy
-                                                                 // ==============================================================
-                                                                 // 使用新增的 read_bytes_view_raw 拿到压缩数据的指针，不产生中间 vector
                                                                  auto [comp_ptr, comp_len] = mp_payload.read_bytes_view();
-
-                                                                 // 解压：结果必须是 vector，因为解压需要新内存
                                                                  auto records_nozstd = MYMQ::ZSTD::zstd_decompress_using_view(dctx, comp_ptr, comp_len);
 
                                                                  // 解析解压后的数据块
                                                                  MessageParser mp_records_serial(records_nozstd);
 
                                                                  for(size_t i = 0; i < record_num; i++) {
-                                                                     // ==============================================================
-                                                                     // 【不得不 Copy】拆分单条记录
-                                                                     // ==============================================================
-                                                                     // 必须把单条记录拷贝成 vector 才能喂给 mp_single
+
                                                                      std::vector<unsigned char> record_serial_vec = mp_records_serial.read_uchar_vector();
 
                                                                      if (record_serial_vec.empty()) throw std::out_of_range("EMPTY RECORD");
@@ -1068,27 +1110,16 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                                                      MessageParser mp_single(record_serial_vec);
                                                                      auto crc = mp_single.read_uint32();
 
-                                                                     // ==============================================================
-                                                                     // 【优化点 2】CRC 校验 Zero-Copy
-                                                                     // ==============================================================
-                                                                     // 获取 Msg Body 的指针，不拷贝
+
                                                                      auto [msg_ptr, msg_len] = mp_single.read_bytes_view();
 
                                                                      if(!MYMQ::Crc32::verify_crc32(msg_ptr, msg_len, crc)) {
                                                                          throw std::out_of_range("Crc verify failed");
                                                                      }
 
-                                                                     // ==============================================================
-                                                                     // 【不得不 Copy】构造 KV 解析器
-                                                                     // ==============================================================
-                                                                     // 因为 mp_kv 需要解析内部的 len+string，构造函数需要 vector
                                                                      std::vector<unsigned char> msg_body_vec(msg_ptr, msg_ptr + msg_len);
                                                                      MessageParser mp_kv(msg_body_vec);
 
-                                                                     // ==============================================================
-                                                                     // 【优化点 3】Key/Value 字符串 Zero-Copy
-                                                                     // ==============================================================
-                                                                     // 这是性能提升最大的地方，避免了两个临时 std::string 对象的构造
                                                                      auto key_view = mp_kv.read_string_view();
                                                                      auto value_view = mp_kv.read_string_view();
                                                                      auto time = mp_kv.read_int64();
@@ -1096,14 +1127,14 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                                                      CRecordbatch.emplace_back(
                                                                          topicname,
                                                                          partition,
-                                                                         std::string(key_view),   // 直接在最终容器中构造
-                                                                         std::string(value_view), // 直接在最终容器中构造
+                                                                         std::string(key_view),
+                                                                         std::string(value_view),
                                                                          time,
                                                                          base + i
                                                                          );
                                                                  }
                                                              } catch (const std::exception& e) {
-                                                                 // std::cerr << "Error parsing record batch: " << e.what() << std::endl;
+                                                                std::cerr << "Error parsing record batch: " << e.what() << std::endl;
                                                                  is_interrupted = true;
                                                                  break;
                                                              }
