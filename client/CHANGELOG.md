@@ -23,7 +23,7 @@
 ---
 
 
-### 🏷️ v2.1.0 (2025-11-26)
+### 🏷️ v2.1.0 (2025-11-25)
 
 #### 🚀 I/O 线程与消息处理的隔离 (Decoupling I/O and Message Processing)
 
@@ -32,4 +32,18 @@
 2 修复了push函数回调设置无效的bug
 3 调整了ack的分级，现在仅分 : ACK_NORESPONCE=0,ACK_PROMISE_INDISK=1 
 ACK_NORESPONCE时不予设置回调，即发即忘，ACK_PROMISE_INDISK时保证写入服务器pagecache，允许设置回调，其服务器响应包含三个字段：topic partition offset ，offset指当前消息的全局偏移量
+
+---
+
+
+### 🏷️ v2.2.0 (2025-11-26)
+
+#### 🚀 I/O 线程与消息处理的隔离 (Decoupling I/O and Message Processing)
+
+`v2.2.0` 
+1 增加了api : seek ,允许在不提交偏移量的前提下更新本地的偏移量记录
+2 增加了一个测试seek能力的测试用例，微调了main测试用例的输出，对应修改了MYMQ\client\CMakeLists.txt
+3 业务逻辑调整： 现在如果pull成功返回了非空Record，会自动更新本地的消费offset记录
+                现在如果尝试在MYMQ::ACK_Level::ACK_NORESPONCE的ack等级下尝试在push中设置回调，会返回警告并拒绝push调用并返回MYMQ_Public::ClientErrorCode::INVALID_OPRATION
+
 

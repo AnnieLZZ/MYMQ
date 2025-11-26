@@ -30,17 +30,6 @@ public:
 
 
     size_t get_position_consumed(const MYMQ_Public::TopicPartition& tp);
-    void exit_rebalance();
-
-    void heartbeat_start();
-
-    void heartbeat_stop();
-
-    void push_perioric_start();
-    void push_perioric_stop();
-
-    void autocommit_start();
-    void autocommit_stop();
 
 
 
@@ -61,15 +50,13 @@ public:
     Err_Client commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
                             ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::CallbackNoop()) ;
 
-
-
     Err_Client join_group(const std::string& groupid);
     Err_Client leave_group(const std::string& groupid);
 
-    void sync_group() ;
-    void heartbeat() ;
+
 
     std::unordered_set<MYMQ_Public::TopicPartition> get_assigned_partition();
+    Err_Client seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume);
 
 
      bool get_is_ingroup(){
@@ -77,6 +64,21 @@ public:
     }
 
 private:
+
+    void sync_group() ;
+    void heartbeat() ;
+    void exit_rebalance();
+
+    void heartbeat_start();
+
+    void heartbeat_stop();
+
+    void push_perioric_start();
+    void push_perioric_stop();
+
+    void autocommit_start();
+    void autocommit_stop();
+
     void init(const std::string& clientid,uint8_t ack_level);
 
     void timer_commit_async();
