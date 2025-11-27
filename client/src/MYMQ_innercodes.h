@@ -40,7 +40,7 @@ namespace MYMQ { // 推荐使用命名空间进一步封装
 
 const std::string consumeroffset_name="__consumer_offset";
 const std::string clientid_DEFAULT="Client-1";
-const std::string run_directory_DEFAULT="run";
+const std::string run_directory_DEFAULT=".";
 constexpr uint16_t send_queue_size_DEFAULT=2048;
 constexpr uint16_t HEADER_SIZE=12;
 constexpr uint16_t HEARTBEAT_MS_CLIENT=2000;
@@ -346,6 +346,125 @@ inline Record parase_Record(const std::vector<unsigned char>& binary_data) {
 }
 
 
+// 预定义一个大 Buffer，专门用来挨个塞消息
+class BatchBuffer {
+public:
+    std::vector<unsigned char> data_;
+    size_t write_pos_ = 0; // 当前写到了哪里
+size_t record_count_ = 0;
+    // 初始化时直接分配固定大小（比如 1MB），禁止后续扩容
+    explicit BatchBuffer(size_t capacity) {
+        data_.resize(capacity);
+        write_pos_ = 0;
+    }
+
+    // 重置 Buffer（复用时调用，不释放内存）
+    void clear() {
+        write_pos_ = 0;
+        record_count_ = 0;
+    }
+
+    // 检查剩余空间是否足够
+    bool has_capacity_for(size_t size_needed) const {
+        return (write_pos_ + size_needed) <= data_.size();
+    }
+
+    // 返回有效数据大小
+    size_t size() const { return write_pos_; }
+
+    // 返回数据指针（给 ZSTD 用）
+    const void* data_ptr() const { return data_.data(); }
+
+    // --- 核心：替代 build_Record 的逻辑 ---
+    // 返回 true 表示写入成功，false 表示空间不足
+    bool append_record(const std::string& key, const std::string& value) {
+        // 1. 预计算总长度，判断是否溢出
+        // 结构：[外层Len(4)] + [CRC(4)] + [KeyLen(4)+Key] + [ValLen(4)+Val] + [Time(8)]
+        size_t key_len = key.size();
+        size_t val_len = value.size();
+
+        // Record 内部的大小 (CRC + Key部分 + Val部分 + Time)
+        size_t record_inner_size = sizeof(uint32_t) + // CRC
+                                   sizeof(uint32_t) + key_len +
+                                   sizeof(uint32_t) + val_len +
+                                   sizeof(int64_t);   // Time
+
+        // 写入 Batch 需要的总空间 (包含外层长度头)
+        size_t total_size_needed = sizeof(uint32_t) + record_inner_size;
+
+        // 检查容量
+        if (write_pos_ + total_size_needed > data_.size()) {
+            return false;
+        }
+
+        // --- 开始写入 (模拟原来的多次 append 行为) ---
+        unsigned char* ptr = data_.data() + write_pos_;
+
+        // A. 【核心修正】写入外层长度 (模拟 append_uchar_vector)
+        // 对应原来的：mb_records.append_uchar_vector(...) 里的 network_length
+        uint32_t n_record_len = htonl(static_cast<uint32_t>(record_inner_size));
+        std::memcpy(ptr, &n_record_len, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+
+        // B. 预留 CRC 位置
+        unsigned char* crc_ptr = ptr; // 记住 CRC 写在哪里
+        ptr += sizeof(uint32_t);      // 跳过 CRC 的 4 字节
+
+        // Body 开始的位置 (用于计算 CRC)
+        unsigned char* body_start_ptr = ptr;
+
+        // C. 写入 Key
+        uint32_t n_key_len = htonl(static_cast<uint32_t>(key_len));
+        std::memcpy(ptr, &n_key_len, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+        std::memcpy(ptr, key.data(), key_len);          ptr += key_len;
+
+        // D. 写入 Value
+        uint32_t n_val_len = htonl(static_cast<uint32_t>(val_len));
+        std::memcpy(ptr, &n_val_len, sizeof(uint32_t)); ptr += sizeof(uint32_t);
+        std::memcpy(ptr, value.data(), val_len);        ptr += val_len;
+
+        // E. 写入 Time
+        auto now = std::chrono::system_clock::now();
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        uint64_t ts_value = static_cast<uint64_t>(ts);
+
+        // --- 修正后的写法 (无需判断系统端序) ---
+
+        // 1. 取出高 32 位，转网络序
+        uint32_t high_part = htonl(static_cast<uint32_t>(ts_value >> 32));
+        // 2. 取出低 32 位，转网络序
+        uint32_t low_part  = htonl(static_cast<uint32_t>(ts_value & 0xFFFFFFFF));
+
+        // 3. 依次写入 (大端序规定：先写高位，再写低位)
+        std::memcpy(ptr, &high_part, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+
+        std::memcpy(ptr, &low_part, sizeof(uint32_t));
+        ptr += sizeof(uint32_t);
+
+
+        // F. 回头计算并填入 CRC
+        // 计算范围：从 Body 开始，到当前位置
+        size_t body_len = ptr - body_start_ptr;
+        uint32_t crc = MYMQ::Crc32::calculate_crc32(body_start_ptr, body_len);
+        uint32_t n_crc = htonl(crc); // CRC 通常也要转网络序，取决于你原来的实现
+        // 如果原来是 mb2.append(crc, ...) 且 append 也是直接 copy，这里要注意大小端
+        // 假设 mb.append 内部做了 htonl 或者你是 x86 对 x86，通常直接 memcpy 也没事
+        // 但为了严谨，这里建议统一转 htonl，除非你确定原来没转。
+        // *假设你原来 append(uint32) 内部做了 htonl*：
+        std::memcpy(crc_ptr, &n_crc, sizeof(uint32_t));
+
+        // 更新全局指针
+        write_pos_ += total_size_needed;
+
+        record_count_++;
+        return true;
+    }
+
+ };
+
+
+
 }
 
 using ResponseCallback = std::function<void(uint16_t event_type, const std::vector<unsigned char>& msg_body)>;
@@ -429,14 +548,42 @@ struct Consumerbasicinfo
 
 using TopicPartition=MYMQ_Public::TopicPartition;
 using CallbackQueue = std::deque<MYMQ_Public::SupportedCallbacks>;
+using BatchBuffer= MSG_serial::BatchBuffer;
 struct  Push_queue{
     std::mutex mtx;
-    std::deque<std::vector<unsigned char>> queue_{};
+    std::condition_variable cv_full; // 用于背压（Buffer全满了就等）
+
+    // 双缓冲：Active 负责写，Flushing 负责后台读
+    // 假设每个 Buffer 1MB (1024 * 1024)
+    BatchBuffer* active_buffer;
+    BatchBuffer* flushing_buffer;
+
+    BatchBuffer buf_1{1024 * 1024};
+    BatchBuffer buf_2{1024 * 1024};
+    BatchBuffer* active_buf = &buf_1;   // 生产者往这里写
+    BatchBuffer* flushing_buf = &buf_2; // 消费者(线程池)读这里
+
+    // 双缓冲 - 回调 (Callback 也需要双缓冲，否则多线程读写会崩)
+    std::vector<MYMQ_Public::SupportedCallbacks> cbs1;
+    std::vector<MYMQ_Public::SupportedCallbacks> cbs2;
+    std::vector<MYMQ_Public::SupportedCallbacks>* active_cbs = &cbs1;
+    std::vector<MYMQ_Public::SupportedCallbacks>* flushing_cbs = &cbs2;
+
+    bool is_flushing = false; // 标记后台线程是否正在处理 flushing_buffer
+
     CallbackQueue callbacks_;
-    std::atomic<size_t>  since_last_send=0;
     ZSTD_CCtx* cctx = ZSTD_createCCtx();
     TopicPartition tp;
-    Push_queue(const std::string& t,size_t p):tp(t,p){}
+
+    Push_queue(const std::string& t, size_t p) : tp(t, p) {
+        // 初始化指针
+        active_buffer = &buf_1;
+        flushing_buffer = &buf_2;
+    }
+
+    ~Push_queue() {
+        ZSTD_freeCCtx(cctx);
+    }
 };
 
 struct endoffset_point

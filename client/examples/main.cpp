@@ -5,7 +5,7 @@ using Err_Client=MYMQ_Public::ClientErrorCode;
 int main(){
       std::cout << "MYMQ Client: Current Version: " << CLIENT_VERSION_STRING << std::endl;
     // --- 吞吐量测试配置 ---
-    const int NUM_MESSAGES_TO_TEST = 1000000; // Number of messages to push and pull
+    const int NUM_MESSAGES_TO_TEST = 4000000; // Number of messages to push and pull
     const int MESSAGE_MIN_LENGTH = 200;     // Minimum length of random message values
     const int MESSAGE_MAX_LENGTH = 300;    // Maximum length of random message values
     const std::string TOPIC_NAME = "testtopic";
@@ -60,7 +60,7 @@ int main(){
         Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values.front() );
 
         if (err != MYMQ_Public::ClientErrorCode:: NULL_ERROR) {
-            cerr("Failed to push message " + std::to_string(i) + ", error code: " + std::to_string(static_cast<int>(err))); // 推送消息 [i] 失败，错误码: [err]
+            cerr("Failed to push message " + std::to_string(i) + ", error code: " + MYMQ_Public::to_string(err));
         } else {
             messages_pushed++;
         }
@@ -73,7 +73,8 @@ int main(){
     out("Total messages pushed: " + std::to_string(messages_pushed)); // 总共推送消息: [messages_pushed]
     out("Push duration: " + std::to_string(push_duration.count()) + " seconds"); // 推送耗时: [push_duration.count()] 秒
     if (push_duration.count() > 0) {
-        out("Push throughput: " + std::to_string(messages_pushed / push_duration.count()) + " messages/second"); // 推送吞吐量: [throughput] 消息/秒
+        std::cout<<"Push throughput: " << std::to_string(messages_pushed / push_duration.count()) << " messages/second"<<std::endl;
+        //out("Push throughput: " + std::to_string(messages_pushed / push_duration.count()) + " messages/second"); // 推送吞吐量: [throughput] 消息/秒
     } else {
         out("Push duration too short to calculate throughput."); // 推送耗时过短，无法计算吞吐量。
     }
@@ -82,9 +83,10 @@ int main(){
 
     {
         std::unique_lock<std::mutex> lock(mtx);
-        cv.wait_for(lock, std::chrono::seconds(10));
+        cv.wait_for(lock, std::chrono::seconds(7));
     }
     // --- 拉取和提交吞吐量测试 ---
+    std::cout<<"\n--- Starting Pull and Commit Throughput Test ---"<<std::endl;
     out("\n--- Starting Pull and Commit Throughput Test ---"); // 开始拉取和提交吞吐量测试
     int messages_pulled_count = 0;
     auto pull_start_time = std::chrono::steady_clock::now();
@@ -98,7 +100,7 @@ int main(){
             out("pull timeout");
             continue;
         }
-        else if (pull_result != Err_Client::NULL_ERROR && res.empty()) {
+        else if (pull_result != Err_Client::NULL_ERROR &&pull_result == Err_Client::EMPTY_RECORD) {
             // 处理 NO_RECORD 或其他错误，但没有数据
             // 此时什么也不做，不提交，只继续循环
             continue;
@@ -113,19 +115,19 @@ int main(){
             auto& msg_first=res.front();
             auto& msg_back=res.back();
             auto msg_num=res.size();
-            auto baseoffset=msg_first.getOffset();
-            auto rearoffset=msg_back.getOffset();
+            // auto baseoffset=msg_first.getOffset();
+            // auto rearoffset=msg_back.getOffset();
 
-            out("Batch : baseoffset= "+std::to_string(baseoffset)+" ,base_key ="+msg_first.getKey()+" ,rearoffset= "+std::to_string(rearoffset)+" ,rear_key= "+msg_back.getKey());
+            // out("Batch : baseoffset= "+std::to_string(baseoffset)+" ,base_key ="+msg_first.getKey()+" ,rearoffset= "+std::to_string(rearoffset)+" ,rear_key= "+msg_back.getKey());
             messages_pulled_count+=msg_num;
 
             // *** 关键修改：在这里计算和提交 ***
-            size_t next_offset_to_consume = rearoffset + 1 ;
-            Err_Client commit_err = mc.commit_sync(MYMQ_Public::TopicPartition(TOPIC_NAME,0), next_offset_to_consume);
+            // size_t next_offset_to_consume = rearoffset + 1 ;
+            // Err_Client commit_err = mc.commit_sync(MYMQ_Public::TopicPartition(TOPIC_NAME,0), next_offset_to_consume);
 
-            if (commit_err != MYMQ_Public::ClientErrorCode:: NULL_ERROR) {
-                cerr("Failed to commit offset " + std::to_string(next_offset_to_consume) + ", error code: " + std::to_string(static_cast<int>(commit_err)));
-            }
+            // if (commit_err != MYMQ_Public::ClientErrorCode:: NULL_ERROR) {
+            //     cerr("Failed to commit offset " + std::to_string(next_offset_to_consume) + ", error code: " + std::to_string(static_cast<int>(commit_err)));
+            // }
         }
         // 如果 first.empty() == true (例如 NO_RECORD)，则此循环不执行任何操作，
         // 只会继续下一次 pull，而不会错误地提交 offset 1。
@@ -138,7 +140,8 @@ int main(){
     out("Total messages pulled: " + std::to_string(messages_pulled_count)); // 总共拉取消息: [messages_pulled_count]
     out("Pull and commit duration: " + std::to_string(pull_duration.count()) + " seconds"); // 拉取和提交耗时: [pull_duration.count()] 秒
     if (pull_duration.count() > 0) {
-        out("Pull and commit throughput: " + std::to_string(messages_pulled_count / pull_duration.count()) + " messages/second"); // 拉取和提交吞吐量: [throughput] 消息/秒
+        std::cout<<"Pull and commit throughput: " << std::to_string(messages_pulled_count / pull_duration.count()) << " messages/second"<<std::endl;
+       // out("Pull and commit throughput: " + std::to_string(messages_pulled_count / pull_duration.count()) + " messages/second"); // 拉取和提交吞吐量: [throughput] 消息/秒
     } else {
         out("Pull and commit duration too short to calculate throughput."); // 拉取和提交耗时过短，无法计算吞吐量。
     }
