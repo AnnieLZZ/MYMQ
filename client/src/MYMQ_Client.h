@@ -65,6 +65,9 @@ public:
 
 private:
 
+    void flush_batch_task(MYMQ::MYMQ_Client::Push_queue& pq);
+    void finish_flush(MYMQ::MYMQ_Client::Push_queue& pq);
+
     void sync_group() ;
     void heartbeat() ;
     void exit_rebalance();
@@ -84,7 +87,7 @@ private:
     void timer_commit_async();
 
 
-    void send(MYMQ::EventType event_type, const Mybyte& msg_body,std::deque<MYMQ_Public::SupportedCallbacks> cbs_=std::deque<MYMQ_Public::SupportedCallbacks>());
+    void send(MYMQ::EventType event_type, const Mybyte& msg_body,std::vector<MYMQ_Public::SupportedCallbacks> cbs_=std::vector<MYMQ_Public::SupportedCallbacks>());
     std::map<std::string, std::map<std::string, std::set<size_t>>> assign_leaderdo(
         const std::unordered_map<std::string, std::set<std::string>>& member_to_topics,
         const std::unordered_map<std::string, size_t>& topic_num_map) ;

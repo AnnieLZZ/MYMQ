@@ -1,10 +1,10 @@
 #include"test_common_header.h"
 void cerr(const std::string& str){
-    std::cout<<str<<std::endl;
+    // std::cout<<str<<std::endl;
 }
 
 void out(const std::string& str){
-    std::cerr<<str<<std::endl;
+    // std::cerr<<str<<std::endl;
 }
 
 double getRepetitionProbability(int randomnessLevel) {
