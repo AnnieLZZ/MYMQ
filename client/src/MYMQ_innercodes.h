@@ -39,7 +39,7 @@
 namespace MYMQ { // 推荐使用命名空间进一步封装
 
 const std::string consumeroffset_name="__consumer_offset";
-const std::string clientid_DEFAULT="Client-1";
+const std::string CLIENTID_DEFAULT="Client-1";
 const std::string run_directory_DEFAULT=".";
 constexpr uint16_t send_queue_size_DEFAULT=2048;
 constexpr uint16_t HEADER_SIZE=12;
@@ -59,6 +59,7 @@ constexpr size_t index_build_interval_bytes_DEFAULT=4096;
 constexpr size_t LOG_FLUSH_INTERVAL_MS=360000;
 constexpr size_t LOG_CLEAN_S_DEFAULT=144000;
 constexpr size_t session_timeout_ms_=500000;
+constexpr size_t MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT=1000;
 
 enum class EventType : uint16_t {
     // 客户端请求事件
@@ -493,7 +494,7 @@ struct UserInfo
 {
     std::string clientid;
     int sock;
-    UserInfo():clientid(MYMQ::clientid_DEFAULT),sock(-1) {}
+    UserInfo():clientid(MYMQ::CLIENTID_DEFAULT),sock(-1) {}
     UserInfo(const std::string& clientid_,int sock_):sock(sock_),clientid(clientid_){}
 };
 
@@ -504,9 +505,9 @@ struct ConsumerInfo{
     int generation_id;
     UserInfo userinfo;
     uint32_t correlation_id_lastjoin;
-    ConsumerInfo(std::set<std::string> topics,std::string memberid,int generation_id,uint32_t correlation_id_lastjoin,std::string clientid=MYMQ::clientid_DEFAULT,int sock=-1)
+    ConsumerInfo(std::set<std::string> topics,std::string memberid,int generation_id,uint32_t correlation_id_lastjoin,std::string clientid=MYMQ::CLIENTID_DEFAULT,int sock=-1)
         :subscribed_topics(topics),memberid(memberid),generation_id(generation_id),userinfo(clientid,sock),correlation_id_lastjoin(correlation_id_lastjoin){}
-    ConsumerInfo():subscribed_topics(std::set<std::string>()),memberid(std::string()),generation_id(-1),userinfo(MYMQ::clientid_DEFAULT,-1),correlation_id_lastjoin(0){}
+    ConsumerInfo():subscribed_topics(std::set<std::string>()),memberid(std::string()),generation_id(-1),userinfo(MYMQ::CLIENTID_DEFAULT,-1),correlation_id_lastjoin(0){}
 };
 
 struct LeaderAssignmentData {

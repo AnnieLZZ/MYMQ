@@ -88,6 +88,12 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         if (!is_ingroup.load()) {
             return Err_Client::NOT_IN_GROUP;
         }
+        size_t curr_fly=SIZE_MAX;
+        cmc_.get_curr_flying_request_num(curr_fly);
+        if(curr_fly>=max_in_flight_requests_num){
+
+            return Err_Client::REACHED_MAX_FLYING_REQUEST;
+        }
 
         auto push_queue_key = tp.topic + "_" + std::to_string(tp.partition);
         auto it = map_push_queue.find(push_queue_key);
@@ -684,8 +690,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             heartbeat_interval_ms=MYMQ::HEARTBEAT_MS_CLIENT;
             auto tmp_clientid=clientid;
             if(!inrange(tmp_clientid.size(),1,30)){
-                tmp_clientid=MYMQ::clientid_DEFAULT;
-                cerr("Initialization : Invaild 'clientid' in config . Use default 'clientid' : "+MYMQ::clientid_DEFAULT);
+                tmp_clientid=MYMQ::CLIENTID_DEFAULT;
+                cerr("Initialization : Invaild 'clientid' in config . Use default 'clientid' : "+MYMQ::CLIENTID_DEFAULT);
             }
             cmc_.set_clientid(tmp_clientid);
             {
@@ -700,11 +706,18 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             auto tmp_ack_level=ack_level;
             if(!inrange(tmp_ack_level,0,1)){
                 tmp_ack_level=MYMQ::ack_level_DEFAULT;
+                 cerr("Initialization : Invaild 'ack_level' in config . Use default 'ack_level' : "+std::to_string(MYMQ::ack_level_DEFAULT));
             }
             cmc_.set_ACK_level(static_cast<MYMQ::ACK_Level>(tmp_ack_level));
             ack_level_=static_cast<MYMQ::ACK_Level>(tmp_ack_level);
 
 
+            size_t max_in_flight_requests_num_tmp= cm_sys.get_size_t("max_in_flight_requests_num");
+            if(!inrange(zstd_level_tmp,1,5000)){
+                max_in_flight_requests_num_tmp=MYMQ:: MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT;
+                cerr("Initialization : Invaild 'max_in_flight_requests_num' in config . Use default 'max_in_flight_requests_num' : "+std::to_string(MYMQ:: MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT));
+            }
+            max_in_flight_requests_num=max_in_flight_requests_num_tmp;
         }
 
 
@@ -755,18 +768,19 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
     // 将第三个参数的类型从 std::deque 改为 std::vector
-    void MYMQ_clientuse::send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ_Public::SupportedCallbacks> cbs_)
+    bool MYMQ_clientuse::send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ_Public::SupportedCallbacks> cbs_)
     {
-        cmc_.send_msg(static_cast<short>(event_type), msg_body,
-
-                      // Lambda 捕获时，直接 move 这个 vector
-                      // vector 的 move 开销极小（只是指针交换），性能远好于 deque
+        size_t curr_fly=SIZE_MAX;
+        cmc_.get_curr_flying_request_num(curr_fly);
+        if(curr_fly>=max_in_flight_requests_num){
+            return 0;
+        }
+      auto succ=  cmc_.send_msg(static_cast<short>(event_type), msg_body,
                       [this, saved_cbs = std::move(cbs_)]
                       (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
                       {
                           auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
 
-                          // 下面的遍历逻辑完全不用改，因为 vector 和 deque 的接口（size, operator[]）是一样的
                           for (size_t i = 0; i < saved_cbs.size(); ++i) {
 
                               auto& current_cb = saved_cbs[i];
@@ -808,6 +822,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                           }
                       }
                       );
+        return succ;
     }
 
     std::map<std::string, std::map<std::string, std::set<size_t>>> MYMQ_clientuse::assign_leaderdo(
@@ -1445,6 +1460,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         autocommit_stop();
         push_perioric_stop();
     }
+
+
 
 
 

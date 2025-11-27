@@ -121,6 +121,7 @@ public:
                 send_queue = std::move(tmp_queue);
             }
             request_timeout_s=config_mgr.get_size_t("request_timeout_s");
+            timer.set_max_queue_size(MYMQ::MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT+500);
 
         }
 
@@ -212,7 +213,7 @@ public:
         ack_level=set;
     }
 
-    uint32_t send_msg(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler) {
+    bool send_msg(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler) {
         MessageBuilder mb;
         // 1. 获取 ID
         uint32_t coid = Correlation_ID.fetch_add(1);
@@ -237,29 +238,45 @@ public:
                 tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
                 if(map_wait_responces.insert(acc, coid)) {
                     acc->second = std::move(handler);
+                     curr_flying_request_num++;
                 }
+
             }
 
-            // 【步骤 B】立即启动超时定时器
-            // 定时器的语义变为：“从我打算发送开始计时”，这通常更符合用户感知的“超时”
-            timer.commit_s([this, coid] {
+
+         auto task_id=timer.commit_s([this, coid] {
                 tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc_timer;
-                // 尝试查找。如果找到了，说明还没收到响应（或者响应处理还没删掉它）
                 if (map_wait_responces.find(acc_timer, coid)) {
                     cerr( "[Request Time out] Correlationid : " + std::to_string(coid));
 
                     auto cb = std::move(acc_timer->second);
                     map_wait_responces.erase(acc_timer);
                     cb(static_cast<uint16_t>(Eve::EVENTTYPE_NULL) ,Mybyte{} );
+                    curr_flying_request_num--;
                 }
             }, request_timeout_s,request_timeout_s,1);
+
+            if (task_id == 0) {//timer的背压机制，当有界队列满时回返回0,反之返回真的taskid
+                cerr("[Backpressure] Request counts overflow. Rollback callback for coid: " + std::to_string(coid));
+                // 回滚
+                tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
+                if (map_wait_responces.find(acc, coid)) {
+                    map_wait_responces.erase(acc);
+                    curr_flying_request_num--;
+                }
+
+
+                return 0; // 返回失败
+            }
+
+
         }
 
         send_queue.try_emplace(std::move(mb.data), coid, ResponseCallback{});
 
         // 4. 唤醒发送线程
         send_pending.store(true);
-        return coid;
+        return 1;
     }
 
 
@@ -288,6 +305,9 @@ public:
 
     void send_msg_prior(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler){
 
+    }
+    void get_curr_flying_request_num(size_t& num){
+        num=curr_flying_request_num.load();
     }
 
 private:
@@ -721,6 +741,7 @@ private:
         tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
 
         if (map_wait_responces.find(acc, correlation_id)) {
+            curr_flying_request_num--;
             auto cb = std::move(acc->second);
             map_wait_responces.erase(acc);
             cb(eventtype,std::move(msg_body) );
@@ -738,11 +759,11 @@ private:
     }
 
     void cerr(const std::string& str){
-        Printqueue::instance().out(str,1,0);
+        // Printqueue::instance().out(str,1,0);
     }
 
     void out(const std::string& str){
-        Printqueue::instance().out(str,0,0);
+        // Printqueue::instance().out(str,0,0);
     }
 private:
     std::string path;
@@ -784,6 +805,8 @@ private:
     bool ssl_handshaked_ = false;    // 标记 SSL 握手是否完成
     bool ssl_want_read_ = false;     // 握手过程中 SSL 是否在等待读
     bool ssl_want_write_ = true;     // 握手过程中 SSL 是否在等待写 (初始为 true 以启动握手)
+
+    std::atomic<size_t> curr_flying_request_num{0};
 
 };
 

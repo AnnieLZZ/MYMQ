@@ -86,8 +86,7 @@ private:
 
     void timer_commit_async();
 
-
-    void send(MYMQ::EventType event_type, const Mybyte& msg_body,std::vector<MYMQ_Public::SupportedCallbacks> cbs_=std::vector<MYMQ_Public::SupportedCallbacks>());
+    bool send(MYMQ::EventType event_type, const Mybyte& msg_body,std::vector<MYMQ_Public::SupportedCallbacks> cbs_=std::vector<MYMQ_Public::SupportedCallbacks>());
     std::map<std::string, std::map<std::string, std::set<size_t>>> assign_leaderdo(
         const std::unordered_map<std::string, std::set<std::string>>& member_to_topics,
         const std::unordered_map<std::string, size_t>& topic_num_map) ;
@@ -139,6 +138,7 @@ private:
 
 
 
+
     ClientState state;
     std::mutex mtx_state;
 
@@ -183,6 +183,7 @@ private:
     MYMQ::ACK_Level ack_level_;
 
     ShardedThreadPool& pool_=ShardedThreadPool::instance(8);
+    size_t max_in_flight_requests_num{1000};
 };
 
 

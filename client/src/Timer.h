@@ -7,7 +7,11 @@
 #include <memory>
 #include <list>
 #include <map>
-
+#include <queue>
+#include <mutex>
+#include <future>
+#include <functional>
+#include <tuple>
 
 class Timer {
 
@@ -65,7 +69,9 @@ public:
         if(period_ms<=0){
             throw std::runtime_error("invalid period_ms: period_ms must be a positive integer .");
         }
-        std::function<void()> task_func = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+        auto&& task_func = [f = std::forward<F>(f), args = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+            std::apply(f, args);
+        };
 
         auto now = std::chrono::steady_clock::now();
         auto exec_time = now + std::chrono::milliseconds(delay_ms);
@@ -84,6 +90,11 @@ public:
 
         {
             std::unique_lock<std::mutex> lock(m_mutex);
+
+            if(m_tasks.size() >= m_max_queue_size.load()){
+                return 0;
+            }
+
             m_tasks.push(newTask);
             m_task_references[taskid] = newTask;
             cnt++;
@@ -108,7 +119,9 @@ public:
         if(period_s<=0){
             throw std::runtime_error("invalid period_s: period_s must be a positive integer .");
         }
-        std::function<void()> task_func = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
+        auto&& task_func = [f = std::forward<F>(f), args = std::make_tuple(std::forward<Args>(args)...)]() mutable {
+            std::apply(f, args);
+        };
 
         auto now = std::chrono::steady_clock::now();
         auto exec_time = now + std::chrono::seconds(delay_s);
@@ -127,6 +140,11 @@ public:
 
         {
             std::unique_lock<std::mutex> lock(m_mutex);
+
+            if(m_tasks.size() >= m_max_queue_size.load()){
+                return 0;
+            }
+
             m_tasks.push(newTask);
             m_task_references[taskid] = newTask;
             cnt++;
@@ -154,6 +172,9 @@ public:
         m_stop.store(true);
         m_cv.notify_one();
     }
+    void set_max_queue_size(size_t size) {
+        m_max_queue_size.store(size);
+    }
 
 private:
     struct Task {
@@ -173,7 +194,7 @@ private:
         }
     };
 
-    std::atomic<size_t> cnt{1};//保留0来做cancel寻找的默认值
+    std::atomic<size_t> cnt{1};
     std::atomic<bool> m_stop;
     std::mutex m_mutex;
     std::condition_variable m_cv;
@@ -184,6 +205,9 @@ private:
 
     std::mutex m_active_futures_mutex;
     std::list<std::future<void>> m_active_futures;
+    std::atomic<size_t> m_max_queue_size{100000};
+
+
 
     void cleanup_active_futures() {
         std::lock_guard<std::mutex> futures_lock(m_active_futures_mutex);
@@ -228,10 +252,16 @@ private:
                 m_tasks.pop();
             }
 
-            std::future<void> current_task_future = ThreadPool::instance().commit([task_func = task_to_execute->func]{
-                task_func();
-            });
+            bool is_last_exec = (task_to_execute->exec_leftcnt == 0);
 
+            std::future<void> current_task_future;
+            if (is_last_exec) {
+                current_task_future = ThreadPool::instance().commit(std::move(task_to_execute->func));
+            } else {
+                current_task_future = ThreadPool::instance().commit(task_to_execute->func); // 必须拷贝
+            }
+
+            // 保留了原有的 active_futures 逻辑
             {
                 std::lock_guard<std::mutex> futures_lock(m_active_futures_mutex);
                 m_active_futures.remove_if([](std::future<void>& f){
@@ -244,7 +274,7 @@ private:
                 std::unique_lock<std::mutex> lock(m_mutex);
 
                 if (!task_to_execute->is_cancelled) {
-                    auto new_exec_time = std::chrono::steady_clock::now();
+                    auto new_exec_time = std::chrono::steady_clock::now(); // 保留了原有逻辑（会有时间漂移）
                     if(task_to_execute->unit==Time_unit::ms){
                         new_exec_time+= std::chrono::milliseconds(task_to_execute->period);
                     }
@@ -266,6 +296,11 @@ private:
                         m_task_references.erase(task_to_execute->id);
                     }
                 } else {
+                    // 确保 cancel 的任务也能清理 map
+                    auto it = m_task_references.find(task_to_execute->id);
+                    if (it != m_task_references.end()) {
+                        m_task_references.erase(it);
+                    }
                 }
             }
         }
