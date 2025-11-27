@@ -11,13 +11,13 @@
 ### 📊 单机单分区性能指标 (Single Node, Single Partition)
 
 **测试环境:** 
-* Workload: 1,000,000 msgs | Size: 200~300B | 单分区 (Single Partition)
+* Workload: 4,000,000 msgs | Size: 200~300B | 单分区 (Single Partition)
 * Hardware: C端: [CPU: Intel® Core™ i7-12650H (10 Cores, 16 Threads)] | [Disk: NVMe SSD] | [Configuration: Threads set to 10]
 
 | Metric | Throughput | Description |
 | :--- | :--- | :--- |
-| **Push (Producer)** | **~131,198 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
-| **Poll + commitsync (Consumer)** | **~147,832 msg/s** | **Fetch & Parse & commit**: Client Response Handling + Message Deserialization +commitsync |
+| **Push (Producer)** | **~431,198 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
+| **Poll + commitsync (Consumer)** | **~255,983 msg/s** | **Fetch & Parse & commit**: Client Response Handling + Message Deserialization +commitsync |
 
 ---
 
