@@ -12,11 +12,12 @@
 
 **测试环境:** 
 * Workload: 4,000,000 msgs | Size: 200~300B | 单分区 (Single Partition)
-* Hardware: C端: [CPU: Intel® Core™ i7-12650H (10 Cores, 16 Threads)] | [Disk: NVMe SSD] | [Configuration: Threads set to 10]
+* Hardware: C端: [CPU: Intel® Core™ i7-12650H (10 Cores)] | [Disk: NVMe SSD]
+            S端: [CPU: Intel® Core™ i7-12650H ] | [Disk: NVMe SSD] | [处理器:2 / 内核数: 4]
 
 | Metric | Throughput | Description |
 | :--- | :--- | :--- |
-| **Push (Producer)** | **~431,198 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
+| **Push (Producer)** | **~331,198 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
 | **Poll + commitsync (Consumer)** | **~255,983 msg/s** | **Fetch & Parse & commit**: Client Response Handling + Message Deserialization +commitsync |
 
 ---
@@ -26,7 +27,7 @@
 ### 1. I/O 与存储优化 (I/O & Storage)
 * **Zero-Copy with kTLS:** 结合 `sendfile` 实现零拷贝传输；引入 **OpenSSL kTLS** 将加密卸载至内核态，解决了传统 SSL 在用户态加密导致无法利用 sendfile 的痛点，显著减少内核/用户态上下文切换。（这也是为什么不使用boost.asio的原因，boost.asio强制将加密抬到用户态）
 * **混合存储策略:**
-    * **日志段:** 采用标准 `write` 系统调用进行 Append-only 追加写。利用 Linux Page Cache 的顺序写合并机制，避免了 `mmap` 在处理变长文件追加时频繁触发的**缺页中断**和 TLB 刷新。
+    * **日志段:** 采用标准 `write` 系统调用进行 Append-only 追加写。利用 Linux Page Cache 的顺序写合并机制，避免了 `mmap` 在处理变长文件追加时频繁触发的缺页中断和 TLB 刷新。
     * **稀疏索引:** 采用 `mmap` 内存映射。针对固定小步长递增的索引文件，利用内存映射避免读取时的 buffer 拷贝，以 $O(\log n)$ 效率的二分查找来消息辅助定位。
 * **Log-Structured:** 采用标准“分段日志 + 稀疏索引”结构。**基于 Base Offset 命名日志段及其索引**，支持**按段大小自动滚动**，保证了磁盘空间的有序管理与写入性能的线性扩展。
 * **原生批量架构:**
@@ -47,7 +48,7 @@
 #### 客户端 (Client Side)
 * **Partition-Aware Response Sharding:** 针对 Consumer 的消息拉取（Pull）响应，设计了专用的分片线程池。
     * **路由策略:** 基于 `Topic + Partition` 组合键用 **MurmurHash2** 计算出key来进行**分片**，均摊线程压力，同时保证同一分区的数据流固定路由至同一工作线程。
-    * **收益:** 实现了消息解析与业务处理的并行化，同时保证了单分区内消息处理的时序性，显著提升了高吞吐场景下的消费速率。
+    * **收益:** 实现了消息解析与业务处理的并行化，保证单分区内消息处理的时序性同时显著提升了高吞吐场景下的生产和消费速率。
 #### 组件
 * **Lock-Free Queue:** 通信层内部使用 `moodycamel::ReaderWriterQueue` (**SPSC**)作发送队列 ，以及作将拉取到的消息连接到用户应用程序的通道。
 
@@ -117,6 +118,7 @@
 # 1. 安装外部依赖 (以 Ubuntu/Debian 为例)
 sudo apt-get update
 sudo apt-get install -y libtbb-dev libzstd-dev zlib1g-dev
+另外注意自己linux的版本，然后下载openssl3.x系列
 
 # 2. 克隆仓库
 git clone [https://github.com/AnnieLZZ/MYMQ.git](https://github.com/AnnieLZZ/MYMQ.git)
@@ -130,11 +132,18 @@ mkdir build && cd build
 cmake ..
 make
 
+# 5. 服务器数字证书
+可选择默认配置:
+openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout server.key -out server.crt
+
+生成后将 `server.key` 和 `server.crt` 文件移动到项目的build目录内
+
+---
+#### Windows (客户端)
+
 MYMQ Windows 客户端编译与运行指南 (MSYS2 MinGW 64-bit)
 
 > **重要提示:** 请确保你运行的是 **MSYS2 MinGW 64-bit 终端** (`mingw64.exe`)。
-
-### 💻 Bash 编译步骤
 
 1.  **安装依赖 (如果还未安装)**
     确保 `CMake` 和 `MinGW` 工具链已安装。
