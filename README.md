@@ -46,9 +46,10 @@
 * **Event-Driven:** 基于 `epoll` (ET模式) + `Reactor` 模式，配合非阻塞 I/O 与有限状态机 (FSM) 处理高并发连接。
 
 #### 客户端 (Client Side)
-* **Partition-Aware Response Sharding:** 针对 Consumer 的消息拉取（Pull）响应，设计了专用的分片线程池。
+* **Partition-Aware Response Sharding:** 针对 Consumer 的消息拉取（Pull）响应 和 Producer的推送（Push），设计了专用的分片线程池。
     * **路由策略:** 基于 `Topic + Partition` 组合键用 **MurmurHash2** 计算出key来进行**分片**，均摊线程压力，同时保证同一分区的数据流固定路由至同一工作线程。
     * **收益:** 实现了消息解析与业务处理的并行化，保证单分区内消息处理的时序性同时显著提升了高吞吐场景下的生产和消费速率。
+* **双缓冲队列:**  针对Producer生产速率过快，利用双缓冲队列+分片线程池进行背压和并行优化
 #### 组件
 * **Lock-Free Queue:** 通信层内部使用 `moodycamel::ReaderWriterQueue` (**SPSC**)作发送队列 ，以及作将拉取到的消息连接到用户应用程序的通道。
 
