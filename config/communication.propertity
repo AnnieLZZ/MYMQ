@@ -1,0 +1,5 @@
+port=50000
+headersize=12
+msgbodylimit_len=1048576
+livenesscheck_ms=5000
+

@@ -1,60 +1,88 @@
-# Prerequisites
-*.d
+# ============================================
+# 1. CMake 核心构建垃圾 (防止根目录被污染)
+# ============================================
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+.cmake/
+compile_commands.json
 
-# Compiled Object files
-*.slo
-*.lo
+# ============================================
+# 2. 编译中间产物 (Object files & Headers)
+# ============================================
+*.d
 *.o
 *.obj
-
-# Precompiled Headers
+*.slo
+*.lo
 *.gch
 *.pch
-
-# Linker files
 *.ilk
-
-# Debugger Files
 *.pdb
+*.idb
 
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
+# ============================================
+# 3. 二进制库文件 (先全部屏蔽，下面会特赦)
+# ============================================
 *.lib
+*.a
+*.la
+*.lai
+*.dll
+*.so
+*.so.*
+*.dylib
+*.mod
 
-# Executables
+# ============================================
+# 4. 可执行文件
+# ============================================
 *.exe
 *.out
 *.app
 
-# debug information files
-*.dwo
-
-# Build directories
+# ============================================
+# 5. 构建目录 & IDE 配置
+# ============================================
+# Qt Creator 的影子构建目录
+build-*/
+# 手动创建的构建目录
 build/
 [Bb]uild/
-[Bb]uild-*/
-
-# Qt / CMake user files
-*.user
-CMakeLists.txt.user
-
-!client/thirdparty/**
-
-!server/thirdparty/**
-
-
-build-*/
 debug/
 release/
 
+# Qt/CMake 用户私有配置 (含绝对路径，严禁提交)
+*.user
+CMakeLists.txt.user
+*.cbp
+
+# 其他编辑器配置
+.vscode/
+.idea/
+*.swp
+
+# ============================================
+# 6. 运行时数据 & 安全隐患
+# ============================================
+# 日志文件
+*.log
+
+# [关键] 之前造成 500MB 提交的日志文件夹
+MYMQ_DEFAULT_DIR/
+server/MYMQ_DEFAULT_DIR/
+
+# 密钥与证书 (严禁提交)
+*.key
+*.crt
+*.pem
+
+# ============================================
+# 7. [白名单] 第三方库特赦区 (必须放最后)
+# ============================================
+# 强制包含 thirdparty 目录下的所有文件 (包括 .a, .dll, .so)
+# 只要是在这个目录里的，Git 都会照单全收
+!client/thirdparty/**
+!server/thirdparty/**
