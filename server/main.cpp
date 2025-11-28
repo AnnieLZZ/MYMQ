@@ -1,5 +1,5 @@
 #include"MYMQ_S.h"
-#include"../generated/version.h"
+#include"../build-server-Desktop_Qt_5_14_2_GCC_64bit-Release/generated/version.h"
 #include<iostream>
 int main(){
     std::cout<< SERVER_VERSION_STRING<<std::endl;

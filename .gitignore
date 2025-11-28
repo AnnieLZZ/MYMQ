@@ -1,60 +1,28 @@
-# Prerequisites
-*.d
+# 1. 忽略所有 CMake 产生的垃圾 (无论在根目录还是子目录)
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+CTestTestfile.cmake
+.cmake/
+compile_commands.json
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# 2. 忽略 Qt/IDE 产生的目录
+build-*/
+*.cbp
 
-# Precompiled Headers
-*.gch
-*.pch
-
-# Linker files
-*.ilk
-
-# Debugger Files
-*.pdb
-
-# Compiled Dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
+# 3. 忽略二进制编译产物 (先全部屏蔽)
 *.a
-*.lib
-
-# Executables
+*.o
+*.so
+*.dll
 *.exe
 *.out
-*.app
+*.lib
 
-# debug information files
-*.dwo
+# 4. [绝对禁止] 忽略密钥
+*.key
+*.crt
 
-# Build directories
-build/
-[Bb]uild/
-[Bb]uild-*/
-
-# Qt / CMake user files
-*.user
-CMakeLists.txt.user
-
+# 5. [特赦] 强制保留 client/thirdparty 下的所有东西
 !client/thirdparty/**
-
-!server/thirdparty/**
-
-
-build-*/
-debug/
-release/
-

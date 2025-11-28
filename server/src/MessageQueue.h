@@ -81,7 +81,8 @@ public:
             offset=pair.first;
         }
 
-        end_offset.store(offset+1);
+        uint64_t next_val = curr_write_segment->next_offset();
+            end_offset.store(next_val, std::memory_order_release);
         return Err::NULL_ERROR;
     }
 
