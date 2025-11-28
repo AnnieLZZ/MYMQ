@@ -83,18 +83,22 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    Err_Client MYMQ_clientuse::push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value, MYMQ_Public::SupportedCallbacks cb) {
+    Err_Client MYMQ_clientuse::push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value, MYMQ_Public::PushResponceCallback cb) {
 
+        // 1. 基础状态检查
         if (!is_ingroup.load()) {
+
             return Err_Client::NOT_IN_GROUP;
         }
-        size_t curr_fly=SIZE_MAX;
-        cmc_.get_curr_flying_request_num(curr_fly);
-        if(curr_fly>=max_in_flight_requests_num){
 
+        size_t curr_fly = SIZE_MAX;
+        cmc_.get_curr_flying_request_num(curr_fly);
+        if (curr_fly >= max_in_flight_requests_num) {
+            cerr("[PUSH] FLYING REQUEST GOT TO LIMIT");
             return Err_Client::REACHED_MAX_FLYING_REQUEST;
         }
 
+        // 2. 查找对应的 Partition Queue
         auto push_queue_key = tp.topic + "_" + std::to_string(tp.partition);
         auto it = map_push_queue.find(push_queue_key);
         if (it == map_push_queue.end()) {
@@ -103,92 +107,66 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
         auto& push_queue = it->second;
         std::unique_lock<std::mutex> ulock(push_queue.mtx);
+
+        // 3. 检查压缩上下文
         if (!push_queue.cctx) {
             cerr("ZSTD ERROR : CCTX Unavailable . Push Interrupt");
             return Err_Client::ZSTD_UNAVAILABLE;
         }
 
-        bool need_downgrade_to_noop = false;
-        bool illegal_callback_usage = false;
+        bool has_callback = (bool)cb;
 
-        std::visit([&](auto& func) {
-            using T = std::decay_t<decltype(func)>;
-            // 只有当类型不是结构体 Noop 时，才进行检查
-            if constexpr (!std::is_same_v<T, MYMQ_Public::CallbackNoop>) {
-                if (!func) {
-                    // 如果是空函数指针/空对象，标记降级
-                    need_downgrade_to_noop = true;
-                }
-                else {
-                    // <--- 2. 如果是有效函数，且当前是 NORESPONCE 模式，标记为非法用法
-                    if (ack_level_ == MYMQ::ACK_Level::ACK_NORESPONCE) {
-                        illegal_callback_usage = true;
-                    }
-                }
-            }
-        }, cb);
-
-
-        if (illegal_callback_usage) {
-            cerr ("WARNING: Callback provided but ignored due to ACK_NORESPONCE level.") ;
+        // 检查：如果用户传了有效回调，但客户端配置为“不响应”，则报错
+        if (has_callback && ack_level_ == MYMQ::ACK_Level::ACK_NORESPONCE) {
+            cerr("WARNING: Callback provided but ignored due to ACK_NORESPONCE level.");
             return Err_Client::INVALID_OPRATION;
         }
 
-        // 如果发现空指针，立即退化为 Noop 结构体
-        if (need_downgrade_to_noop) {
-            cb = MYMQ_Public::CallbackNoop{};
-        }
-
-
-
-        // [死循环重试] 直到写入成功
         while (true) {
             // A. 尝试直接写入 Active Buffer
-            // BatchBuffer::append_record 会处理所有二进制拼接，一次 Copy
             bool success = push_queue.active_buf->append_record(key, value);
 
             if (success) {
-                // 写入成功，保存回调
-                if (ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
-                    push_queue.active_cbs->emplace_back(std::move(cb));
+                // [核心逻辑修正]
+                // 只有当回调对象“非空” 且 配置允许响应时，才入队保存
+                if (has_callback && ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
+                    push_queue.active_cbs->push_back({
+                        static_cast<uint32_t>(push_queue.current_batch_count),
+                        std::move(cb) // 移动语义，存入后外部cb失效
+                    });
                 }
-                // 成功返回，无需唤醒线程池（除非你想做低延迟优化，比如 size > 4KB 就触发）
+
+                push_queue.current_batch_count++;
+
                 return Err_Client::NULL_ERROR;
             }
 
-            // --------------------------------------------------------
-            // B. 写入失败：Buffer 满了！需要 Flush
-            // --------------------------------------------------------
-
-            // 1. 背压检查 (Backpressure)
-            // 如果后台线程还在处理上一个 flushing_buf，我们必须等，否则数据会被覆盖
+            // 1. 背压检查
             while (push_queue.is_flushing) {
-               push_queue.cv_full.wait(ulock);
+                push_queue.cv_full.wait(ulock);
             }
 
-            // 2. 交换双缓冲 (Swap)
-            // 此时 flushing_buf 肯定是空闲的
+            // 2. 交换双缓冲
             std::swap(push_queue.active_buf, push_queue.flushing_buf);
-            std::swap(push_queue.active_cbs,push_queue.flushing_cbs);
+            std::swap(push_queue.active_cbs, push_queue.flushing_cbs);
 
-            // 3. 标记状态
+            // 3. 重置计数器
+            push_queue.current_batch_count = 0;
+
+            // 4. 标记状态
             push_queue.is_flushing = true;
 
-            // 4. 提交任务到全局分片线程池
-            // 使用 MurmurHash2 计算分片索引，保证 CPU 亲和性
-            uint32_t shard_id = MurmurHash2::hash(push_queue_key ) ;
-
+            // 5. 提交 Flush 任务
+            uint32_t shard_id = MurmurHash2::hash(push_queue_key);
             pool_.submit(shard_id, [this, &push_queue]() {
-                this->flush_batch_task(push_queue); // 执行 Flush 任务
+                this->flush_batch_task(push_queue);
             });
 
-            // 5. 循环继续 -> 回到 while(true)
-            // 此时 active_buf 指向了刚才空的那个 buffer，下一次 append_record 一定成功
+            // 6. 循环继续，重试 append_record
         }
 
         return Err_Client::NULL_ERROR;
     }
-
 
     void MYMQ_clientuse::flush_batch_task(MYMQ::MYMQ_Client:: Push_queue& pq) {
        MYMQ::MSG_serial:: BatchBuffer* src_buf = pq.flushing_buf;
@@ -443,7 +421,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         if(!is_ingroup.load()){
             return Err_Client::NOT_IN_GROUP;
         }
-        auto res= commit_inter(tp,next_offset_to_consume);
+        auto res= commit_inter(tp,next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback());
         if(res!=Err_Client::NULL_ERROR){
             return res;
         }
@@ -471,8 +449,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    Err_Client MYMQ_clientuse::commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
-                                            ,MYMQ_Public::SupportedCallbacks cb) {
+    Err_Client MYMQ_clientuse::commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb) {
         if(is_auto_commit){
             return Err_Client::AUTOCOMMIT_ENABLE;
         }
@@ -768,63 +745,72 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
     // 将第三个参数的类型从 std::deque 改为 std::vector
-    bool MYMQ_clientuse::send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ_Public::SupportedCallbacks> cbs_)
+    bool MYMQ_clientuse::send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_)
     {
-        size_t curr_fly=SIZE_MAX;
+        // 1. 检查飞行请求数 (保持不变)
+        size_t curr_fly = SIZE_MAX;
         cmc_.get_curr_flying_request_num(curr_fly);
-        if(curr_fly>=max_in_flight_requests_num){
+        if (curr_fly >= max_in_flight_requests_num) {
             return 0;
         }
-      auto succ=  cmc_.send_msg(static_cast<short>(event_type), msg_body,
-                      [this, saved_cbs = std::move(cbs_)]
-                      (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
-                      {
-                          auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
 
-                          for (size_t i = 0; i < saved_cbs.size(); ++i) {
-
-                              auto& current_cb = saved_cbs[i];
-
-                              std::visit([&](auto&& specific_cb) {
-                                  using CBType = std::decay_t<decltype(specific_cb)>;
-
-                                  // --- Push 响应处理 ---
-                                  if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>)
+        // 2. 发送消息并挂载回调
+        auto succ = cmc_.send_msg(static_cast<short>(event_type), msg_body,
+                                  [this, saved_cbs = std::move(cbs_)] // 捕获稀疏列表
+                                  (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
                                   {
-                                      if (auto* data = std::get_if<MYMQ_Public::PushResponce>(&resp)) {
-                                          MYMQ_Public::PushResponce individual_resp = *data;
-                                          individual_resp.offset = data->offset + i;
-                                          specific_cb(individual_resp);
+                                      // 解析响应
+                                      auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
+
+                                      // 3. 遍历稀疏回调列表
+                                      // saved_cbs 中只包含需要回调的消息，非需要回调的已被跳过
+                                      for (auto& sparse_item : saved_cbs) {
+
+                                          uint32_t msg_idx = sparse_item.relative_index; // [关键] 获取该消息在 Batch 中的相对位置
+                                          auto& current_cb = sparse_item.cb;             // 获取对应的回调函数 variant
+
+                                          std::visit([&](auto&& specific_cb) {
+                                              using CBType = std::decay_t<decltype(specific_cb)>;
+
+                                              // --- Push 响应处理 (需要用到 msg_idx 计算 offset) ---
+                                              if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>)
+                                              {
+                                                  if (auto* data = std::get_if<MYMQ_Public::PushResponce>(&resp)) {
+                                                      MYMQ_Public::PushResponce individual_resp = *data;
+
+                                                      // [核心修改]: Offset = Batch基准Offset + 消息相对索引
+                                                      individual_resp.offset = data->offset + msg_idx;
+
+                                                      specific_cb(individual_resp);
+                                                  }
+                                              }
+                                              // --- Commit 响应处理 (不需要索引，直接透传) ---
+                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>)
+                                              {
+                                                  if (auto* data = std::get_if<MYMQ_Public::CommitAsyncResponce>(&resp)) {
+                                                      specific_cb(*data);
+                                                  }
+                                              }
+                                              // --- Noop/Error 处理 (不需要索引，直接透传) ---
+                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>)
+                                              {
+                                                  if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
+                                                      specific_cb(*err);
+                                                  } else {
+                                                      specific_cb(MYMQ_Public::CommonErrorCode::NULL_ERROR);
+                                                  }
+                                              }
+                                              else
+                                              {
+                                                  static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
+                                              }
+
+                                          }, current_cb);
                                       }
                                   }
-                                  // --- Commit 响应处理 ---
-                                  else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>)
-                                  {
-                                      if (auto* data = std::get_if<MYMQ_Public::CommitAsyncResponce>(&resp)) {
-                                          specific_cb(*data);
-                                      }
-                                  }
-                                  // --- Noop/Error 处理 ---
-                                  else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>)
-                                  {
-                                      if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
-                                          specific_cb(*err);
-                                      } else {
-                                          specific_cb(MYMQ_Public::CommonErrorCode::NULL_ERROR);
-                                      }
-                                  }
-                                  else
-                                  {
-                                      static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
-                                  }
-
-                              }, current_cb);
-                          }
-                      }
-                      );
+                                  );
         return succ;
     }
-
     std::map<std::string, std::map<std::string, std::set<size_t>>> MYMQ_clientuse::assign_leaderdo(
         const std::unordered_map<std::string, std::set<std::string>>& member_to_topics,
         const std::unordered_map<std::string, size_t>& topic_num_map) {
@@ -903,7 +889,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         return mb.dump();
     }
 
-    Err_Client MYMQ_clientuse::commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::SupportedCallbacks cb){
+    Err_Client MYMQ_clientuse::commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb){
         auto key=tp.topic+"_"+std::to_string(tp.partition);
 
         Endoffsetmap::const_accessor cac;
@@ -939,10 +925,18 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         MB mb;
         mb.append(groupid,tp.topic,tp.partition,parid_hash,key_off,next_offset_to_consume);
 
-        std::vector<MYMQ_Public::SupportedCallbacks> cbs_;
-        cbs_.reserve(1);
-        cbs_.emplace_back(std::move(cb));
-        send(Eve::CLIENT_REQUEST_COMMIT_OFFSET,mb.data,std::move(cbs_));
+        bool has_callback = (bool)cb;
+        if(has_callback){
+            std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_;
+            cbs_.reserve(1);
+            cbs_.push_back({static_cast<uint32_t>(0), std::move(cb)});
+            send(Eve::CLIENT_REQUEST_COMMIT_OFFSET,mb.data,std::move(cbs_));
+
+        }
+        else{
+            send(Eve::CLIENT_REQUEST_COMMIT_OFFSET,mb.data);
+        }
+
 
         return MYMQ_Public::ClientErrorCode::NULL_ERROR;
     }
@@ -1101,7 +1095,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
                         tmp_map_push_queue.emplace(std::piecewise_construct,
                                                    std::forward_as_tuple(key),
-                                                   std::forward_as_tuple(par.first,par.second));
+                                                   std::forward_as_tuple(par.first,par.second,batch_size));
                     }
 
                     map_end_offset=std::move(tmp_map_endoffset);

@@ -122,6 +122,8 @@ public:
             }
             request_timeout_s=config_mgr.get_size_t("request_timeout_s");
             timer.set_max_queue_size(MYMQ::MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT+500);
+            IO_buffer_size=config_mgr.get_size_t("IO_buffer_size");
+            IO_buffer.resize(IO_buffer_size);
 
         }
 
@@ -583,12 +585,12 @@ private:
         std::cout << "[" << now_ms_time_gen_str() << "] Client I/O loop stopped." << std::endl;
     }
     bool handle_incoming_data() {
-        char buffer[4096];
+
 
         // 【核心修改】死循环读取，直到 SSL 说没数据 (WANT_READ)
         while (true) {
             size_t bytes_received = 0;
-            int ret = SSL_read_ex(ssl_, buffer, sizeof(buffer), &bytes_received);
+            int ret = SSL_read_ex(ssl_, IO_buffer.data(),IO_buffer_size, &bytes_received);
 
             // ---------------------------------------------------------
             //情况 A: 读取失败或需要等待 (ret == 0)
@@ -644,7 +646,7 @@ private:
                         int bytes_to_copy = (bytes_needed < bytes_available) ? bytes_needed : bytes_available;
 
                         memcpy(client_state.header_buffer.data() + client_state.received_bytes,
-                               buffer + bytes_processed,
+                               IO_buffer.data() + bytes_processed,
                                bytes_to_copy);
 
                         client_state.received_bytes += bytes_to_copy;
@@ -681,7 +683,8 @@ private:
                                 client_state.received_bytes = 0;
                             } else {
                                 // Header Only 消息处理
-                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, Mybyte{});
+                                auto tmp= Mybyte{};
+                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level,tmp);
                                 client_state.reset(HEADER_SIZE);
                             }
                         }
@@ -693,7 +696,7 @@ private:
                         int bytes_to_copy = (bytes_needed < bytes_available) ? bytes_needed : bytes_available;
 
                         memcpy(client_state.body_buffer.data() + client_state.received_bytes,
-                               buffer + bytes_processed,
+                               IO_buffer.data() + bytes_processed,
                                bytes_to_copy);
 
                         client_state.received_bytes += bytes_to_copy;
@@ -721,10 +724,11 @@ private:
                             } else {
 
                                 if (client_state.event_type == static_cast<uint16_t>(MYMQ::EventType::SERVER_RESPONSE_PULL_DATA)) {
-                                    handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(client_state.body_buffer));
+                                    handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level,client_state.body_buffer);
                                 } else {
                                     MP mp(client_state.body_buffer);
-                                    handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, std::move(mp.read_uchar_vector()));
+                                    auto body=mp.read_uchar_vector();
+                                    handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, body);
                                 }
                             }
 
@@ -737,7 +741,7 @@ private:
         }
     }
 
-    void handle_event(uint16_t eventtype, uint32_t correlation_id, uint16_t ack_level, Mybyte msg_body) {
+    void handle_event(uint16_t eventtype, uint32_t correlation_id, uint16_t ack_level, Mybyte& msg_body) {
         tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
 
         if (map_wait_responces.find(acc, correlation_id)) {
@@ -807,6 +811,9 @@ private:
     bool ssl_want_write_ = true;     // 握手过程中 SSL 是否在等待写 (初始为 true 以启动握手)
 
     std::atomic<size_t> curr_flying_request_num{0};
+    std::vector<char> IO_buffer;
+    size_t IO_buffer_size;
+
 
 };
 

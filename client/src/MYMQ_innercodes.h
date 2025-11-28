@@ -429,8 +429,6 @@ size_t record_count_ = 0;
         int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
         uint64_t ts_value = static_cast<uint64_t>(ts);
 
-        // --- 修正后的写法 (无需判断系统端序) ---
-
         // 1. 取出高 32 位，转网络序
         uint32_t high_part = htonl(static_cast<uint32_t>(ts_value >> 32));
         // 2. 取出低 32 位，转网络序
@@ -448,11 +446,7 @@ size_t record_count_ = 0;
         // 计算范围：从 Body 开始，到当前位置
         size_t body_len = ptr - body_start_ptr;
         uint32_t crc = MYMQ::Crc32::calculate_crc32(body_start_ptr, body_len);
-        uint32_t n_crc = htonl(crc); // CRC 通常也要转网络序，取决于你原来的实现
-        // 如果原来是 mb2.append(crc, ...) 且 append 也是直接 copy，这里要注意大小端
-        // 假设 mb.append 内部做了 htonl 或者你是 x86 对 x86，通常直接 memcpy 也没事
-        // 但为了严谨，这里建议统一转 htonl，除非你确定原来没转。
-        // *假设你原来 append(uint32) 内部做了 htonl*：
+        uint32_t n_crc = htonl(crc);
         std::memcpy(crc_ptr, &n_crc, sizeof(uint32_t));
 
         // 更新全局指针
@@ -468,7 +462,7 @@ size_t record_count_ = 0;
 
 }
 
-using ResponseCallback = std::function<void(uint16_t event_type, const std::vector<unsigned char>& msg_body)>;
+using ResponseCallback = std::function<void(uint16_t event_type, std::vector<unsigned char> msg_body)>;
 struct PendingMessage {
     std::vector<unsigned char> message_bytes;
     size_t offset;
@@ -547,45 +541,54 @@ struct Consumerbasicinfo
     std::atomic<bool> is_ingroup=0;
 };
 
+struct SparseCallback {
+    uint32_t relative_index; // 该回调对应 Batch 中的第几条消息 (0-based)
+    MYMQ_Public::SupportedCallbacks cb;
+};
+
 using TopicPartition=MYMQ_Public::TopicPartition;
 using CallbackQueue = std::deque<MYMQ_Public::SupportedCallbacks>;
 using BatchBuffer= MSG_serial::BatchBuffer;
-struct  Push_queue{
+struct Push_queue {
     std::mutex mtx;
-    std::condition_variable cv_full; // 用于背压（Buffer全满了就等）
+    std::condition_variable cv_full;
 
-    // 双缓冲：Active 负责写，Flushing 负责后台读
-    // 假设每个 Buffer 1MB (1024 * 1024)
-    BatchBuffer* active_buffer;
-    BatchBuffer* flushing_buffer;
+    BatchBuffer buf_1;
+    BatchBuffer buf_2;
 
-    BatchBuffer buf_1{1024 * 1024};
-    BatchBuffer buf_2{1024 * 1024};
-    BatchBuffer* active_buf = &buf_1;   // 生产者往这里写
-    BatchBuffer* flushing_buf = &buf_2; // 消费者(线程池)读这里
+    BatchBuffer* active_buf;
+    BatchBuffer* flushing_buf;
 
-    // 双缓冲 - 回调 (Callback 也需要双缓冲，否则多线程读写会崩)
-    std::vector<MYMQ_Public::SupportedCallbacks> cbs1;
-    std::vector<MYMQ_Public::SupportedCallbacks> cbs2;
-    std::vector<MYMQ_Public::SupportedCallbacks>* active_cbs = &cbs1;
-    std::vector<MYMQ_Public::SupportedCallbacks>* flushing_cbs = &cbs2;
+    // 回调双缓冲
+    std::vector<SparseCallback> cbs1;
+    std::vector<SparseCallback> cbs2;
+    std::vector<SparseCallback>* active_cbs = &cbs1;
+    std::vector<SparseCallback>* flushing_cbs = &cbs2;
 
-    bool is_flushing = false; // 标记后台线程是否正在处理 flushing_buffer
+    bool is_flushing = false;
 
     CallbackQueue callbacks_;
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
+    ZSTD_CCtx* cctx = nullptr;
     TopicPartition tp;
 
-    Push_queue(const std::string& t, size_t p) : tp(t, p) {
-        // 初始化指针
-        active_buffer = &buf_1;
-        flushing_buffer = &buf_2;
+    std::atomic<size_t> current_batch_count{0};
+
+    Push_queue(const std::string& t, size_t p, size_t buffer_size = 1024 * 1024)
+        : tp(t, p),
+        buf_1(buffer_size),
+        buf_2(buffer_size),
+        active_buf(&buf_1),
+        flushing_buf(&buf_2)
+    {
+        cctx=ZSTD_createCCtx();
     }
 
     ~Push_queue() {
         ZSTD_freeCCtx(cctx);
     }
 };
+
+
 
 struct endoffset_point
 {

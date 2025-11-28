@@ -25,7 +25,7 @@ int main(){
     // -------------------------------------
 
     out("Generating " + std::to_string(NUM_MESSAGES_TO_TEST) + " random messages..."); // 正在生成 [NUM_MESSAGES_TO_TEST] 条随机消息...
-    std::queue<std::string> message_values = generateRandomStringQueue(NUM_MESSAGES_TO_TEST, MESSAGE_MIN_LENGTH, MESSAGE_MAX_LENGTH,2);
+    auto message_values = generateRandomStringVector(NUM_MESSAGES_TO_TEST, MESSAGE_MIN_LENGTH, MESSAGE_MAX_LENGTH,2);
     std::vector<std::string> message_keys(NUM_MESSAGES_TO_TEST);
     for (int i = 0; i < NUM_MESSAGES_TO_TEST; ++i) {
         message_keys[i] = "key_" + std::to_string(i);
@@ -58,14 +58,13 @@ int main(){
 
     int messages_pushed = 0;
     for (int i = 0; i < NUM_MESSAGES_TO_TEST; ++i) {
-        Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values.front() );
+        Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values[i] );
 
         if (err != MYMQ_Public::ClientErrorCode:: NULL_ERROR) {
             cerr("Failed to push message " + std::to_string(i) + ", error code: " + std::to_string(static_cast<int>(err))); // 推送消息 [i] 失败，错误码: [err]
         } else {
             messages_pushed++;
         }
-        message_values.pop();
     }
 
 

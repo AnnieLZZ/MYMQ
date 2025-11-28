@@ -16,8 +16,8 @@ MYMQ_Client& MYMQ_Client::operator=(MYMQ_Client&&) noexcept = default;
 
 
 MYMQ_Client::ClientErrorCode MYMQ_Client::commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
-                                                       ,MYMQ_Public::SupportedCallbacks cb) {
-    return pimpl->commit_async(tp,next_offset_to_consume);
+                                                       ,MYMQ_Public::CommitAsyncResponceCallback cb) {
+    return pimpl->commit_async(tp,next_offset_to_consume,cb);
 }
 
 MYMQ_Client::ClientErrorCode MYMQ_Client::seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume){
@@ -25,7 +25,7 @@ MYMQ_Client::ClientErrorCode MYMQ_Client::seek(const MYMQ_Public::TopicPartition
 }
 
 MYMQ_Client::ClientErrorCode MYMQ_Client::push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value
-                                               ,MYMQ_Public::SupportedCallbacks cb) {
+                                               ,MYMQ_Public::PushResponceCallback cb) {
     return pimpl->push(tp, key, value,cb);
 }
 

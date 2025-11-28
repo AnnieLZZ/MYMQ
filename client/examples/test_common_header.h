@@ -24,7 +24,7 @@ void cerr(const std::string& message);
 void out(const std::string& str);
 std::string generateRandomString(int length, std::mt19937& rng, const std::string& charSet, int randomnessLevel);
 double getRepetitionProbability(int randomnessLevel);
-std::queue<std::string> generateRandomStringQueue(
+std::vector<std::string> generateRandomStringVector(
     int numStrings,
     int minLength,
     int maxLength,

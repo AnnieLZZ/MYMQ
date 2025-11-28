@@ -52,37 +52,42 @@ std::string generateRandomString(int length, std::mt19937& rng, const std::strin
 // 修改 generateRandomStringQueue 函数：
 // - 移除 seed 参数
 // - 将种子生成逻辑封装在函数内部
-std::queue<std::string> generateRandomStringQueue(
+std::vector<std::string> generateRandomStringVector(
     int numStrings,
     int minLength,
     int maxLength,
-    int randomnessLevel, // 随机性级别参数 (1-5)，越高越随机
+    int randomnessLevel, // 随机性级别参数 (1-5)
     const std::string& charSet) {
 
-    std::queue<std::string> stringQueue;
+    std::vector<std::string> stringVector;
 
-    if (numStrings <= 0) return stringQueue;
+    if (numStrings <= 0) return stringVector;
+
+    // 【优化】预分配内存，避免 vector 扩容带来的性能损耗
+    stringVector.reserve(numStrings);
+
     if (minLength <= 0) minLength = 1;
     if (maxLength < minLength) maxLength = minLength;
 
-    // 验证随机性级别，确保在 1 到 5 之间
+    // 验证随机性级别
     if (randomnessLevel < 1) randomnessLevel = 1;
     if (randomnessLevel > 5) randomnessLevel = 5;
 
-    // 将种子生成逻辑封装在函数内部
+    // 种子生成逻辑
     std::mt19937 rng;
     try {
         std::random_device rd;
-        rng.seed(rd()); // 使用 std::random_device 作为种子
+        rng.seed(rd());
     } catch (const std::exception& e) {
-        // 如果 random_device 不可用，则回退到时间作为种子
         rng.seed(static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
     }
 
     std::uniform_int_distribution<> lengthDist(minLength, maxLength);
 
     for (int i = 0; i < numStrings; ++i) {
-        stringQueue.push(generateRandomString(lengthDist(rng), rng, charSet, randomnessLevel));
+        // 使用 emplace_back 直接在 vector 尾部构造
+        stringVector.emplace_back(generateRandomString(lengthDist(rng), rng, charSet, randomnessLevel));
     }
-    return stringQueue;
+
+    return stringVector;
 }
