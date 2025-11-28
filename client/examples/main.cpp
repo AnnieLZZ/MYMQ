@@ -13,7 +13,7 @@ int main(){
     // -------------------------------------
 
     out("Generating " + std::to_string(NUM_MESSAGES_TO_TEST) + " random messages..."); // 正在生成 [NUM_MESSAGES_TO_TEST] 条随机消息...
-    std::queue<std::string> message_values = generateRandomStringQueue(NUM_MESSAGES_TO_TEST, MESSAGE_MIN_LENGTH, MESSAGE_MAX_LENGTH,2);
+    auto message_values = generateRandomStringVector(NUM_MESSAGES_TO_TEST, MESSAGE_MIN_LENGTH, MESSAGE_MAX_LENGTH,2);
     std::vector<std::string> message_keys(NUM_MESSAGES_TO_TEST);
     for (int i = 0; i < NUM_MESSAGES_TO_TEST; ++i) {
         message_keys[i] = "key_" + std::to_string(i);
@@ -50,21 +50,13 @@ int main(){
     auto push_start_time = std::chrono::high_resolution_clock::now();
     int messages_pushed = 0;
     for (int i = 0; i < NUM_MESSAGES_TO_TEST; ++i) {
-        // Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values.front(),
-        //                          [](const MYMQ_Public::PushResponce& resp) {
-        //     if( resp.errorcode!=MYMQ_Public::CommonErrorCode::NULL_ERROR){
-        //         cerr(MYMQ_Public::to_string(resp.errorcode));
-        //     }
-        //                          } );
-
-        Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values.front() );
+        Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values[i] );
 
         if (err != MYMQ_Public::ClientErrorCode:: NULL_ERROR) {
             cerr("Failed to push message " + std::to_string(i) + ", error code: " + MYMQ_Public::to_string(err));
         } else {
             messages_pushed++;
         }
-        message_values.pop(); // 消费队列中的值
     }
     auto push_end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> push_duration = push_end_time - push_start_time;
@@ -80,6 +72,9 @@ int main(){
     }
 
 
+
+    message_values.clear();
+    message_keys.clear();
 
     {
         std::unique_lock<std::mutex> lock(mtx);
@@ -116,14 +111,14 @@ int main(){
             auto& msg_back=res.back();
             auto msg_num=res.size();
             // auto baseoffset=msg_first.getOffset();
-            // auto rearoffset=msg_back.getOffset();
+            auto rearoffset=msg_back.getOffset();
 
             // out("Batch : baseoffset= "+std::to_string(baseoffset)+" ,base_key ="+msg_first.getKey()+" ,rearoffset= "+std::to_string(rearoffset)+" ,rear_key= "+msg_back.getKey());
             messages_pulled_count+=msg_num;
 
             // *** 关键修改：在这里计算和提交 ***
             // size_t next_offset_to_consume = rearoffset + 1 ;
-            // Err_Client commit_err = mc.commit_sync(MYMQ_Public::TopicPartition(TOPIC_NAME,0), next_offset_to_consume);
+            // Err_Client commit_err = mc.commit_async(MYMQ_Public::TopicPartition(TOPIC_NAME,0), next_offset_to_consume);
 
             // if (commit_err != MYMQ_Public::ClientErrorCode:: NULL_ERROR) {
             //     cerr("Failed to commit offset " + std::to_string(next_offset_to_consume) + ", error code: " + std::to_string(static_cast<int>(commit_err)));

@@ -34,7 +34,7 @@ public:
 
 
     Err_Client push(const MYMQ_Public::TopicPartition& tp,const std::string& key,const std::string& value
-                    ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::CallbackNoop()) ;
+                    ,MYMQ_Public::PushResponceCallback cb) ;
 
     Err_Client pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch) ;
     void create_topic(const std::string& topicname,size_t parti_num=1);
@@ -47,8 +47,7 @@ public:
 
 
 
-    Err_Client commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
-                            ,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::CallbackNoop()) ;
+    Err_Client commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb=MYMQ_Public::CommitAsyncResponceCallback()) ;
 
     Err_Client join_group(const std::string& groupid);
     Err_Client leave_group(const std::string& groupid);
@@ -85,22 +84,22 @@ private:
     void init(const std::string& clientid,uint8_t ack_level);
 
     void timer_commit_async();
+    bool send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_=std::vector<MYMQ::MYMQ_Client::SparseCallback>());
 
-    bool send(MYMQ::EventType event_type, const Mybyte& msg_body,std::vector<MYMQ_Public::SupportedCallbacks> cbs_=std::vector<MYMQ_Public::SupportedCallbacks>());
     std::map<std::string, std::map<std::string, std::set<size_t>>> assign_leaderdo(
         const std::unordered_map<std::string, std::set<std::string>>& member_to_topics,
         const std::unordered_map<std::string, size_t>& topic_num_map) ;
     std::string weave_assignments_message(const std::map<std::string, std::map<std::string, std::set<size_t>>>& assignments) ;
-    Err_Client commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::SupportedCallbacks cb=MYMQ_Public::CallbackNoop());
+    Err_Client commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb);
     MYMQ_Public::ResultVariant handle_response(Eve event_type,const Mybyte& msg_body);
     void push_timer_send();
     void out_group_reset();
     void cerr(const std::string& str){
-        Printqueue::instance().out(str,1,0);
+        // Printqueue::instance().out(str,1,0);
     }
 
     void out(const std::string& str){
-        Printqueue::instance().out(str,0,0);
+        // Printqueue::instance().out(str,0,0);
     }
 
 
@@ -122,12 +121,14 @@ private:
     MYMQ::PullSet pull_start_location;
     size_t autopush_perior_ms;
     size_t autocommit_perior_ms;
+    bool is_auto_commit;
+    size_t max_in_flight_requests_num;
     //Config配置项
 
 
     std::string path_;
     Communication_client cmc_;
-    bool is_auto_commit;
+
 
     Timer timer;
     size_t rebalance_timeout_taskid{0};
@@ -183,7 +184,7 @@ private:
     MYMQ::ACK_Level ack_level_;
 
     ShardedThreadPool& pool_=ShardedThreadPool::instance(8);
-    size_t max_in_flight_requests_num{1000};
+
 };
 
 
