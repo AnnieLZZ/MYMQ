@@ -52,3 +52,9 @@ CMakeLists.txt.user
 !client/thirdparty/**
 
 !server/thirdparty/**
+
+
+build-*/
+debug/
+release/
+
