@@ -37,11 +37,11 @@ using SendFileTask=MYMQ_Server::SendFileTask;
 
 
 void out(const std::string& str, bool perior = 0){
-    Printqueue::instance().out(str,0,perior);
+//    Printqueue::instance().out(str,0,perior);
 }
 
 void cerr(const std::string& str, bool perior = 0){
-    Printqueue::instance().out(str,1,perior);
+//    Printqueue::instance().out(str,1,perior);
 }
 
 
