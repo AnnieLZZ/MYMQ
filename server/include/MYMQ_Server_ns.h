@@ -81,7 +81,7 @@ struct SendFileTask {
      std::vector<unsigned char>   header_data;
      size_t header_send_offset=0;
     // 下面这些仅作记录用，如果不需要可以删掉
-    size_t offset_batch_first;
+    size_t offset_next_to_consume;
     std::string topicname;
     size_t partition;
     uint32_t correlation_id;
@@ -89,10 +89,10 @@ struct SendFileTask {
 
     SendFileTask(int fd, off_t off, size_t len, size_t first_off, const std::string& topic, size_t par, uint32_t cid, uint16_t ack)
         : in_fd(fd), offset(off), length(len), sent_so_far(0),
-          offset_batch_first(first_off), topicname(topic), partition(par), correlation_id(cid), ack_level(ack) {}
+          offset_next_to_consume(first_off), topicname(topic), partition(par), correlation_id(cid), ack_level(ack) {}
     SendFileTask(MYMQ_Server::MessageLocation mesloc, const std::string& topic, size_t par, uint32_t cid, uint16_t ack)
         : in_fd(mesloc.file_descriptor), offset(mesloc.offset_in_file), length(mesloc.length), sent_so_far(0),
-          offset_batch_first(mesloc.offset_next_to_consume), topicname(topic), partition(par),correlation_id(cid),ack_level(ack) {}
+          offset_next_to_consume(mesloc.offset_next_to_consume), topicname(topic), partition(par),correlation_id(cid),ack_level(ack) {}
 };
 
 class ClientState {

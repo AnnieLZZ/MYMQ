@@ -606,7 +606,7 @@ public:
                                         mb_pull_inf_additional.append_string(task.topicname);
                                         mb_pull_inf_additional.append_size_t(task.partition);
                                         mb_pull_inf_additional.append_short(static_cast<short>(Err::NULL_ERROR));
-                                        mb_pull_inf_additional.append_size_t(task.offset_batch_first);
+                                        mb_pull_inf_additional.append_size_t(task.offset_next_to_consume);
                                         auto pull_inf_additional = std::move(mb_pull_inf_additional.data);
 
                                         MessageBuilder mb;
