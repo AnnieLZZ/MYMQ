@@ -156,6 +156,11 @@ inline std::string to_string(ACK_Level ackLevel) {
     }
 }
 
+
+
+
+
+
 namespace ZSTD {
 
 
@@ -347,8 +352,7 @@ inline Record parase_Record(const std::vector<unsigned char>& binary_data) {
 }
 
 
-// 预定义一个大 Buffer，专门用来挨个塞消息
-class BatchBuffer {
+class BatchBuffer {//生产者用的
 public:
     std::vector<unsigned char> data_;
     size_t write_pos_ = 0; // 当前写到了哪里
@@ -596,6 +600,80 @@ struct endoffset_point
     size_t off;
     endoffset_point(size_t off_,const std::string& t,size_t p):tp(t,p),off(off_){}
 };
+
+
+class PollBuffer {
+public:
+    enum State {
+        PAUSE,
+        NEED_POLL
+    };
+
+    PollBuffer(size_t low, size_t high)
+        : low_level_capacity(low), high_level_capacity(high), state(NEED_POLL) {}
+
+    // 返回 true 表示成功取出了数据
+    bool try_pop(std::vector<unsigned char>& target) {
+        std::lock_guard<std::mutex> ulock(mtx);
+
+        if (queue_.empty()) {
+            return false;
+        }
+
+        auto& item = queue_.front();
+        target = std::move(item);
+
+        // 关键修复：减少当前大小
+        curr_size -= target.size();
+
+        queue_.pop_front();
+
+        // 关键修复：水位检查逻辑
+        // 如果当前是暂停状态，且水位已经降到低水位以下，则切换为需要拉取
+        if (state == PAUSE && curr_size <= low_level_capacity) {
+            state = NEED_POLL;
+        }
+
+        return true;
+    }
+
+    // 建议返回值改为 void，或者返回是否触发了暂停
+    void push(std::vector<unsigned char>& obj) {
+        std::lock_guard<std::mutex> ulock(mtx);
+
+        size_t obj_size = obj.size();
+        queue_.emplace_back(std::move(obj));
+        curr_size += obj_size;
+
+        // 如果超过高水位，标记为暂停
+        if (state == NEED_POLL && curr_size >= high_level_capacity) {
+            state = PAUSE;
+        }
+    }
+
+    // 检查当前状态
+    bool is_paused() {
+        std::lock_guard<std::mutex> ulock(mtx);
+        return state == PAUSE;
+    }
+
+    bool need_poll() {
+        std::lock_guard<std::mutex> ulock(mtx);
+        return state == NEED_POLL;
+    }
+
+private:
+    std::mutex mtx;
+    std::deque<std::vector<unsigned char>> queue_;
+
+    std::atomic<size_t> curr_size = 0;
+
+    size_t high_level_capacity;
+    size_t low_level_capacity;
+    State state;
+};
+
+
 
 }
 

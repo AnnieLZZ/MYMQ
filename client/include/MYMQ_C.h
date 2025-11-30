@@ -33,11 +33,11 @@ public:
     // --- Public API (Mirrored from MYMQ_clientuse) ---
 
 
-
+void  trigger_pull();
 
     ClientErrorCode push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value
                          ,MYMQ_Public::PushResponceCallback cb=MYMQ_Public::PushResponceCallback());
-    ClientErrorCode pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch);
+    ClientErrorCode pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch);
 
     ClientErrorCode seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume);
     ClientErrorCode commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb=MYMQ_Public::CommitAsyncResponceCallback());

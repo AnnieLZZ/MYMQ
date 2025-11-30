@@ -5,6 +5,8 @@
 #include"MYMQ_innercodes.h"
 #include"MYMQ_PublicCodes.h"
 #include"SharedThreadPool.h"
+#include"tbb/parallel_for_each.h"
+#include"tbb/enumerable_thread_specific.h"
 #include"Timer.h"
 #include <unordered_set>
 
@@ -15,7 +17,9 @@ using Err=MYMQ_Public::CommonErrorCode;
 using MB=MessageBuilder;
 using Err_Client=MYMQ_Public::ClientErrorCode;
 using Mybyte=std::vector<unsigned char>;
-using Endoffsetmap=tbb::concurrent_hash_map<std::string,MYMQ::MYMQ_Client::endoffset_point>;
+using Endoffsetmap=tbb::concurrent_hash_map<MYMQ::MYMQ_Client::TopicPartition,MYMQ::MYMQ_Client::endoffset_point>;
+using Pollqueuemap=tbb::concurrent_hash_map<MYMQ_Public::TopicPartition,MYMQ::MYMQ_Client::PollBuffer>;
+using TopicPartition=MYMQ_Public::TopicPartition;
 
 
 
@@ -36,7 +40,7 @@ public:
     Err_Client push(const MYMQ_Public::TopicPartition& tp,const std::string& key,const std::string& value
                     ,MYMQ_Public::PushResponceCallback cb) ;
 
-    Err_Client pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch) ;
+    Err_Client pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch) ;
     void create_topic(const std::string& topicname,size_t parti_num=1);
     void set_pull_bytes(size_t bytes);
 
@@ -62,7 +66,18 @@ public:
         return is_ingroup.load();
     }
 
+       void  trigger_pull();
+
 private:
+    void call_parse_impl(
+        const std::vector<unsigned char>& raw_big_chunk,            // IO 线程收到的原始大包
+        std::vector<MYMQ_Public::ConsumerRecord>& out_records,      // 输出结果
+        const MYMQ::MYMQ_Client::TopicPartition& tp,                // 所属分区
+        Err_Client& out_error                                       // 错误码传出
+        ) ;
+
+
+
 
     void flush_batch_task(MYMQ::MYMQ_Client::Push_queue& pq);
     void finish_flush(MYMQ::MYMQ_Client::Push_queue& pq);
@@ -95,11 +110,11 @@ private:
     void push_timer_send();
     void out_group_reset();
     void cerr(const std::string& str){
-        // Printqueue::instance().out(str,1,0);
+        Printqueue::instance().out(str,1,0);
     }
 
     void out(const std::string& str){
-        // Printqueue::instance().out(str,0,0);
+        Printqueue::instance().out(str,0,0);
     }
 
 
@@ -154,11 +169,12 @@ private:
 
     std::atomic<bool> rebalance_ing{0};
 
-    std::unordered_map<std::string,std::unordered_set<MYMQ_Public::TopicPartition> > map_final_assign;
+    std::unordered_map<std::string,std::unordered_set<TopicPartition> > map_final_assign;
     std::shared_mutex mtx_map_final_assign;
 
-    tbb::concurrent_hash_map<std::string,MYMQ::MYMQ_Client::endoffset_point> map_end_offset;
+    tbb::concurrent_hash_map<MYMQ_Public::TopicPartition,MYMQ::MYMQ_Client::endoffset_point> map_end_offset;
 
+    tbb::concurrent_hash_map<MYMQ_Public::TopicPartition,MYMQ::MYMQ_Client::PollBuffer> map_poll_queue;
 
     std::unordered_map<std::string,MYMQ::MYMQ_Client::Push_queue> map_push_queue;
 
@@ -177,13 +193,16 @@ private:
     std::atomic<bool> poll_ready{0};
     std::mutex mtx_poll_ready;
 
-    moodycamel::ReaderWriterQueue<std::vector< MYMQ_Public::ConsumerRecord>> poll_queue;
+
 
 
     ZSTD_DCtx* dctx;
     MYMQ::ACK_Level ack_level_;
 
+    tbb::enumerable_thread_specific<ZSTD_DCtx*> tbb_dctx_pool;
     ShardedThreadPool& pool_=ShardedThreadPool::instance(8);
+
+
 
 };
 

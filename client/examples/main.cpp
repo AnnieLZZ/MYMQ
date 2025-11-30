@@ -80,6 +80,7 @@ int main(){
         std::unique_lock<std::mutex> lock(mtx);
         cv.wait_for(lock, std::chrono::seconds(7));
     }
+    mc.trigger_pull();
     // --- 拉取和提交吞吐量测试 ---
     std::cout<<"\n--- Starting Pull and Commit Throughput Test ---"<<std::endl;
     out("\n--- Starting Pull and Commit Throughput Test ---"); // 开始拉取和提交吞吐量测试
@@ -90,7 +91,7 @@ int main(){
     while (messages_pulled_count < NUM_MESSAGES_TO_TEST) {
 
         std::vector< MYMQ_Public::ConsumerRecord> res;
-        auto pull_result = mc.pull(MYMQ_Public::TopicPartition(TOPIC_NAME,0),res);
+        auto pull_result = mc.pull(res);
         if(pull_result==Err_Client::PULL_TIMEOUT){
             out("pull timeout");
             continue;
