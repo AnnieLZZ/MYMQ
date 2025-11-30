@@ -23,7 +23,7 @@ struct MessageLocation {
     off_t   offset_in_file=0;  // 在文件内的物理偏移
     size_t  length=0;          // 消息长度
     bool    found=0;
-    size_t offset_batch_first=0;
+    size_t offset_next_to_consume=0;
 };
 
 
@@ -92,7 +92,7 @@ struct SendFileTask {
           offset_batch_first(first_off), topicname(topic), partition(par), correlation_id(cid), ack_level(ack) {}
     SendFileTask(MYMQ_Server::MessageLocation mesloc, const std::string& topic, size_t par, uint32_t cid, uint16_t ack)
         : in_fd(mesloc.file_descriptor), offset(mesloc.offset_in_file), length(mesloc.length), sent_so_far(0),
-          offset_batch_first(mesloc.offset_batch_first), topicname(topic), partition(par),correlation_id(cid),ack_level(ack) {}
+          offset_batch_first(mesloc.offset_next_to_consume), topicname(topic), partition(par),correlation_id(cid),ack_level(ack) {}
 };
 
 class ClientState {

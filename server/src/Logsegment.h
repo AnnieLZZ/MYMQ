@@ -350,159 +350,175 @@ log_bytes_since_last_flush.store(0);
     }
 
     MesLoc find(uint64_t target_offset, size_t byte_need) {
-        std::shared_lock<std::shared_mutex> lock(rw_mutex_);
-        MesLoc loc{}; // 默认 found=0
+            std::shared_lock<std::shared_mutex> lock(rw_mutex_);
+            MesLoc loc{}; // 默认 found=0
 
-        // 1. 基础范围检查
-        // 注意：如果 target_offset < base_offset，通常应该返回最早的数据(base_offset)，而不是空
-        // 这里保留你的逻辑：如果超出范围则返回空
-        if (target_offset >= next_offset_.load()) {
-            return loc;
-        }
-        // 如果请求的比当前 base 还小，从 base 开始读
-        if (target_offset < base_offset_) {
-            target_offset = base_offset_;
-        }
-
-        uint32_t relative_offset = static_cast<uint32_t>(target_offset - base_offset_);
-        char* index_start = static_cast<char*>(index_file_.give_mapped_data_ptr());
-        size_t index_size = index_file_.give_curr_used_size();
-        size_t num_entries = index_size / (sizeof(uint32_t) * 2);
-
-        uint32_t phy_pos = 0;
-
-        // 2. 二分查找 (Binary Search) - 保持不变，逻辑正确
-        // 寻找最后一个 relative_offset <= target 的索引项
-        if (num_entries != 0) {
-            int low = 0, high = static_cast<int>(num_entries - 1), found_idx = -1;
-            while (low <= high) {
-                int mid = low + (high - low) / 2;
-                uint32_t current_relative;
-                // 边界检查
-                if ((size_t)mid * 8 + 4 > index_size) break;
-
-                std::memcpy(&current_relative, index_start + mid * 8, 4);
-                current_relative = ntohl(current_relative);
-
-                if (current_relative <= relative_offset) {
-                    found_idx = mid;
-                    low = mid + 1;
-                } else {
-                    high = mid - 1;
-                }
+            // 1. 基础范围检查
+            if (target_offset >= next_offset_.load()) {
+                return loc;
+            }
+            if (target_offset < base_offset_) {
+                target_offset = base_offset_;
             }
 
-            if (found_idx != -1) {
-                // 读取对应的物理位置
-                if ((size_t)found_idx * 8 + 8 <= index_size) {
-                    std::memcpy(&phy_pos, index_start + found_idx * 8 + 4, 4);
-                    phy_pos = ntohl(phy_pos);
+            uint32_t relative_offset = static_cast<uint32_t>(target_offset - base_offset_);
+            char* index_start = static_cast<char*>(index_file_.give_mapped_data_ptr());
+            size_t index_size = index_file_.give_curr_used_size();
+            size_t num_entries = index_size / (sizeof(uint32_t) * 2);
+
+            uint32_t phy_pos = 0;
+
+            // 2. 二分查找 (Binary Search)
+            if (num_entries != 0) {
+                int low = 0, high = static_cast<int>(num_entries - 1), found_idx = -1;
+                while (low <= high) {
+                    int mid = low + (high - low) / 2;
+                    uint32_t current_relative;
+                    if ((size_t)mid * 8 + 4 > index_size) break;
+
+                    std::memcpy(&current_relative, index_start + mid * 8, 4);
+                    current_relative = ntohl(current_relative);
+
+                    if (current_relative <= relative_offset) {
+                        found_idx = mid;
+                        low = mid + 1;
+                    } else {
+                        high = mid - 1;
+                    }
                 }
-            }
-        }
 
-        // 3. 线性扫描 (Linear Scan) 找到精确的 Batch
-        size_t logsize = actual_physical_file_size;
-        if (phy_pos >= logsize) return loc;
-
-        size_t current_scan_pos = phy_pos;
-
-        // 这里的目标是找到第一个 "结束Offset > Target" 的 Batch
-        // 或者更简单：找到第一个 "Offset >= Target" 的 Batch，
-        // 但如果 Target 落在某个 Batch 中间，我们需要返回那个 Batch。
-
-        while (current_scan_pos < logsize) {
-            // 读取 Log Header (12 Bytes)
-            char header_buf[12];
-            if (current_scan_pos + 12 > logsize) break;
-
-            ssize_t r = pread(log_file_fd, header_buf, 12, current_scan_pos);
-            if (r < 12) break;
-
-            uint64_t off_net;
-            uint32_t len_net;
-            std::memcpy(&off_net, header_buf, 8);
-            std::memcpy(&len_net, header_buf + 8, 4);
-
-            uint64_t batch_base_offset = ntohll(off_net);
-            uint32_t batch_len = ntohl(len_net); // Payload 长度
-
-            // 完整性检查
-            size_t total_msg_size = 12 + batch_len;
-            if (current_scan_pos + total_msg_size > logsize) break;
-
-            // --- 关键修正：判定是否命中 ---
-
-            bool is_target_batch = false;
-
-            if (batch_base_offset >= target_offset) {
-                // Case A: 当前 Batch 的起始位置已经 >= 目标，肯定是它（或者目标不存在）
-                is_target_batch = true;
-            } else {
-                // Case B: 当前 Batch 起始位置 < 目标。
-                // 我们需要检查 Target 是否在这个 Batch 内部 (Offset ~ Offset + Count)
-                // 这需要读取 Payload 里的 Batch Count (8~15字节)
-
-                if (batch_len >= 16) {
-                    char count_buf[8];
-                    // Payload start = current_scan_pos + 12
-                    // Batch Count offset inside payload = 8
-                    // So read at: current_scan_pos + 12 + 8
-                    if (pread(log_file_fd, count_buf, 8, current_scan_pos + 20) == 8) {
-                        uint64_t cnt_net;
-                        std::memcpy(&cnt_net, count_buf, 8);
-                        uint64_t batch_count = ntohll(cnt_net);
-
-                        // 如果 target 落在 [base, base + count) 区间内
-                        if (batch_base_offset + batch_count > target_offset) {
-                            is_target_batch = true;
-                        }
+                if (found_idx != -1) {
+                    if ((size_t)found_idx * 8 + 8 <= index_size) {
+                        std::memcpy(&phy_pos, index_start + found_idx * 8 + 4, 4);
+                        phy_pos = ntohl(phy_pos);
                     }
                 }
             }
 
-            if (is_target_batch) {
-                // --- 4. 命中！开始累积 byte_need ---
-                loc.found = 1;
-                loc.file_descriptor = log_file_fd; // 只要 fd，不重新 open
-                loc.offset_in_file = static_cast<off_t>(current_scan_pos);
-                loc.offset_batch_first = batch_base_offset; // 实际返回的第一个 offset
+            // 3. 线性扫描 (Linear Scan)
+            size_t logsize = actual_physical_file_size;
+            if (phy_pos >= logsize) return loc;
 
-                size_t accumulated_len = 0;
-                size_t accumulate_pos = current_scan_pos;
+            size_t current_scan_pos = phy_pos;
 
-                // 循环读取后续消息，直到满足 byte_need
-                while (accumulated_len < byte_need && accumulate_pos < logsize) {
-                     // 读取 Header 里的 Size
-                     char len_buf[4];
-                     // Offset(8) + Size(4). 我们只读 Size，所以在 pos + 8
-                     if (accumulate_pos + 12 > logsize) break;
+            while (current_scan_pos < logsize) {
+                // 读取 Log Header (12 Bytes)
+                char header_buf[12];
+                if (current_scan_pos + 12 > logsize) break;
 
-                     if (pread(log_file_fd, len_buf, 4, accumulate_pos + 8) != 4) break;
+                ssize_t r = pread(log_file_fd, header_buf, 12, current_scan_pos);
+                if (r < 12) break;
 
-                     uint32_t this_msg_len_net;
-                     std::memcpy(&this_msg_len_net, len_buf, 4);
-                     uint32_t this_msg_len = ntohl(this_msg_len_net);
+                uint64_t off_net;
+                uint32_t len_net;
+                std::memcpy(&off_net, header_buf, 8);
+                std::memcpy(&len_net, header_buf + 8, 4);
 
-                     size_t this_total_size = 12 + this_msg_len;
+                uint64_t batch_base_offset = ntohll(off_net);
+                uint32_t batch_len = ntohl(len_net); // Payload 长度
 
-                     // 检查越界
-                     if (accumulate_pos + this_total_size > logsize) break;
+                size_t total_msg_size = 12 + batch_len;
+                if (current_scan_pos + total_msg_size > logsize) break;
 
-                     accumulated_len += this_total_size;
-                     accumulate_pos += this_total_size;
+                // --- 判定是否命中 ---
+                bool is_target_batch = false;
+
+                if (batch_base_offset >= target_offset) {
+                    is_target_batch = true;
+                } else {
+                    // 检查 Target 是否在 Batch 内部
+                    if (batch_len >= 16) {
+                        char count_buf[8];
+                        // Count 位于 Payload 偏移 8 字节处 (Header 12 + 8 = 20)
+                        if (pread(log_file_fd, count_buf, 8, current_scan_pos + 20) == 8) {
+                            uint64_t cnt_net;
+                            std::memcpy(&cnt_net, count_buf, 8);
+                            uint64_t batch_count = ntohll(cnt_net);
+
+                            if (batch_base_offset + batch_count > target_offset) {
+                                is_target_batch = true;
+                            }
+                        }
+                    }
                 }
 
-                loc.length = accumulated_len;
-                return loc;
+                if (is_target_batch) {
+                    // --- 4. 命中！开始累积数据并计算尾部 Offset ---
+                    loc.found = 1;
+                    loc.file_descriptor = log_file_fd;
+                    loc.offset_in_file = static_cast<off_t>(current_scan_pos);
+                    // loc.offset_of_this_responce 初始化为 0 或当前 base，会在下方循环中更新为最后一个 Batch 的尾部
+                    loc.offset_next_to_consume = batch_base_offset;
+
+                    size_t accumulated_len = 0;
+                    size_t accumulate_pos = current_scan_pos;
+
+                    // 循环读取后续消息，直到满足 byte_need
+                    while (accumulated_len < byte_need && accumulate_pos < logsize) {
+                        // 我们需要读取 Header (12B) 和 Payload 前段 (至少到 Count 结束)
+                        // Batch 结构: [Offset 8B][Len 4B] ... Payload ... [Magic][CRC][Type][Count 8B]
+                        // Count 在 Payload 的第 8 字节起始。也就是说 Count 在整个 Batch 的 Offset 20 处。
+                        // 为了减少 IO，我们尝试读前 28 字节 (12 Header + 16 Payload)
+
+                        char temp_buf[28];
+                        // 确保读取不越界，至少读 Header
+                        if (accumulate_pos + 12 > logsize) break;
+
+                        // 先读 28 字节，如果不够就读剩下的
+                        size_t bytes_to_read = 28;
+                        if (accumulate_pos + bytes_to_read > logsize) bytes_to_read = logsize - accumulate_pos;
+
+                        if (pread(log_file_fd, temp_buf, bytes_to_read, accumulate_pos) < 12) break; // 至少读出 Header
+
+                        // 解析 Header
+                        uint64_t this_off_net;
+                        uint32_t this_len_net;
+                        std::memcpy(&this_off_net, temp_buf, 8);
+                        std::memcpy(&this_len_net, temp_buf + 8, 4);
+
+                        uint64_t this_base = ntohll(this_off_net);
+                        uint32_t this_len = ntohl(this_len_net);
+                        size_t this_total_size = 12 + this_len;
+
+                        // 完整性检查
+                        if (accumulate_pos + this_total_size > logsize) break;
+
+                        // 解析 Count 以更新 loc.offset_of_this_responce
+                        // Count 在 temp_buf 的下标 20 开始 (8+4+8 = 20)
+                        uint64_t this_count = 0;
+                        if (this_len >= 16 && bytes_to_read >= 28) {
+                            // 缓冲区里已经有 Count 了
+                            uint64_t cnt_net;
+                            std::memcpy(&cnt_net, temp_buf + 20, 8);
+                            this_count = ntohll(cnt_net);
+                        } else if (this_len >= 16) {
+                            // 缓冲区不够 (极少见边缘情况)，补一次 pread
+                            char cnt_buf[8];
+                            if (pread(log_file_fd, cnt_buf, 8, accumulate_pos + 20) == 8) {
+                                uint64_t cnt_net;
+                                std::memcpy(&cnt_net, cnt_buf, 8);
+                                this_count = ntohll(cnt_net);
+                            }
+                        }
+
+                        // *** 核心修改：实时更新返回的尾部 Offset ***
+                        // 这里的语义是：返回数据的逻辑结束位置 (Next Offset)
+                        loc.offset_next_to_consume = this_base + this_count;
+
+                        accumulated_len += this_total_size;
+                        accumulate_pos += this_total_size;
+                    }
+
+                    loc.length = accumulated_len;
+                    return loc;
+                }
+
+                current_scan_pos += total_msg_size;
             }
 
-            // 如果不是目标 Batch，跳过，看下一个
-            current_scan_pos += total_msg_size;
+            return loc;
         }
 
-        return loc;
-    }
     uint64_t base_offset() const { return base_offset_; }
     uint64_t next_offset() const { return next_offset_.load(); }
 
