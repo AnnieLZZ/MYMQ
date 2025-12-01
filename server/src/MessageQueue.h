@@ -1458,12 +1458,31 @@ private:
                     failed=0;
 
                 }
-                if(failed){
+                if (failed) {
+                    cerr(MYMQ_Public::to_string(static_cast<Err>(res.second)));
 
-                    cerr(MYMQ_Public::to_string(static_cast<Err>( res.second)));
-                    MB mb;
-                    mb.append( static_cast<uint16_t>( res.second),offset,topicname,partition);
-                    session.send(Eve::SERVER_RESPONSE_PULL_DATA,correlation_id,ack_level,std::move(mb.data) );
+                    // 1. 构建 Metadata (必须与 SendFileTask 里的结构完全一致！)
+                    // SendFileTask: Topic -> Partition -> Error -> Offset
+                    MessageBuilder mb_meta;
+                    mb_meta.append_string(topicname);
+                    mb_meta.append_size_t(partition);
+                    mb_meta.append_uint16(static_cast<uint16_t>(res.second));
+                    mb_meta.append_size_t(offset);
+
+                    // 2. 将 Metadata 包装进 Body，并追加一个空的 Payload
+
+                    MessageBuilder mb_body;
+
+                    // 第一层：Metadata Vector
+                    mb_body.append_uchar_vector(mb_meta.data);
+
+                    // 第二层：空的 Payload Vector (长度0)
+                    std::vector<unsigned char> empty_payload;
+                    mb_body.append_uchar_vector(empty_payload);
+
+                    // 3. 发送 (session.send 会给整个 mb_body 再加一层长度头，作为最外层的 Body)
+                    session.send(Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, std::move(mb_body.data));
+
                     cerr(std::to_string(offset));
                 }
 
@@ -1586,7 +1605,7 @@ private:
 
 
                 MB mb;
-                mb.append(static_cast<short>(sync_res.second),groupid );
+                mb.append(static_cast<short>(sync_res.second),groupid,memberid );
 
                 if(sync_res.second==Err::NULL_ERROR){
                     mb.append(sync_res.first.size());

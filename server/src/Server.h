@@ -602,24 +602,50 @@ public:
                                 if (!task.header_sent) {
                                     // 构造 Header 的逻辑保持不变
                                     if (task.header_data.empty()) {
-                                        MessageBuilder mb_pull_inf_additional;
-                                        mb_pull_inf_additional.append_string(task.topicname);
-                                        mb_pull_inf_additional.append_size_t(task.partition);
-                                        mb_pull_inf_additional.append_short(static_cast<short>(Err::NULL_ERROR));
-                                        mb_pull_inf_additional.append_size_t(task.offset_next_to_consume);
-                                        auto pull_inf_additional = std::move(mb_pull_inf_additional.data);
-
                                         MessageBuilder mb;
-                                        mb.reserve(HEADER_SIZE + sizeof(short) + sizeof(size_t) + sizeof(uint32_t));
-                                        uint32_t total_message_length = static_cast<uint32_t>(HEADER_SIZE + pull_inf_additional.size() + sizeof(size_t) + task.length);
+                                        mb.append_string(task.topicname);
+                                        mb.append_size_t(task.partition);
+                                        mb.append_uint16(static_cast<uint16_t>(Err::NULL_ERROR));
+                                        mb.append_size_t(task.offset_next_to_consume);
+                                        auto pull_inf_additional = std::move(mb.data);
 
-                                        mb.append_uint32(total_message_length);
-                                        mb.append_uint16(static_cast<uint16_t>(Eve::SERVER_RESPONSE_PULL_DATA));
-                                        mb.append(task.correlation_id, task.ack_level);
-                                        mb.append(pull_inf_additional);
-                                        mb.append_uint32(static_cast<uint32_t>(task.length));
+                                        // --- 开始构建最终包头 ---
+                                        MessageBuilder mb_final;
 
-                                        task.header_data = std::move(mb.data);
+                                        // 1. 计算 Metadata 块的大小 (Vector 自带一个 uint32 长度前缀)
+                                        uint32_t meta_block_size = sizeof(uint32_t) + static_cast<uint32_t>(pull_inf_additional.size());
+
+                                        // 2. 计算 Task Payload 块的大小 (我们需手动加一个 uint32 长度前缀来表示 Payload 长度)
+                                        uint32_t payload_block_size = sizeof(uint32_t) + static_cast<uint32_t>(task.length);
+
+                                        // 3. 计算这两者组成的“新层级(Body)”的总大小
+                                        uint32_t body_wrapper_size = meta_block_size + payload_block_size;
+
+                                        uint32_t total_message_length = static_cast<uint32_t>(HEADER_SIZE + sizeof(uint32_t) + body_wrapper_size);
+
+
+                                        mb_final.reserve(HEADER_SIZE + sizeof(uint32_t) + meta_block_size + sizeof(uint32_t));
+
+                                        // --- 写入数据 ---
+
+                                        // [Level 0] 总长度
+                                        mb_final.append_uint32(total_message_length);
+
+                                        // [Level 1] 协议头字段
+                                        mb_final.append_uint16(static_cast<uint16_t>(Eve::SERVER_RESPONSE_PULL_DATA));
+                                        mb_final.append(task.correlation_id, task.ack_level);
+
+                                        // [Level 1] Body 层 (新增的层级，与 corr_id/ack 同级)
+                                        // 这里写入算好的 Body 总长度
+                                        mb_final.append_uint32(body_wrapper_size);
+
+                                            // [Level 2] Metadata (append_uchar_vector 会自动加上 meta 长度前缀)
+                                            mb_final.append_uchar_vector(pull_inf_additional);
+
+                                            // [Level 2] Task Payload (手动写入长度前缀，实际数据紧随其后)
+                                            mb_final.append_uint32(static_cast<uint32_t>(task.length));
+
+                                        task.header_data = std::move(mb_final.data);
                                         task.header_send_offset = 0;
                                     }
 
