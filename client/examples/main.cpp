@@ -85,6 +85,7 @@ int main() {
     // --- 4. 拉取并校验数据 (Consumer Phase) ---
     out("\n--- [Phase 2] Verifying Messages ---");
     mc.trigger_pull();
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
     std::vector<MYMQ_Public::ConsumerRecord> res;
     res.reserve(2000);
@@ -97,6 +98,8 @@ int main() {
         res.clear();
         auto pull_result = mc.pull(res, PULL_TIMEOUT_S);
 
+        std::cout << "[DEBUG] pull_result=" << MYMQ_Public::to_string(pull_result)
+                  << ", res.size()=" << res.size() << std::endl;
         if (pull_result == Err_Client::PULL_TIMEOUT || pull_result == Err_Client::EMPTY_RECORD) {
             retry_empty_count++;
             if (retry_empty_count > 10) {

@@ -383,83 +383,61 @@ size_t record_count_ = 0;
     // --- 核心：替代 build_Record 的逻辑 ---
     // 返回 true 表示写入成功，false 表示空间不足
     bool append_record(const std::string& key, const std::string& value) {
-        // 1. 预计算总长度，判断是否溢出
-        // 结构：[外层Len(4)] + [CRC(4)] + [KeyLen(4)+Key] + [ValLen(4)+Val] + [Time(8)]
+        // 1. 预计算长度
         size_t key_len = key.size();
         size_t val_len = value.size();
 
-        // Record 内部的大小 (CRC + Key部分 + Val部分 + Time)
-        size_t record_inner_size = sizeof(uint32_t) + // CRC
-                                   sizeof(uint32_t) + key_len +
-                                   sizeof(uint32_t) + val_len +
-                                   sizeof(int64_t);   // Time
+        // ---------------------------------------------------------
+        // 逻辑: [TotalLen] -> [KeyLen][Key][ValLen][Val][Time]
+        // ---------------------------------------------------------
 
-        // 写入 Batch 需要的总空间 (包含外层长度头)
+        // Record 内部大小 = Key部分 + Val部分 + Time(8)
+        size_t record_inner_size = sizeof(uint32_t) + key_len +
+                                   sizeof(uint32_t) + val_len +
+                                   sizeof(uint64_t);   // Time
+
+        // 写入 Batch 需要的总空间 (包含开头的 4字节 TotalLen)
         size_t total_size_needed = sizeof(uint32_t) + record_inner_size;
 
-        // 检查容量
+        // 2. 检查容量
         if (write_pos_ + total_size_needed > data_.size()) {
             return false;
         }
 
-        // --- 开始写入 (模拟原来的多次 append 行为) ---
+        // --- 开始写入 ---
         unsigned char* ptr = data_.data() + write_pos_;
 
-        // A. 【核心修正】写入外层长度 (模拟 append_uchar_vector)
-        // 对应原来的：mb_records.append_uchar_vector(...) 里的 network_length
+        // A. 写入单条 Record 的总长度 (不包含自身 4 字节)
+        // 解析端：std::memcpy(&single_rec_len, rec_ptr, 4);
         uint32_t n_record_len = htonl(static_cast<uint32_t>(record_inner_size));
         std::memcpy(ptr, &n_record_len, sizeof(uint32_t));
         ptr += sizeof(uint32_t);
 
-        // B. 预留 CRC 位置
-        unsigned char* crc_ptr = ptr; // 记住 CRC 写在哪里
-        ptr += sizeof(uint32_t);      // 跳过 CRC 的 4 字节
-
-        // Body 开始的位置 (用于计算 CRC)
-        unsigned char* body_start_ptr = ptr;
-
-        // C. 写入 Key
+        // B. 写入 Key (Length + Data)
+        // 解析端：std::memcpy(&key_len, kv_start, 4);
         uint32_t n_key_len = htonl(static_cast<uint32_t>(key_len));
         std::memcpy(ptr, &n_key_len, sizeof(uint32_t)); ptr += sizeof(uint32_t);
         std::memcpy(ptr, key.data(), key_len);          ptr += key_len;
 
-        // D. 写入 Value
+        // C. 写入 Value (Length + Data)
+        // 解析端：std::memcpy(&val_len, kv_start, 4);
         uint32_t n_val_len = htonl(static_cast<uint32_t>(val_len));
         std::memcpy(ptr, &n_val_len, sizeof(uint32_t)); ptr += sizeof(uint32_t);
         std::memcpy(ptr, value.data(), val_len);        ptr += val_len;
 
-        // E. 写入 Time
         auto now = std::chrono::system_clock::now();
         int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
         uint64_t ts_value = static_cast<uint64_t>(ts);
 
-        // 1. 取出高 32 位，转网络序
-        uint32_t high_part = htonl(static_cast<uint32_t>(ts_value >> 32));
-        // 2. 取出低 32 位，转网络序
-        uint32_t low_part  = htonl(static_cast<uint32_t>(ts_value & 0xFFFFFFFF));
+        uint64_t n_time = htonll(ts_value);
+        std::memcpy(ptr, &n_time, sizeof(uint64_t));
+        ptr += sizeof(uint64_t);
 
-        // 3. 依次写入 (大端序规定：先写高位，再写低位)
-        std::memcpy(ptr, &high_part, sizeof(uint32_t));
-        ptr += sizeof(uint32_t);
-
-        std::memcpy(ptr, &low_part, sizeof(uint32_t));
-        ptr += sizeof(uint32_t);
-
-
-        // F. 回头计算并填入 CRC
-        // 计算范围：从 Body 开始，到当前位置
-        size_t body_len = ptr - body_start_ptr;
-        uint32_t crc = MYMQ::Crc32::calculate_crc32(body_start_ptr, body_len);
-        uint32_t n_crc = htonl(crc);
-        std::memcpy(crc_ptr, &n_crc, sizeof(uint32_t));
-
-        // 更新全局指针
         write_pos_ += total_size_needed;
 
         record_count_++;
         return true;
     }
-
  };
 
 

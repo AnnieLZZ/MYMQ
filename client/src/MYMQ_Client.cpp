@@ -1283,9 +1283,17 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         else if(event_type==Eve::SERVER_RESPONSE_SYNC_GROUP_ACK){
             auto error=static_cast<Err>(mp.read_short()) ;
             auto groupid=mp.read_string();
+            auto memberid=mp.read_string();
+
 
 
             if(error==Err::NULL_ERROR){
+
+                {
+                    std::unique_lock<std::shared_mutex> ulock(mtx_consumerinfo) ;
+                    info_consumer.memberid=memberid;
+                }
+
                 std::queue<std::pair<std::pair<std::string,size_t>,size_t> > tmp_queue_endoffset;
 
                 {
@@ -1393,8 +1401,6 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             // 1. 读取响应头元数据 (这部分数据很小，保持原有逻辑)
             auto pull_inf_additional = mp.read_uchar_vector();
             MessageParser mp_pull_inf_additional(pull_inf_additional);
-
-
             auto topicname_ = mp_pull_inf_additional.read_string();
             auto partition_ = mp_pull_inf_additional.read_size_t();
             auto error = static_cast<Err>(mp_pull_inf_additional.read_uint16());
@@ -1403,14 +1409,19 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             out(std::string{} + "[PULL] Result : " + " State : " + MYMQ_Public::to_string(error));
 
             bool is_no_record=(error==Err::NO_RECORD);
-            if(error != Err::NULL_ERROR&&!is_no_record) {
+            if(is_no_record){
+                {
+                    std::lock_guard<std::mutex> lock(mtx_poll_ready);
+                    poll_ready.store(true);
+                }
+                cv_poll_ready.notify_one(); // 唤醒 pull 函数中的 wait
+            }
+            if(error != Err::NULL_ERROR) {
                 return error;
             }
 
 
-
-            auto message_collection = mp.read_uchar_vector();
-
+             auto message_collection= mp.read_uchar_vector();
             bool need_poll=0;
             // 2. 找到对应的队列
             Pollqueuemap::accessor cac;

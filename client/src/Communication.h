@@ -723,13 +723,9 @@ private:
                                 }
                             } else {
 
-                                if (client_state.event_type == static_cast<uint16_t>(MYMQ::EventType::SERVER_RESPONSE_PULL_DATA)) {
-                                    handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level,client_state.body_buffer);
-                                } else {
-                                    MP mp(client_state.body_buffer);
-                                    auto body=mp.read_uchar_vector();
-                                    handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level, body);
-                                }
+                                MP mp(client_state.body_buffer);
+                                auto body=mp.read_uchar_vector();
+                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level,std::move( body));
                             }
 
                             client_state.reset(HEADER_SIZE);
@@ -741,7 +737,7 @@ private:
         }
     }
 
-    void handle_event(uint16_t eventtype, uint32_t correlation_id, uint16_t ack_level, Mybyte& msg_body) {
+    void handle_event(uint16_t eventtype, uint32_t correlation_id, uint16_t ack_level, Mybyte msg_body) {
         tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
 
         if (map_wait_responces.find(acc, correlation_id)) {
@@ -763,11 +759,11 @@ private:
     }
 
     void cerr(const std::string& str){
-        // Printqueue::instance().out(str,1,0);
+        Printqueue::instance().out(str,1,0);
     }
 
     void out(const std::string& str){
-        // Printqueue::instance().out(str,0,0);
+        Printqueue::instance().out(str,0,0);
     }
 private:
     std::string path;
