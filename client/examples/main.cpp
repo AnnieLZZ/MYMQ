@@ -1,166 +1,175 @@
-#include"test_common_header.h"
+#include "test_common_header.h"
+#include <vector>
+#include <string>
+#include <iostream>
+#include <iomanip>
+#include <thread>
+#include <chrono>
+#include <cassert>
 
-using Err_Client=MYMQ_Public::ClientErrorCode;
+using Err_Client = MYMQ_Public::ClientErrorCode;
 
-int main(){
-      std::cout << "MYMQ Client: Current Version: " << CLIENT_VERSION_STRING << std::endl;
-    // --- 吞吐量测试配置 ---
-    const int NUM_MESSAGES_TO_TEST = 4000000; // Number of messages to push and pull
-    const int MESSAGE_MIN_LENGTH = 200;     // Minimum length of random message values
-    const int MESSAGE_MAX_LENGTH = 300;    // Maximum length of random message values
-    const std::string TOPIC_NAME = "testtopic";
+// 用于本地存储预期的消息结构
+struct ExpectedMessage {
+    std::string key;
+    std::string value;
+};
 
-    // -------------------------------------
+int main() {
+    std::cout << "===========================================" << std::endl;
+    std::cout << "   MYMQ Data Integrity & Correctness Test  " << std::endl;
+    std::cout << "===========================================" << std::endl;
+    std::cout << "Client Version: " << CLIENT_VERSION_STRING << std::endl;
 
-    out("Generating " + std::to_string(NUM_MESSAGES_TO_TEST) + " random messages..."); // 正在生成 [NUM_MESSAGES_TO_TEST] 条随机消息...
-    auto message_values = generateRandomStringVector(NUM_MESSAGES_TO_TEST, MESSAGE_MIN_LENGTH, MESSAGE_MAX_LENGTH,2);
-    std::vector<std::string> message_keys(NUM_MESSAGES_TO_TEST);
-    for (int i = 0; i < NUM_MESSAGES_TO_TEST; ++i) {
-        message_keys[i] = "key_" + std::to_string(i);
+    // --- 配置参数 ---
+    // 验证测试不需要像吞吐量测试那么大的量，重点是“准确”
+    const int NUM_MESSAGES_TO_VERIFY = 50000;
+    const int MESSAGE_LEN = 100; // 固定长度方便对比，或者随机长度均可
+    const std::string TOPIC_NAME = "verify_topic";
+    const std::string GROUP_ID = "verify_group";
+    const size_t PULL_TIMEOUT_S = 2;
+
+    // --- 1. 生成并记录预期数据 ---
+    out("Generating " + std::to_string(NUM_MESSAGES_TO_VERIFY) + " verification messages...");
+
+    std::vector<ExpectedMessage> expected_data;
+    expected_data.reserve(NUM_MESSAGES_TO_VERIFY);
+
+    // 生成确定的数据，方便调试。如果出错，我们知道 key_100 就应该对应 index 100
+    for (int i = 0; i < NUM_MESSAGES_TO_VERIFY; ++i) {
+        ExpectedMessage msg;
+        msg.key = "key_" + std::to_string(i);
+        // 为了确保内容独一无二，将 index 编码进 value
+        msg.value = "val_" + std::to_string(i) + "_" + std::string(MESSAGE_LEN, 'x');
+        expected_data.push_back(msg);
     }
-    out("Message generation complete."); // 消息生成完成。
+    out("Data generation complete.");
 
+    // --- 2. 初始化客户端 ---
+    MYMQ_Client mc("verify_client", 1);
+    // 确保 Topic 是空的或者新创建的，防止读取到脏数据
+    // 注意：在真实测试中，最好每次跑测试都用不同的 Topic 名字，或者先清空 Topic
+    mc.create_topic(TOPIC_NAME);
+    mc.subscribe_topic(TOPIC_NAME);
+    mc.join_group(GROUP_ID);
 
-    MYMQ_Client mc("test",1);
-    mc.subscribe_topic("testtopic");
-    mc.create_topic("testtopic");
-    mc.join_group("testgroup");
-    mc.set_pull_bytes(1024*1024);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
 
+    // --- 3. 推送数据 (Producer Phase) ---
+    out("\n--- [Phase 1] Pushing Messages ---");
+    int push_success_count = 0;
 
-    std::condition_variable cv;
-    std::mutex mtx;
+    for (int i = 0; i < NUM_MESSAGES_TO_VERIFY; ++i) {
+        Err_Client err = mc.push(
+            MYMQ_Public::TopicPartition(TOPIC_NAME, 0),
+            expected_data[i].key,
+            expected_data[i].value
+            );
 
+        if (err != Err_Client::NULL_ERROR) {
+            cerr("FATAL: Push failed at index " + std::to_string(i) + " Error: " + MYMQ_Public::to_string(err));
+            return -1; // 发送失败直接退出，验证测试要求 100% 可靠
+        }
+        push_success_count++;
 
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait_for(lock, std::chrono::seconds(2));
-    }
-
-     out("\n--- Your assignment ---");
-    auto ass= mc.get_assigned_partition();
-    for(const auto& [topic,partition]:ass){
-        out(topic+" "+std::to_string(partition)+" Offset : "+std::to_string( mc.get_position_consumed(MYMQ_Public::TopicPartition(topic,partition))));
-    }
-     out("\n--- Your assignment ---");
-
-
-    // --- 推送吞吐量测试 ---
-    out("\n--- Starting Push Throughput Test ---"); // 开始推送吞吐量测试
-    auto push_start_time = std::chrono::high_resolution_clock::now();
-    int messages_pushed = 0;
-    for (int i = 0; i < NUM_MESSAGES_TO_TEST; ++i) {
-        Err_Client err = mc.push(MYMQ_Public::TopicPartition(TOPIC_NAME,0),message_keys[i], message_values[i] );
-
-        if (err != MYMQ_Public::ClientErrorCode:: NULL_ERROR) {
-            cerr("Failed to push message " + std::to_string(i) + ", error code: " + MYMQ_Public::to_string(err));
-        } else {
-            messages_pushed++;
+        if ((i + 1) % 10000 == 0) {
+            std::cout << "Pushed " << (i + 1) << " / " << NUM_MESSAGES_TO_VERIFY << "\r" << std::flush;
         }
     }
-    auto push_end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> push_duration = push_end_time - push_start_time;
+    std::cout << "\nPush Complete. Success: " << push_success_count << std::endl;
 
-    out("Push test complete."); // 推送测试完成。
-    out("Total messages pushed: " + std::to_string(messages_pushed)); // 总共推送消息: [messages_pushed]
-    out("Push duration: " + std::to_string(push_duration.count()) + " seconds"); // 推送耗时: [push_duration.count()] 秒
-    if (push_duration.count() > 0) {
-        std::cout<<"Push throughput: " << std::to_string(messages_pushed / push_duration.count()) << " messages/second"<<std::endl;
-        //out("Push throughput: " + std::to_string(messages_pushed / push_duration.count()) + " messages/second"); // 推送吞吐量: [throughput] 消息/秒
-    } else {
-        out("Push duration too short to calculate throughput."); // 推送耗时过短，无法计算吞吐量。
-    }
+    // 等待数据落盘/同步
+    out("Waiting for server sync (3s)...");
+    std::this_thread::sleep_for(std::chrono::seconds(3));
 
-
-
-    message_values.clear();
-    message_keys.clear();
-
-    {
-        std::unique_lock<std::mutex> lock(mtx);
-        cv.wait_for(lock, std::chrono::seconds(7));
-    }
+    // --- 4. 拉取并校验数据 (Consumer Phase) ---
+    out("\n--- [Phase 2] Verifying Messages ---");
     mc.trigger_pull();
-    // --- 拉取和提交吞吐量测试 ---
-    std::cout<<"\n--- Starting Pull and Commit Throughput Test ---"<<std::endl;
-    out("\n--- Starting Pull and Commit Throughput Test ---"); // 开始拉取和提交吞吐量测试
-    int messages_pulled_count = 0;
-    auto pull_start_time = std::chrono::steady_clock::now();
 
-    bool first=0;
-    while (messages_pulled_count < NUM_MESSAGES_TO_TEST) {
+    std::vector<MYMQ_Public::ConsumerRecord> res;
+    res.reserve(2000);
 
-        std::vector< MYMQ_Public::ConsumerRecord> res;
-        auto pull_result = mc.pull(res);
-        if(pull_result==Err_Client::PULL_TIMEOUT){
-            out("pull timeout");
+    int verified_count = 0;
+    bool verification_passed = true;
+    int retry_empty_count = 0; // 防止无限等待
+
+    while (verified_count < NUM_MESSAGES_TO_VERIFY) {
+        res.clear();
+        auto pull_result = mc.pull(res, PULL_TIMEOUT_S);
+
+        if (pull_result == Err_Client::PULL_TIMEOUT || pull_result == Err_Client::EMPTY_RECORD) {
+            retry_empty_count++;
+            if (retry_empty_count > 10) {
+                cerr("TIMEOUT: Server stopped sending data. Stuck at index " + std::to_string(verified_count));
+                verification_passed = false;
+                break;
+            }
             continue;
         }
-        else if (pull_result != Err_Client::NULL_ERROR &&pull_result == Err_Client::EMPTY_RECORD) {
-            // 处理 NO_RECORD 或其他错误，但没有数据
-            // 此时什么也不做，不提交，只继续循环
-            continue;
+
+        if (pull_result != Err_Client::NULL_ERROR && pull_result != Err_Client::PARTIAL_PARASE_FAILED) {
+            cerr("ERROR: Pull failed with code: " + MYMQ_Public::to_string(pull_result));
+            verification_passed = false;
+            break;
         }
 
-        if(!res.empty()){
-            if(!first){
-                first=1;
-                pull_start_time =std::chrono::steady_clock::now();
+        retry_empty_count = 0; // 重置超时计数
+
+        // === 核心校验逻辑 ===
+        for (const auto& record : res) {
+            // 获取当前期望的数据
+            const auto& expected = expected_data[verified_count];
+
+            // 注意：这里假设 ConsumerRecord 有 getKey() 和 getValue() 方法
+            // 如果你的接口不同（例如是 public 成员变量），请修改此处
+            std::string actual_key = record.getKey();
+            std::string actual_val = record.getValue();
+
+            // 1. 校验 Key
+            if (actual_key != expected.key) {
+                cerr("\n[FAIL] Key Mismatch at index " + std::to_string(verified_count));
+                cerr("Expected: " + expected.key);
+                cerr("Actual:   " + actual_key);
+                cerr("Offset:   " + std::to_string(record.getOffset()));
+                verification_passed = false;
+                goto end_verification;
             }
 
-            auto& msg_first=res.front();
-            auto& msg_back=res.back();
-            auto msg_num=res.size();
-            // auto baseoffset=msg_first.getOffset();
-            auto rearoffset=msg_back.getOffset();
+            // 2. 校验 Value
+            if (actual_val != expected.value) {
+                cerr("\n[FAIL] Value Mismatch at index " + std::to_string(verified_count));
+                // 只打印前50个字符避免刷屏
+                cerr("Expected (len=" + std::to_string(expected.value.size()) + "): " + expected.value.substr(0, 50) + "...");
+                cerr("Actual   (len=" + std::to_string(actual_val.size()) + "): " + actual_val.substr(0, 50) + "...");
+                verification_passed = false;
+                goto end_verification;
+            }
 
-            // out("Batch : baseoffset= "+std::to_string(baseoffset)+" ,base_key ="+msg_first.getKey()+" ,rearoffset= "+std::to_string(rearoffset)+" ,rear_key= "+msg_back.getKey());
-            messages_pulled_count+=msg_num;
-
-            // *** 关键修改：在这里计算和提交 ***
-            // size_t next_offset_to_consume = rearoffset + 1 ;
-            // Err_Client commit_err = mc.commit_async(MYMQ_Public::TopicPartition(TOPIC_NAME,0), next_offset_to_consume);
-
-            // if (commit_err != MYMQ_Public::ClientErrorCode:: NULL_ERROR) {
-            //     cerr("Failed to commit offset " + std::to_string(next_offset_to_consume) + ", error code: " + std::to_string(static_cast<int>(commit_err)));
-            // }
+            verified_count++;
         }
-        // 如果 first.empty() == true (例如 NO_RECORD)，则此循环不执行任何操作，
-        // 只会继续下一次 pull，而不会错误地提交 offset 1。
+
+        // 打印进度
+        if (verified_count % 5000 == 0) {
+            std::cout << "Verified " << verified_count << " / " << NUM_MESSAGES_TO_VERIFY << "\r" << std::flush;
+        }
     }
 
-    auto pull_end_time = std::chrono::steady_clock::now();
-    std::chrono::duration<double> pull_duration = pull_end_time - pull_start_time;
-
-    out("Pull and commit test complete."); // 拉取和提交测试完成。
-    out("Total messages pulled: " + std::to_string(messages_pulled_count)); // 总共拉取消息: [messages_pulled_count]
-    out("Pull and commit duration: " + std::to_string(pull_duration.count()) + " seconds"); // 拉取和提交耗时: [pull_duration.count()] 秒
-    if (pull_duration.count() > 0) {
-        std::cout<<"Pull and commit throughput: " << std::to_string(messages_pulled_count / pull_duration.count()) << " messages/second"<<std::endl;
-       // out("Pull and commit throughput: " + std::to_string(messages_pulled_count / pull_duration.count()) + " messages/second"); // 拉取和提交吞吐量: [throughput] 消息/秒
+end_verification:
+    std::cout << "\n\n";
+    if (verification_passed && verified_count == NUM_MESSAGES_TO_VERIFY) {
+        std::cout << "========================================" << std::endl;
+        std::cout << " TEST RESULT: [ PASS ]" << std::endl;
+        std::cout << " Verified " << verified_count << " messages successfully." << std::endl;
+        std::cout << " Data Integrity: OK" << std::endl;
+        std::cout << " Order Integrity: OK" << std::endl;
+        std::cout << "========================================" << std::endl;
     } else {
-        out("Pull and commit duration too short to calculate throughput."); // 拉取和提交耗时过短，无法计算吞吐量。
+        std::cout << "========================================" << std::endl;
+        std::cout << " TEST RESULT: [ FAILED ]" << std::endl;
+        std::cout << " Verified only " << verified_count << " / " << NUM_MESSAGES_TO_VERIFY << std::endl;
+        std::cout << "========================================" << std::endl;
     }
 
-    out("\nThroughput test finished."); // 吞吐量测试结束。
-
-
-    // mc.leave_group("testgroup");
-
-
-    std::cin.get(); // 保持控制台打开
-    return 0;
+    std::cin.get();
+    return verification_passed ? 0 : 1;
 }
-
-
-
-
-
-
-
-
-
-
-
-
-

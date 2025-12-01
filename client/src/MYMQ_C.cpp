@@ -29,12 +29,12 @@ MYMQ_Client::ClientErrorCode MYMQ_Client::push(const MYMQ_Public::TopicPartition
     return pimpl->push(tp, key, value,cb);
 }
 
-MYMQ_Client::ClientErrorCode MYMQ_Client::pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch) {
-    return pimpl->pull(record_batch);
+MYMQ_Client::ClientErrorCode MYMQ_Client::pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_s) {
+    return pimpl->pull(record_batch,poll_wait_timeout_s);
 }
 
 void MYMQ_Client::trigger_pull(){
-    return pimpl->trigger_pull();
+    return pimpl->trigger_all_partition_pull();
 }
 
 void MYMQ_Client::create_topic(const std::string& topicname, size_t parti_num) {

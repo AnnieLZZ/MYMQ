@@ -40,7 +40,7 @@ public:
     Err_Client push(const MYMQ_Public::TopicPartition& tp,const std::string& key,const std::string& value
                     ,MYMQ_Public::PushResponceCallback cb) ;
 
-    Err_Client pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch) ;
+    Err_Client pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batc,size_t poll_wait_timeout_s) ;
     void create_topic(const std::string& topicname,size_t parti_num=1);
     void set_pull_bytes(size_t bytes);
 
@@ -66,7 +66,7 @@ public:
         return is_ingroup.load();
     }
 
-       void  trigger_pull();
+       void  trigger_all_partition_pull();
 
 private:
     void call_parse_impl(
@@ -201,6 +201,9 @@ private:
 
     tbb::enumerable_thread_specific<ZSTD_DCtx*> tbb_dctx_pool;
     ShardedThreadPool& pool_=ShardedThreadPool::instance(8);
+
+
+    std::atomic<size_t> local_pull_bytes{1048576};
 
 
 
