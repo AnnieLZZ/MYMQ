@@ -251,46 +251,51 @@ public:
     std::pair<uint64_t, Err> append(std::vector<unsigned char>& msg) {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
 
-
+        // 1. 获取当前偏移量
         uint64_t current_offset = next_offset_;
-        uint32_t msg_size = static_cast<uint32_t>(msg.size());
-        size_t total_log_entry_size = sizeof(uint64_t) + sizeof(uint32_t) + msg_size;
+
+        // msg 包含了 header(12字节) + payload，所以总大小就是 msg.size()
+        size_t total_log_entry_size = msg.size();
 
         // 2. 检查容量
-        if (actual_physical_file_size+ total_log_entry_size > max_segment_size_) {
+        // 注意：这里一定要保证 msg 至少包含 Header(12B) + Payload Header(8B+8B) 的最小长度，防止越界
+        if (actual_physical_file_size + total_log_entry_size > max_segment_size_) {
             return {0, Err::FULL_SEGMENT};
         }
 
-        // 3. 准备数据
-        uint32_t encoded_size = htonl(msg_size);
+        // 3. 准备数据：直接在 msg 内存上修改
         uint64_t curr_off_net = htonll(current_offset);
 
-        // 修改 msg 内部 BaseOffset (注意：这会修改入参，这是预期的副作用)
+        // -------------------------------------------------------
+        // 修改点 A: 填充最外层的 Log Entry Header 中的 Offset (前8字节)
+        // -------------------------------------------------------
         std::memcpy(msg.data(), &curr_off_net, sizeof(uint64_t));
 
+        // 修改点 B: 填充 Payload 内部的 BaseOffset
+        // 原来是在 msg.data()，现在 Header 占了 12 字节，所以偏移 12 字节
+        // -------------------------------------------------------
+        std::memcpy(msg.data() + 12, &curr_off_net, sizeof(uint64_t));
+
+        // -------------------------------------------------------
         // 解析 msg_num
+        // 原来是在 msg.data() + 8
+        // 现在位置：Header(12) + PayloadBaseOffset(8) = 偏移 20 字节处
+        // -------------------------------------------------------
         size_t msg_num;
         uint64_t msg_num_raw;
-        std::memcpy(&msg_num_raw, msg.data() + sizeof(uint64_t), sizeof(uint64_t));
+        std::memcpy(&msg_num_raw, msg.data() + 12 + sizeof(uint64_t), sizeof(uint64_t));
         msg_num = ntohll(msg_num_raw);
 
-        // 4. 使用 writev 避免大内存拷贝
-        struct iovec iov[3];
-        iov[0].iov_base = &curr_off_net;
-        iov[0].iov_len = sizeof(uint64_t);
-        iov[1].iov_base = &encoded_size;
-        iov[1].iov_len = sizeof(uint32_t);
-        iov[2].iov_base = msg.data();
-        iov[2].iov_len = msg.size();
-
-        // 5. 关键：先保存当前的物理位置用于索引！
+        // 4. 关键：记录写入前的物理位置用于索引
         uint32_t index_physical_pos = actual_physical_file_size;
 
-        // 6. 执行写入并检查错误
-        ssize_t written = writev(log_file_fd, iov, 3);
+        // 5. 执行单次 Write，不再需要 writev
+        ssize_t written = write(log_file_fd, msg.data(), total_log_entry_size);
+
         if (written != total_log_entry_size) {
             // truncate 文件到 actual_physical_file_size 以丢弃可能写入的一半数据
             ftruncate(log_file_fd, actual_physical_file_size);
+            // 这里可能需要更严谨的错误处理，比如重置 offset 或者抛出致命错误
             return {0, Err::IO_ERROR};
         }
 
@@ -298,13 +303,13 @@ public:
         actual_physical_file_size += total_log_entry_size;
         log_bytes_since_last_flush += total_log_entry_size;
 
-
-        // 7. 索引逻辑
+        // 6. 索引逻辑 (保持不变)
         bool create_index_entry = (current_offset == base_offset_ ||
             actual_physical_file_size - bytes_last_index_entry_ >= index_build_interval_bytes);
 
         if (create_index_entry) {
             try {
+                // 索引文件格式：[相对Offset 4B][物理位置 4B]
                 char* index_ptr = static_cast<char*>(index_file_.allocate(sizeof(uint32_t) * 2));
                 uint32_t relative_offset = static_cast<uint32_t>(current_offset - base_offset_);
 
@@ -318,25 +323,21 @@ public:
                 bytes_last_index_entry_ = actual_physical_file_size;
             } catch (std::out_of_range& e) {
                 cerr("[Logsegment] Index Full");
-
+            } catch (std::runtime_error& e) {
+                cerr("[Logsegment] Index mmap crushed");
             }
-            catch (std::runtime_error& e) {
-                            cerr("[Logsegment] Index mmap crushed");
-
-                        }
         }
 
         if (log_bytes_since_last_flush.load() >= LOG_FLUSH_BYTES_INTERVAL) {
-//            flush_log();
+            // flush_log();
         }
-        if(bytes_last_index_entry_>index_build_interval_bytes){
-//            flush_index();
+        if(bytes_last_index_entry_ > index_build_interval_bytes){
+            // flush_index();
         }
 
         next_offset_ += msg_num;
         return {current_offset, Err::NULL_ERROR};
     }
-
 
     void flush_log() {
 

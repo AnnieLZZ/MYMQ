@@ -1586,7 +1586,7 @@ private:
 
 
                 MB mb;
-                mb.append(static_cast<short>(sync_res.second),groupid );
+                mb.append(static_cast<short>(sync_res.second),groupid,memberid );
 
                 if(sync_res.second==Err::NULL_ERROR){
                     mb.append(sync_res.first.size());
