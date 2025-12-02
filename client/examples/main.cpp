@@ -49,8 +49,8 @@ int main() {
     MYMQ_Client mc("verify_client", 1);
     // 确保 Topic 是空的或者新创建的，防止读取到脏数据
     // 注意：在真实测试中，最好每次跑测试都用不同的 Topic 名字，或者先清空 Topic
-    mc.create_topic(TOPIC_NAME);
     mc.subscribe_topic(TOPIC_NAME);
+    mc.create_topic(TOPIC_NAME); 
     mc.join_group(GROUP_ID);
 
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -85,7 +85,7 @@ int main() {
     // --- 4. 拉取并校验数据 (Consumer Phase) ---
     out("\n--- [Phase 2] Verifying Messages ---");
     mc.trigger_pull();
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    std::this_thread::sleep_for(std::chrono::seconds(3));//trigger完等一会让消息进入缓冲区
 
     std::vector<MYMQ_Public::ConsumerRecord> res;
     res.reserve(2000);
@@ -123,8 +123,6 @@ int main() {
             // 获取当前期望的数据
             const auto& expected = expected_data[verified_count];
 
-            // 注意：这里假设 ConsumerRecord 有 getKey() 和 getValue() 方法
-            // 如果你的接口不同（例如是 public 成员变量），请修改此处
             std::string actual_key = record.getKey();
             std::string actual_val = record.getValue();
 
