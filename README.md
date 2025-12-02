@@ -1,3 +1,4 @@
+
 # MYMQ: High-Performance Distributed Message Queue
 
 > A C++ distributed messaging system benchmarked against Apache Kafka's architecture.
@@ -11,14 +12,14 @@
 ### 📊 单机单分区性能指标 (Single Node, Single Partition)
 
 **测试环境:** 
-* Workload: 4,000,000 msgs | Size: 200~300B | 单分区 (Single Partition)
-* Hardware: C端: [CPU: Intel® Core™ i7-12650H (10 Cores)] | [Disk: NVMe SSD]
-            S端: [CPU: Intel® Core™ i7-12650H ] | [Disk: NVMe SSD] | [处理器:2 / 内核数: 4]
+* **Workload:** 4,000,000 msgs | Msg Size: 1KB (Payload) | Single Partition
+* **Hardware:** C端: [CPU: Intel® Core™ i7-12650H (10 Cores)] | [Disk: NVMe SSD]
+                S端: [CPU: Intel® Core™ i7-12650H ] | [Disk: NVMe SSD] |  [处理器:2 / 内核数: 4]
 
 | Metric | Throughput | Description |
 | :--- | :--- | :--- |
 | **Push (Producer)** | **~331,198 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
-| **Poll + commitsync (Consumer)** | **~255,983 msg/s** | **Fetch & Parse & commit**: Client Response Handling + Message Deserialization +commitsync |
+| **Pull (Consumer)** | **~1,087,359 msg/s** | **Buffered Processing**: Fetch Buffer $\rightarrow$ **ZSTD Decompress** $\rightarrow$ **CRC32 Verify** $\rightarrow$ Batch Parsing $\rightarrow$ Object Construction |
 
 ---
 
@@ -27,7 +28,7 @@
 ### 1. I/O 与存储优化 (I/O & Storage)
 * **Zero-Copy with kTLS:** 结合 `sendfile` 实现零拷贝传输；引入 **OpenSSL kTLS** 将加密卸载至内核态，解决了传统 SSL 在用户态加密导致无法利用 sendfile 的痛点，显著减少内核/用户态上下文切换。（这也是为什么不使用boost.asio的原因，boost.asio强制将加密抬到用户态）
 * **混合存储策略:**
-    * **日志段:** 采用标准 `write` 系统调用进行 Append-only 追加写。利用 Linux Page Cache 的顺序写合并机制，避免了 `mmap` 在处理变长文件追加时频繁触发的缺页中断和 TLB 刷新。
+    * **日志段:** 采用标准 `write` 系统调用进行 Append-only 追加写。利用 Linux Page Cache 的顺序写合并机制，避免了 `mmap` 在处理变长文件追加写时频繁触发的**缺页中断 (Page Faults)** 和 **TLB 抖动**。。
     * **稀疏索引:** 采用 `mmap` 内存映射。针对固定小步长递增的索引文件，利用内存映射避免读取时的 buffer 拷贝，以 $O(\log n)$ 效率的二分查找来消息辅助定位。
 * **Log-Structured:** 采用标准“分段日志 + 稀疏索引”结构。**基于 Base Offset 命名日志段及其索引**，支持**按段大小自动滚动**，保证了磁盘空间的有序管理与写入性能的线性扩展。
 * **原生批量架构:**
