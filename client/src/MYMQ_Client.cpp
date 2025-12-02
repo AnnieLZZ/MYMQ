@@ -310,167 +310,175 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         const MYMQ::MYMQ_Client::TopicPartition& tp,
         Err_Client& out_error
         ) {
-
         out_error = Err_Client::NULL_ERROR;
-        size_t current_position = 0;
-        const size_t collection_size = raw_big_chunk.size();
 
-        // Batch 头部结构: [8 bytes BaseOffset] + [4 bytes BatchLength]
-        const size_t RECORD_HEADER_SIZE = sizeof(uint64_t) + sizeof(uint32_t);
+        // 如果数据极小，连一个 Header 都凑不齐，直接返回
+        if (raw_big_chunk.empty()) return;
 
-        ZSTD_DCtx* dctx = tbb_dctx_pool.local();
+        // Batch 头部由 BaseOffset(8) + BatchLength(4) 组成
+        // Payload 最小长度为 InnerBase(8) + Count(8) + ZstdLen(4) = 20 bytes
+        const size_t MIN_PAYLOAD_SIZE = 20;
 
+        size_t total_records_to_reserve = 0;
+        const size_t chunk_size = raw_big_chunk.size();
+        const unsigned char* chunk_data = raw_big_chunk.data();
+
+        // =========================================================
+        // Phase 1: Pre-scan (为了能够一口气 reserve)
+        // =========================================================
         try {
-            while (current_position < collection_size) {
-                // --- A. 边界预检查 ---
-                if (current_position + RECORD_HEADER_SIZE > collection_size) {
+            MessageParser scan_mp(chunk_data, chunk_size);
+
+            while (!scan_mp.eof()) {
+                // 1. 读取 Batch Header
+                // 如果剩余数据不足以读取 Header (12 bytes)，MP 会抛出异常，跳出循环
+                if (scan_mp.remaining() < 12) break;
+
+                scan_mp.skip(8); // 跳过 BaseOffset (8 bytes)
+                uint32_t batch_len = scan_mp.read_uint32(); // BatchLength
+
+                if (batch_len == 0) continue;
+
+                // 2. 检查 Payload 完整性
+                // 此时 scan_mp.offset 指向 Payload 起始位置
+                // 我们只需要读取里面的 Count 字段，不需要解压
+                if (scan_mp.remaining() < batch_len) {
+                    // 数据被截断，停止预扫描
                     break;
                 }
 
-                // --- B. 读取 Batch Header ---
-                const unsigned char* header_ptr = raw_big_chunk.data() + current_position;
-
-                // 1. 读取 BaseOffset (8 bytes) -> NTOHLL
-                uint64_t batch_base_offset;
-                std::memcpy(&batch_base_offset, header_ptr, sizeof(uint64_t));
-                batch_base_offset = ntohll(batch_base_offset); // [Network -> Host]
-                header_ptr += sizeof(uint64_t);
-
-                // 2. 读取 BatchLength (4 bytes) -> NTOHL
-                uint32_t record_size;
-                std::memcpy(&record_size, header_ptr, sizeof(uint32_t));
-                record_size = ntohl(record_size); // [Network -> Host]
-                header_ptr += sizeof(uint32_t);
-
-                // --- C. Payload 边界检查 ---
-                if (record_size == 0) {
-                    current_position += RECORD_HEADER_SIZE;
+                // 如果 Payload 甚至不足以存放 Meta 信息，跳过该 Batch
+                if (batch_len < MIN_PAYLOAD_SIZE) {
+                    scan_mp.skip(batch_len);
                     continue;
                 }
 
-                if (current_position + RECORD_HEADER_SIZE + record_size > collection_size) {
-                    out_error = Err_Client::UNKNOWN_ERROR; // Data truncated
+                // 3. 读取 Meta (InnerBase + Count)
+                scan_mp.skip(8); // 跳过 InnerBase
+                uint64_t count = scan_mp.read_uint64();
+                total_records_to_reserve += count;
+
+                // 4. 跳过剩余的 Payload (ZstdLen + ZstdData)
+                // 也就是跳过 (batch_len - 16) 字节
+                scan_mp.skip(batch_len - 16);
+            }
+        } catch (const std::exception& e) {
+            // Pre-scan 阶段的异常可以忽略（或者是数据截断），
+            // 我们只利用已经扫到的数量进行 reserve，真正的错误由 Phase 2 捕捉
+        }
+
+
+        if (total_records_to_reserve > 0) {
+            out_records.reserve(out_records.size() + total_records_to_reserve);
+        }
+
+        // =========================================================
+        // Phase 2: Actual Parsing
+        // =========================================================
+        ZSTD_DCtx* dctx = tbb_dctx_pool.local();
+
+        try {
+            MessageParser mp(chunk_data, chunk_size);
+
+            while (!mp.eof()) {
+                // --- A. 读取 Batch Header ---
+                if (mp.remaining() < 12) break;
+
+                // BaseOffset (虽然这里没用到，但协议里有)
+                uint64_t batch_base_offset = mp.read_uint64();
+                // BatchLength
+                uint32_t batch_len = mp.read_uint32();
+
+                if (batch_len == 0) continue;
+
+                // --- B. 获取 Payload 视图 ---
+                // 这里我们手动构造一个指向 Payload 的视图/子解析器，或者直接校验
+                if (mp.remaining() < batch_len) {
+                    out_error = Err_Client::UNKNOWN_ERROR; // Data Truncated
                     return;
                 }
 
-                // --- D. 提取 Payload ---
-                // 指向 Payload 开始位置
-                const unsigned char* payload_ptr = raw_big_chunk.data() + current_position + RECORD_HEADER_SIZE;
-                // 为了安全，设定 Payload 结束边界
-                const unsigned char* payload_end = payload_ptr + record_size;
-
-                // --- E. 解析 Payload 内部 (Meta + Zstd) ---
-                // 必须保证 Payload 至少包含 InnerBase(8) + Count(8) + ZstdLen(4) = 20 bytes
-                if (payload_ptr + 20 > payload_end) {
-                    current_position += (RECORD_HEADER_SIZE + record_size);
+                // 如果 batch_len < 20，属于异常数据，直接跳过整个 Payload
+                if (batch_len < MIN_PAYLOAD_SIZE) {
+                    mp.skip(batch_len);
                     continue;
                 }
 
-                // 1. Inner Base Offset (8 bytes) -> NTOHLL
-                uint64_t inner_base;
-                std::memcpy(&inner_base, payload_ptr, sizeof(uint64_t));
-                inner_base = ntohll(inner_base);
-                payload_ptr += sizeof(uint64_t);
+                // 标记 Payload 起始点，方便后续计算跳过
 
-                // 2. Record Count (8 bytes) -> NTOHLL
-                uint64_t record_num;
-                std::memcpy(&record_num, payload_ptr, sizeof(uint64_t));
-                record_num = ntohll(record_num);
-                payload_ptr += sizeof(uint64_t);
+                // 1. Inner Base
+                uint64_t inner_base = mp.read_uint64();
+                // 2. Count
+                uint64_t record_num = mp.read_uint64();
 
-                // 3. ZSTD Length (4 bytes) -> NTOHL
-                uint32_t comp_len;
-                std::memcpy(&comp_len, payload_ptr, sizeof(uint32_t));
-                comp_len = ntohl(comp_len);
-                payload_ptr += sizeof(uint32_t);
+                // 3. ZSTD Block (Length + Data)
+                // read_bytes_view 读取一个 uint32_t 长度，然后返回后续数据的指针和长度
+                // 这正好对应 Batch 结构里的 [ZstdLen][ZstdData...]
+                auto [comp_ptr, comp_len] = mp.read_bytes_view();
 
-                // 4. ZSTD Data Ptr
-                const unsigned char* comp_ptr = payload_ptr;
-
-                // 校验 ZSTD 数据是否越界
-                if (comp_ptr + comp_len > payload_end) {
-                    // Error: Compressed data length exceeds payload
-                    current_position += (RECORD_HEADER_SIZE + record_size);
-                    continue;
+                // 此时 mp 已经越过了 ZstdData，指向了下一个 Batch 的开头 (如果计算正确的话)
+                // 校验一下：我们读了 8+8=16 字节，read_bytes_view 读了 4+comp_len 字节
+                // 所以总共消耗了 20 + comp_len。应该等于 batch_len。
+                // 如果协议允许 padding，这里可能需要 skip 剩余字节，但通常 read_bytes_view 就是结尾。
+                // 为了严谨（防止 BatchLength 比实际内容大），计算实际消耗并修正：
+                size_t consumed_payload = 16 + 4 + comp_len;
+                if (batch_len > consumed_payload) {
+                    mp.skip(batch_len - consumed_payload);
                 }
 
-                // --- F. 解压 ---
+                // --- C. 解压 ---
+                // 注意：zstd_decompress_using_view 应该返回一个 vector 或者类似容器
                 auto records_nozstd = MYMQ::ZSTD::zstd_decompress_using_view(dctx, comp_ptr, comp_len);
 
-                // --- G. 解析 Records (KV Pairs) ---
-                out_records.reserve(out_records.size() + record_num);
-
-                const unsigned char* rec_ptr = records_nozstd.data();
-                const unsigned char* rec_end = records_nozstd.data() + records_nozstd.size();
-
-                for(size_t i = 0; i < record_num; i++) {
-                    // 1. 读取单条 Record 总长度 (4 bytes) -> NTOHL
-                    // 注意：这取决于 src_buf 是如何把数据塞进去的。
-                    // 假设 src_buf 里的格式也是 [Length(4)][Body...]
-                    if (rec_ptr + 4 > rec_end) break;
-
-                    uint32_t single_rec_len;
-                    std::memcpy(&single_rec_len, rec_ptr, sizeof(uint32_t));
-                    single_rec_len = ntohl(single_rec_len);
-                    rec_ptr += 4;
-
-                    if (rec_ptr + single_rec_len > rec_end) break;
-
-                    const unsigned char* kv_start = rec_ptr;
-                    // kv_start 指向的内容: [KeyLen][Key][ValLen][Val][Time]
-
-                    // 2. 解析 Key
-                    if (kv_start + 4 > rec_end) break; // Check KeyLen bounds
-                    uint32_t key_len;
-                    std::memcpy(&key_len, kv_start, sizeof(uint32_t));
-                    key_len = ntohl(key_len);
-                    kv_start += 4;
-
-                    if (kv_start + key_len > rec_end) break; // Check KeyBytes bounds
-                    std::string key_str(reinterpret_cast<const char*>(kv_start), key_len);
-                    kv_start += key_len;
-
-                    // 3. 解析 Value
-                    if (kv_start + 4 > rec_end) break; // Check ValLen bounds
-                    uint32_t val_len;
-                    std::memcpy(&val_len, kv_start, sizeof(uint32_t));
-                    val_len = ntohl(val_len);
-                    kv_start += 4;
-
-                    if (kv_start + val_len > rec_end) break; // Check ValBytes bounds
-                    std::string val_str(reinterpret_cast<const char*>(kv_start), val_len);
-                    kv_start += val_len;
-
-                    // 4. 解析 Time (8 bytes) -> NTOHLL
-                    if (kv_start + 8 > rec_end) break;
-                    uint64_t timestamp_u64;
-                    std::memcpy(&timestamp_u64, kv_start, sizeof(uint64_t));
-                    int64_t timestamp = static_cast<int64_t>(ntohll(timestamp_u64));
-                    // kv_start += 8; // Not needed as we use single_rec_len to jump
-
-                    // 构造结果
-                    out_records.emplace_back(
-                        tp.topic, tp.partition,
-                        std::move(key_str),
-                        std::move(val_str),
-                        timestamp,
-                        inner_base + i
-                        );
-
-                    // 跳到下一条 Record
-                    // 注意：必须严格按照 single_rec_len 跳跃，因为它可能包含 padding 或其他未解析字段
-                    rec_ptr += single_rec_len;
+                // --- D. 解析 Records ---
+                if (records_nozstd.empty() && record_num > 0) {
+                    // 解压失败或为空
+                    continue;
                 }
 
-                // --- H. 推进 Batch 游标 ---
-                current_position += (RECORD_HEADER_SIZE + record_size);
+                // 使用 MessageParser 解析解压后的数据
+                // 这是一个全新的 Parser，处理解压后的内存块
+                MessageParser inner_mp(records_nozstd.data(), records_nozstd.size());
+
+                for (size_t i = 0; i < record_num; ++i) {
+                    if (inner_mp.eof()) break;
+
+                    // 1. 读取单条 Record 的总长度
+                    // read_bytes_view 读取 [uint32 len] [bytes body]
+                    // 返回的 body_view 包含了 [KeyLen][Key][ValLen][Val][Time]
+                    // 这样做的好处是：如果 Body 内部损坏，我们依然可以通过 View 机制安全地跳到下一条 Record
+                    auto [rec_body_ptr, rec_body_len] = inner_mp.read_bytes_view();
+
+                    // 创建一个临时的 Parser 来解析这个 Record Body
+                    MessageParser rec_parser(rec_body_ptr, rec_body_len);
+
+                    try {
+                        // 解析 Key
+                        std::string key_str = rec_parser.read_string();
+                        // 解析 Value
+                        std::string val_str = rec_parser.read_string();
+                        // 解析 Timestamp
+                        int64_t timestamp = rec_parser.read_int64();
+
+                        out_records.emplace_back(
+                            tp.topic,
+                            tp.partition,
+                            std::move(key_str),
+                            std::move(val_str),
+                            timestamp,
+                            inner_base + i
+                            );
+                    } catch (const std::exception&) {
+                        continue;
+                    }
+                }
             }
+
         } catch (const std::exception& e) {
             std::cerr << "Error parsing record batch: " << e.what() << std::endl;
             out_error = Err_Client::UNKNOWN_ERROR;
         }
     }
-
     // 辅助函数：清理现场
     void MYMQ_clientuse::finish_flush(MYMQ::MYMQ_Client::Push_queue& pq) {
         std::unique_lock<std::mutex> ulock(pq.mtx);

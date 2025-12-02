@@ -8,8 +8,8 @@
 #include <atomic>
 
 // --- 性能测试配置 ---
-const int NUM_MESSAGES = 4000000;   // 测试消息总量 (例如 100万)
-const int MESSAGE_SIZE = 1024;      // 单条消息大小 (1KB)，这是基准测试常用大小
+const int NUM_MESSAGES = 4000000;   // 测试消息总量
+const int MESSAGE_SIZE = 1024;      // 单条消息大小 (1KB)
 const std::string TOPIC_NAME = "perf_test_topic";
 const std::string GROUP_ID = "perf_group";
 
