@@ -300,56 +300,10 @@ struct Record{
 };
 
 
-inline std::vector<unsigned char> build_Record(const std::string& key,const std::string& value) {
-    auto now = std::chrono::system_clock::now();
-    int64_t current_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    MessageBuilder mb;
-    mb.reserve(2*sizeof(uint32_t)+key.size()+value.size()+sizeof(int64_t));
-    mb.append(key,value,current_time_ms);
-    uint32_t crc= MYMQ::Crc32::calculate_crc32(mb.data.data(),mb.data.size());
-    MessageBuilder mb2;
-    mb2.append(crc,mb.data);
-
-    return mb2.data;
-}
-
-inline std::vector<unsigned char> build_Record(const Record& unpacked_msg) {
-    MessageBuilder mb;
-    mb.reserve(2*sizeof(uint32_t)+unpacked_msg.key.size()+unpacked_msg.value.size()+sizeof(int64_t));
-    mb.append(unpacked_msg.key,unpacked_msg.value,unpacked_msg.time);
-    uint32_t crc= MYMQ::Crc32::calculate_crc32(mb.data.data(),mb.data.size());
-    MessageBuilder mb2;
-    mb2.append(crc,mb.data);
-
-    return mb2.data;
-}
-
-inline Record parase_Record(const std::vector<unsigned char>& binary_data) {
-    if (binary_data.empty()) {
-        return Record();
-    }
-
-    MessageParser mp(binary_data);
-    auto crc=mp.read_uint32();
-    auto msg=mp.read_uchar_vector();
-    if(!MYMQ::Crc32::verify_crc32(msg.data(),msg.size(),crc)){
-        throw std::out_of_range("Crc verify failed");
-    }
-    try {
-        MessageParser mp2(msg);
-        auto key=mp2.read_string();
-        auto value=mp2.read_string();
-        auto time=mp2.read_ll();
-        return Record(key, value, time);
-
-    } catch (std::exception& e) {
-
-       throw std::out_of_range("UNKNOWN ERROR IN RECORD PARASE");
-    }
 
 
 
-}
+
 
 
 class BatchBuffer {//生产者用的

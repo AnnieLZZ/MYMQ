@@ -469,7 +469,9 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             std::cerr << "Error parsing record batch: " << e.what() << std::endl;
             out_error = Err_Client::UNKNOWN_ERROR;
         }
-    }   // 辅助函数：清理现场
+    }
+
+    // 辅助函数：清理现场
     void MYMQ_clientuse::finish_flush(MYMQ::MYMQ_Client::Push_queue& pq) {
         std::unique_lock<std::mutex> ulock(pq.mtx);
 
@@ -1194,7 +1196,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
     MYMQ_Public::ResultVariant MYMQ_clientuse::handle_response(Eve event_type,const Mybyte& msg_body){
 
-        MessageParser mp(msg_body);
+        MessageParser mp(msg_body.data(),msg_body.size());
         if(event_type==MYMQ::EventType::SERVER_RESPONSE_PUSH_ACK){
             auto topicname=mp.read_string();
             auto partition=mp.read_size_t();
@@ -1228,7 +1230,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
                 {
                     auto assignment_inf=mp.read_uchar_vector();
-                    MP mp_assignment_inf(assignment_inf);
+                    MP mp_assignment_inf(assignment_inf.data(),assignment_inf.size());
                     auto leaderid=mp_assignment_inf.read_string();
 
 
@@ -1360,7 +1362,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                 ac,
                                 std::piecewise_construct,
                                 std::make_tuple(tp),
-                                std::make_tuple(16384,2097152)
+                                std::make_tuple(16384,4000000000)
                                 );
                         }
 
@@ -1383,6 +1385,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                 is_ingroup.store(1);
                 heartbeat_start();
                 push_perioric_start();
+                poll_perioric_start();
                 if(is_auto_commit){
                     autocommit_start();
                 }
@@ -1411,8 +1414,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         else if(event_type == Eve::SERVER_RESPONSE_PULL_DATA) {
 
             // 1. 读取响应头元数据 (这部分数据很小，保持原有逻辑)
-            auto pull_inf_additional = mp.read_uchar_vector();
-            MessageParser mp_pull_inf_additional(pull_inf_additional);
+            auto pull_inf_additional_view = mp.read_bytes_view();
+            MessageParser mp_pull_inf_additional(pull_inf_additional_view.first,pull_inf_additional_view.second);
             auto topicname_ = mp_pull_inf_additional.read_string();
             auto partition_ = mp_pull_inf_additional.read_size_t();
             auto error = static_cast<Err>(mp_pull_inf_additional.read_uint16());
@@ -1426,7 +1429,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     std::lock_guard<std::mutex> lock(mtx_poll_ready);
                     poll_ready.store(true);
                 }
-                cv_poll_ready.notify_one(); // 唤醒 pull 函数中的 wait
+                cv_poll_ready.notify_one();
             }
             if(error != Err::NULL_ERROR) {
                 return error;
@@ -1655,6 +1658,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         heartbeat_stop();
         autocommit_stop();
         push_perioric_stop();
+        poll_perioric_stop();
     }
 
 

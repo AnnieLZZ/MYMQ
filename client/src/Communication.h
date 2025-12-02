@@ -706,9 +706,9 @@ private:
                             // 完整消息处理
                             if (!is_registered) {
                                 if (static_cast<Eve>(client_state.event_type) == MYMQ::EventType::SERVER_RESPONSE_REGISTER) {
-                                    MP mp(client_state.body_buffer);
-                                    auto content = mp.read_uchar_vector();
-                                    MP mp_content(content);
+                                    MP mp(client_state.body_buffer.data(),client_state.body_buffer.size());
+                                    auto view = mp.read_bytes_view();
+                                    MP mp_content(view.first, view.second);
                                     auto succ = mp_content.read_bool();
                                     std::string resp = "Register result : '" + client_id_str + "' register ";
                                     if (succ) {
@@ -723,7 +723,7 @@ private:
                                 }
                             } else {
 
-                                MP mp(client_state.body_buffer);
+                                MP mp(client_state.body_buffer.data(),client_state.body_buffer.size());
                                 auto body=mp.read_uchar_vector();
                                 handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level,std::move( body));
                             }
