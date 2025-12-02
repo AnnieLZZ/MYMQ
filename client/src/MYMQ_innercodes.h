@@ -575,7 +575,7 @@ struct Push_queue {
 struct endoffset_point
 {
     TopicPartition tp;
-    size_t off;
+    mutable std::atomic<size_t> off;
     endoffset_point(size_t off_,const std::string& t,size_t p):tp(t,p),off(off_){}
 };
 
@@ -590,7 +590,18 @@ public:
     PollBuffer(size_t low, size_t high)
         : low_level_capacity(low), high_level_capacity(high), state(NEED_POLL) {}
 
-    // 返回 true 表示成功取出了数据
+    // 【优化点 1】: 移除锁。
+    // 因为 state 是原子的，且这里是“提示性”查询，
+    // 即使在多线程极端的 race condition 下读到旧值，
+    // 对流控来说通常也是可以接受的（只差一个周期）。
+    bool need_poll() const {
+        return state.load(std::memory_order_acquire) == NEED_POLL;
+    }
+
+    bool is_paused() const {
+        return state.load(std::memory_order_acquire) == PAUSE;
+    }
+
     bool try_pop(std::vector<unsigned char>& target) {
         std::lock_guard<std::mutex> ulock(mtx);
 
@@ -601,56 +612,48 @@ public:
         auto& item = queue_.front();
         target = std::move(item);
 
-        // 关键修复：减少当前大小
-        curr_size -= target.size();
 
+        size_t popped_size = target.size();
         queue_.pop_front();
 
-        // 关键修复：水位检查逻辑
-        // 如果当前是暂停状态，且水位已经降到低水位以下，则切换为需要拉取
-        if (state == PAUSE && curr_size <= low_level_capacity) {
-            state = NEED_POLL;
+        size_t current = curr_size.fetch_sub(popped_size, std::memory_order_relaxed) - popped_size;
+
+        // 迟滞判断
+        // 只有当前是 PAUSE 且水位降到 LOW 以下，才“切换”状态
+        if (state.load(std::memory_order_relaxed) == PAUSE && current <= low_level_capacity) {
+            state.store(NEED_POLL, std::memory_order_release);
         }
 
         return true;
     }
 
-    // 建议返回值改为 void，或者返回是否触发了暂停
     void push(std::vector<unsigned char>& obj) {
         std::lock_guard<std::mutex> ulock(mtx);
 
         size_t obj_size = obj.size();
         queue_.emplace_back(std::move(obj));
-        curr_size += obj_size;
 
-        // 如果超过高水位，标记为暂停
-        if (state == NEED_POLL && curr_size >= high_level_capacity) {
-            state = PAUSE;
+        // 更新大小
+        size_t current = curr_size.fetch_add(obj_size, std::memory_order_relaxed) + obj_size;
+
+        // 迟滞判断
+        // 只有当前是 NEED_POLL 且水位涨到 HIGH 以上，才“切换”状态
+        if (state.load(std::memory_order_relaxed) == NEED_POLL && current >= high_level_capacity) {
+            state.store(PAUSE, std::memory_order_release);
         }
-    }
-
-    // 检查当前状态
-    bool is_paused() {
-        std::lock_guard<std::mutex> ulock(mtx);
-        return state == PAUSE;
-    }
-
-    bool need_poll() {
-        std::lock_guard<std::mutex> ulock(mtx);
-        return state == NEED_POLL;
     }
 
 private:
     std::mutex mtx;
     std::deque<std::vector<unsigned char>> queue_;
 
-    std::atomic<size_t> curr_size = 0;
+    // 使用 atomic 允许无锁查询
+    std::atomic<size_t> curr_size{0};
+    std::atomic<State> state;
 
-    size_t high_level_capacity;
-    size_t low_level_capacity;
-    State state;
+    const size_t high_level_capacity;
+    const size_t low_level_capacity;
 };
-
 
 
 }

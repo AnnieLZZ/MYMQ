@@ -24,7 +24,6 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
     void MYMQ_clientuse::exit_rebalance(){
 
-        rebalance_ing.store(0);
         is_leader=0;
         timer.commit_ms([this]{
             timer.cancel_task(join_collect_timeout_taskid);
@@ -56,6 +55,18 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         },10,10,1);
     }
 
+    void MYMQ_clientuse::poll_perioric_start(){
+        autopoll_taskid= timer.commit_ms([this]{
+            push_timer_send();
+        },autopoll_perior_ms,autopoll_perior_ms);
+    }
+    void MYMQ_clientuse::poll_perioric_stop(){
+        timer.commit_ms([this]{
+            timer.cancel_task(autopoll_taskid);
+        },10,10,1);
+    }
+
+
     void MYMQ_clientuse::autocommit_start(){
         autocommit_taskid= timer.commit_ms([this]{
             timer_commit_async();
@@ -70,16 +81,16 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     Err_Client MYMQ_clientuse::seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume){
 
 
-            Endoffsetmap::accessor ac;
-            auto it=map_end_offset.find(ac,tp);
+            Endoffsetmap::const_accessor cac;
+            auto it=map_end_offset.find(cac,tp);
             if(!it){
                 cerr("ERROR :Invalid topic or partition in 'commit_inter' function");
                 return MYMQ_Public::ClientErrorCode::INVALID_PARTITION_OR_TOPIC;
             }
             else{
-                ac->second.off=offset_next_to_consume;
+                cac->second.off.store(offset_next_to_consume,std::memory_order_release);
             }
-            ac.release();
+            cac.release();
               out("[Seek offset] Current offset : "+std::to_string(offset_next_to_consume));
              return Err_Client::NULL_ERROR;
 
@@ -484,7 +495,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         if(!it){
             return SIZE_MAX;
         }
-        return cac->second.off;
+        return cac->second.off.load(std::memory_order_relaxed);
     }
 
     Err_Client MYMQ_clientuse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_s) {
@@ -615,11 +626,11 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         // --- 4. 统一更新 Offset (Fix bug) ---
         // 必须遍历所有成功解析的分区来更新 Offset，而不是只看 record_batch.back()
         {
-            Endoffsetmap::accessor ac;
+           Endoffsetmap::const_accessor cac;
             for (auto const& [tp, max_off] : max_offsets_this_round) {
-                if (map_end_offset.find(ac, tp)) {
+                if (map_end_offset.find(cac, tp)) {
                     // Offset 应该是 消费到的最后一条 offset + 1
-                    ac->second.off = max_off + 1;
+                    cac->second.off.store(max_off,std::memory_order_release);
                 } else {
                     // 理论上不应该发生，因为拉取时必然存在于 map 中，除非并发删除
                     return Err_Client::INVALID_PARTITION_OR_TOPIC;
@@ -952,6 +963,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             batch_size=cm_business.get_size_t("batch_size");
             autopush_perior_ms=cm_business.get_size_t ("autopush_perior_ms");
             autocommit_perior_ms=cm_business.get_size_t ("autocommit_perior_ms");
+            autopoll_perior_ms=cm_business.get_size_t("autopoll_perior_ms");
 
 
         }
@@ -979,7 +991,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     continue;
             }
             const auto& val=cac->second;
-             commit_async(val.tp,val.off);
+             commit_async(val.tp,val.off.load(std::memory_order_relaxed));
         }
     }
 
@@ -1138,7 +1150,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             return MYMQ_Public::ClientErrorCode::INVALID_PARTITION_OR_TOPIC;
         }
 
-        size_t now_off =cac->second.off;
+        size_t now_off =cac->second.off.load(std::memory_order_relaxed);
         cac.release();
           out("[Commit offset] Current offset : "+std::to_string(now_off));
         if(now_off>next_offset_to_consume){
@@ -1536,14 +1548,14 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     auto key= topicname+"_"+std::to_string(partition);
 
 
-                    Endoffsetmap::accessor ac;
-                    auto it=map_end_offset.find(ac,TopicPartition(key,partition));
+                    Endoffsetmap::const_accessor cac;
+                    auto it=map_end_offset.find(cac,TopicPartition(key,partition));
                     if(!it){
                         cerr("Error : Failed to update committed offset : Invalid topic or partition .");
                         return MYMQ_Public::CommonErrorCode::INTERNAL_ERROR;
                     }
-                    auto& point=ac->second;
-                    point.off=offset ;
+                    auto& point=cac->second;
+                    point.off.store(offset,std::memory_order_release) ;
 
 
                 }
@@ -1648,25 +1660,28 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    void MYMQ_clientuse::trigger_all_partition_pull(){
-
+    void MYMQ_clientuse::trigger_poll_for_low_cap_pollbuffer(){
+        if(!is_ingroup.load()){
+            return ;
+        }
         std::string groupid;
         {
             std::shared_lock<std::shared_mutex> slock(mtx_consumerinfo);
             groupid= info_basic.groupid;
 
         }
-        if(!is_ingroup.load()){
 
-            return ;
-        }
-
-       for (const auto& [key, val] : map_end_offset) {
-           size_t now_off=val.off;
-           size_t bytes= pull_bytes_once.load();
-           MB mb;
-           mb.append(groupid,key.topic,key.partition,now_off,bytes);
-           send(Eve:: CLIENT_REQUEST_PULL,mb.data);
+        for(const auto& [tp,pollqueue]:map_poll_queue){
+            if(pollqueue.need_poll()){
+                Endoffsetmap::const_accessor cac;
+                if(map_end_offset.find(cac,tp)){
+                    size_t now_off=  cac->second.off.load(std::memory_order_relaxed);
+                 size_t bytes= pull_bytes_once.load();
+                    MB mb;
+                    mb.append(groupid,tp.topic,tp.partition,now_off,bytes);
+                    send(Eve:: CLIENT_REQUEST_PULL,mb.data);
+                }
+            }
         }
 
 

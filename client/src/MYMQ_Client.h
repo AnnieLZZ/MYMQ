@@ -66,7 +66,7 @@ public:
         return is_ingroup.load();
     }
 
-       void  trigger_all_partition_pull();
+       void  trigger_poll_for_low_cap_pollbuffer();
 
 private:
     void call_parse_impl(
@@ -92,6 +92,9 @@ private:
 
     void push_perioric_start();
     void push_perioric_stop();
+
+    void poll_perioric_start();
+    void poll_perioric_stop();
 
     void autocommit_start();
     void autocommit_stop();
@@ -138,6 +141,7 @@ private:
     size_t autocommit_perior_ms;
     bool is_auto_commit;
     size_t max_in_flight_requests_num;
+    size_t autopoll_perior_ms;
     //Config配置项
 
 
@@ -151,6 +155,7 @@ private:
     size_t heartbeat_taskid{0};
     size_t push_perioric_taskid{0};
     size_t autocommit_taskid{0};
+    size_t autopoll_taskid{0};
 
 
 
@@ -167,7 +172,7 @@ private:
     std::atomic<bool> is_ingroup{0};
     bool is_leader{0};
 
-    std::atomic<bool> rebalance_ing{0};
+
 
     std::unordered_map<std::string,std::unordered_set<TopicPartition> > map_final_assign;
     std::shared_mutex mtx_map_final_assign;

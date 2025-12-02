@@ -34,7 +34,7 @@ MYMQ_Client::ClientErrorCode MYMQ_Client::pull(std::vector< MYMQ_Public::Consume
 }
 
 void MYMQ_Client::trigger_pull(){
-    return pimpl->trigger_all_partition_pull();
+    return pimpl->trigger_poll_for_low_cap_pollbuffer();
 }
 
 void MYMQ_Client::create_topic(const std::string& topicname, size_t parti_num) {
