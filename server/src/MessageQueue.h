@@ -1437,11 +1437,10 @@ private:
                     [this](TcpSession session, uint16_t event_type_short,uint32_t correlation_id,uint16_t ack_level ,Mybyte msg_body) {
             MYMQ::EventType type = static_cast<MYMQ::EventType>(event_type_short);
 
-            auto decoded_msg=std::move(msg_body) ;
             cerr("["+std::to_string(correlation_id)+"]["+session.get_clientid()+"]"+ MYMQ::to_string(static_cast<Eve>(event_type_short))+" called.");
-
-
-            MessageParser mp(decoded_msg.data(),decoded_msg.size());
+            MessageParser mp_pre1(msg_body.data(),msg_body.size());
+            auto decoded_msg=mp_pre1.read_bytes_view();
+            MessageParser mp(decoded_msg.first,decoded_msg.second);
             if(type==MYMQ::EventType::CLIENT_REQUEST_PULL){
 
                 auto groupid=mp.read_string();

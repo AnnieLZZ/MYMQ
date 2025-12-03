@@ -908,17 +908,18 @@ private:
             // --- 准备发送响应 ---
             MessageBuilder mb;
             mb.append(succ);
-            real_body=std::move(mb.data);
-
+            MessageBuilder mb2;
+            mb2.append(mb.data);
+           handle_event(state,std::move(mb2.data));
 
         }
         else{
             // 状态：已注册
-            MessageParser mp(body.data(),body.size());
-            real_body = mp.read_uchar_vector();
+
+            handle_event(state,std::move(body) );
 
         }
-        handle_event(state,std::move(real_body));
+
     }
 
     IOStatus handle_client(int sock, std::shared_ptr<ClientState> state) {
