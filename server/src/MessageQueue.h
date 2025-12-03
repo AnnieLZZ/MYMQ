@@ -27,6 +27,7 @@ using Mybyte=std::vector<unsigned char>;
 using Eve=MYMQ::EventType;
 using ConsumerGroupState=MYMQ_Server::ConsumerGroupState;
 using ServerConsumerInfo=MYMQ_Server::ServerConsumerInfo;
+using Byte_view_pair=std::pair<const unsigned char*, uint32_t>;
 
 
 class Topic;
@@ -67,14 +68,14 @@ public:
         timer_.stop();
     }
 
-    Err save_msg(std::vector<unsigned char>& msg) {
+    Err save_msg(const Byte_view_pair& msg_view) {
         std::unique_lock<std::shared_mutex> lock(mtx_file);
-        auto [offset,err] = curr_write_segment->append(msg);
+        auto [offset,err] = curr_write_segment->append(msg_view);
 
                 if (err==Err::FULL_SEGMENT) {
             create_new_segment(curr_write_segment->next_offset());
             curr_write_segment = segments_.back().get();
-            auto  pair = curr_write_segment->append(msg);
+            auto  pair = curr_write_segment->append(msg_view);
             if (pair.second != Err::NULL_ERROR) {
                 throw std::runtime_error("Failed to append message even after creating new segment.");
             }
@@ -292,8 +293,8 @@ public:
         }
     }
 
-    Err push(std::vector<unsigned char>& msg) {
-        return  msg_stor->save_msg(msg);
+    Err push(const Byte_view_pair& msg_view) {
+        return  msg_stor->save_msg(msg_view);
 
     }
 
@@ -351,8 +352,8 @@ public:
     }
 
 
-    Err push(std::vector<unsigned char>& msg, int partition_idx) {
-        return  partitions_.at(partition_idx)->push(msg);
+    Err push(const Byte_view_pair& msg_view, int partition_idx) {
+        return  partitions_.at(partition_idx)->push(msg_view);
     }
 
     MesLoc pull(size_t target_offset, int partition_idx,size_t byte_need) {
@@ -1265,7 +1266,7 @@ public:
         }
     }
 
-    Err push(Mybyte& msg ,const std::string& topicname,size_t partition) {
+    Err push(const Byte_view_pair& msg_view ,const std::string& topicname,size_t partition) {
         auto it = topicmap.topics_.find(topicname);
         if (it == topicmap.topics_.end()) {
             throw std::runtime_error("Topic not found: " + topicname);
@@ -1275,7 +1276,7 @@ public:
             throw std::out_of_range("Invalid partition ID for topic " + topicname + ": " + std::to_string(partition));
             return Err::NO_ASSIGNED_PARTITION;
         }
-       return topic_ptr->push(msg,partition);
+       return topic_ptr->push(msg_view,partition);
     }
 
     std::pair<MesLoc,Err>  pull(size_t target_offset,const std::string& groupid,const std::string& topicname, size_t partition,size_t byte_need) {
@@ -1438,9 +1439,8 @@ private:
             MYMQ::EventType type = static_cast<MYMQ::EventType>(event_type_short);
 
             cerr("["+std::to_string(correlation_id)+"]["+session.get_clientid()+"]"+ MYMQ::to_string(static_cast<Eve>(event_type_short))+" called.");
-            MessageParser mp_pre1(msg_body.data(),msg_body.size());
-            auto decoded_msg=mp_pre1.read_bytes_view();
-            MessageParser mp(decoded_msg.first,decoded_msg.second);
+            MessageParser mp(msg_body.data(),msg_body.size());
+            mp.skip(4);
             if(type==MYMQ::EventType::CLIENT_REQUEST_PULL){
 
                 auto groupid=mp.read_string();
@@ -1498,7 +1498,7 @@ private:
                 auto partition=mp.read_size_t();
 
                 auto crc= mp.read_uint32();
-                auto msg_batch=mp.read_uchar_vector();
+                auto msg_view=mp.read_bytes_view();
 
 
                 MB mb_res;
@@ -1506,7 +1506,7 @@ private:
                 mb_res.append(topicname,partition);
 
 
-                if(!MYMQ::Crc32::verify_crc32(msg_batch.data(),msg_batch.size(),crc)){
+                if(!MYMQ::Crc32::verify_crc32(msg_view.first,msg_view.second,crc)){
                     cerr("Push CRC verify : Not match , refused to push");
                     if(ack_level!=static_cast<uint16_t>(MYMQ::ACK_Level::ACK_NORESPONCE)){
                             mb_res.append_uint16(static_cast<uint16_t>(Err::CRC_VERIFY_FAILED));
@@ -1516,9 +1516,9 @@ private:
                 }
 
 
-                auto push_res= push(msg_batch,topicname,partition);
+                auto push_res= push(msg_view,topicname,partition);
                 uint64_t baseoffset;
-                std::memcpy(&baseoffset,msg_batch.data(),sizeof(uint64_t));
+                std::memcpy(&baseoffset,msg_view.first,sizeof(uint64_t));
                 baseoffset=ntohll(baseoffset);
 
                 if(ack_level==static_cast<uint16_t>(MYMQ::ACK_Level::ACK_PROMISE_INDISK)){

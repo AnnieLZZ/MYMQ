@@ -38,7 +38,7 @@ public:
 
 
     void save_topics_metadata() ;
-    Err push(Mybyte& msg ,const std::string& topicname,size_t partition) ;
+    Err push(const std::pair<const unsigned char*, uint32_t>& msg_view ,const std::string& topicname,size_t partition) ;
     std::pair<MesLoc,Err>  pull(size_t target_offset,const std::string& groupid,const std::string& topicname, size_t partition,size_t byte_need) ;
     bool create_topic(const std::string& topicname,size_t parti_num =1);
 
