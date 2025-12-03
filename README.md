@@ -9,7 +9,6 @@
 
 ## ⚡ 核心性能 (Performance Benchmark)
 ### 最新V3版本
-基准测试下，拥有比肩kafka单分区消费能力极限性能的80+% 的消费速率！！（1011359msg/s）（1KB/msg）
 ---
 ### 📊 单机单分区性能指标 (Single Node, Single Partition)
 
@@ -20,8 +19,8 @@
 
 | Metric | Throughput | Description |
 | :--- | :--- | :--- |
-| **Push (Producer)** | **~753,691 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
-| **Pull (Consumer)** | **~1,011,359 msg/s** | **Network Poll + Buffered Processing**: Fetch Buffer $\rightarrow$ **ZSTD Decompress** $\rightarrow$ **CRC32 Verify** $\rightarrow$ Batch Parsing $\rightarrow$ Object Construction |
+| **Push (Producer)** | **~ 356,842msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
+| **Pull (Consumer)** | **~753,691 msg/s** | **Network Poll + Buffered Processing**: Fetch Buffer $\rightarrow$ **ZSTD Decompress** $\rightarrow$ **CRC32 Verify** $\rightarrow$ Batch Parsing $\rightarrow$ Object Construction |
 
 ---
 
