@@ -471,7 +471,7 @@ private:
         tbb::concurrent_hash_map<size_t,std::queue<Mybyte>> ::accessor a;
 
         if(map_offset_queue.find(a,par_id)){
-            a->second.emplace(MYMQ::MSG_serial::build_Record(key,std::to_string(off)));
+//            a->second.emplace(MYMQ::MSG_serial::build_Record(key,std::to_string(off)));
         }
         else{
             return Err::INTERNAL_ERROR;
@@ -1441,7 +1441,7 @@ private:
             cerr("["+std::to_string(correlation_id)+"]["+session.get_clientid()+"]"+ MYMQ::to_string(static_cast<Eve>(event_type_short))+" called.");
 
 
-            MessageParser mp(decoded_msg);
+            MessageParser mp(decoded_msg.data(),decoded_msg.size());
             if(type==MYMQ::EventType::CLIENT_REQUEST_PULL){
 
                 auto groupid=mp.read_string();
@@ -1560,7 +1560,7 @@ private:
                 auto client_id=mp.read_string();
                 auto topics=mp.read_uchar_vector();
 
-                MessageParser mp2(topics);
+                MessageParser mp2(topics.data(),topics.size());
                 size_t topicsnum=mp2.read_size_t();
                 std::set<std::string> topicset;
                 for(size_t i=0;i<topicsnum;i++){
@@ -1688,7 +1688,7 @@ private:
     }
 
     std::map<std::string, std::map<std::string, std::set<size_t>>> parse_assignments_message(const Mybyte& serialized_data) {
-        MessageParser parser(serialized_data);
+        MessageParser parser(serialized_data.data(),serialized_data.size());
         std::map<std::string, std::map<std::string, std::set<size_t>>> assignments;
 
         // 1. 读取成员总数
