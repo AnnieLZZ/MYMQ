@@ -42,19 +42,37 @@
         4. Record采用紧凑二进制布局，最大化 CPU 缓存命中率。
 
 ### 2. 并发设计 (Concurrency Design)
-**分片式线程池** 底层使用 `moodycamel::BlockingConcurrentQueue`。该设计保证了同一连接的请求处理具备 CPU 亲和性，大幅减少线程间的上下文切换与CPU空转。 
-#### 服务端 (Broker Side)
-* **FD-Sharded Thread Pool:** 引入基于连接 FD 哈希的分片式线程池，实现线程间负载均衡的同时，确立了连接维度的 CPU 亲和性，有效避免了多线程处理同一连接上下文时的锁开销与缓存失效。
-#### 架构
-* **Event-Driven:** 基于 `epoll` (ET模式) + `Reactor` 模式，配合非阻塞 I/O 与有限状态机 (FSM) 处理高并发连接。
 
 #### 客户端 (Client Side)
-* **Partition-Aware Response Sharding:** 针对 Consumer 的消息拉取（Pull）响应 和 Producer的推送（Push），设计了专用的分片线程池。
+* **1. TBB::Parallel :** 针对解析类高CPU占用行为的并行优化:*TBB并行*
+    * **并行解析:** 基于 `​tbb::parallel_for_each` 的高并行解析（拆分、解析、反序列化，创建消息体），解析效率提升13倍
+    * **初始化预加载ZSTD上下文** 初始化时让Dctx交由tbb来分配资源，最大化利用Dctx资源
+
+* **2. Consumer Buffer :** 
+    * **消除RTT/S端业务隔离:** 针对消费者本地Process与网络Transfer速率不平行的优化:*消费者缓冲区*
+* 1.消除RTT与S端业务的带来的延迟，平衡网络与本地处理的速率，提升CPU利用率
+* 2.最大化隔离网络I/O与本地业务逻辑，优化网络吞吐量
+
+    * **高低水位消抖与动态请求**
+* 1.利用高低水位与后台定时器，自动管理缓冲区的饥饿/饱和状态，保证本地缓冲区足量、合理存量
+
+* **3. Partition-Aware Response Sharding :** 针对Producer的推送（Push），设计了专用的分片线程池。
     * **路由策略:** 基于 `Topic + Partition` 组合键用 **MurmurHash2** 计算出key来进行**分片**，均摊线程压力，同时保证同一分区的数据流固定路由至同一工作线程。
-    * **收益:** 实现了消息解析与业务处理的并行化，保证单分区内消息处理的时序性同时显著提升了高吞吐场景下的生产和消费速率。
-* **双缓冲队列:**  针对Producer生产速率过快，利用双缓冲队列+分片线程池进行背压和并行优化
-#### 组件
-* **Lock-Free Queue:** 通信层内部使用 `moodycamel::ReaderWriterQueue` (**SPSC**)作发送队列 ，以及作将拉取到的消息连接到用户应用程序的通道。
+    * **提高并行性:** 实现了不同分区Push的并行化，保证单分区内消息处理的时序性同时显著提升了本地的生产速率。
+
+* **4. Double-Buffered Queue:**
+针对本地同一分区push速率的优化
+    * **提高串行性:**
+* 1.将设置的回调与包体的*高开销*，其处理转向后台，让前台专注于*消息构建与入列*，降低锁竞争
+
+
+#### 服务端 (Broker Side)
+* **1. FD-Sharded Thread Pool:** 引入基于连接 FD 哈希的分片式线程池，实现线程间负载均衡的同时，有效避免多线程处理同一连接上下文时的锁开销与缓存失效。
+#### 架构
+* **2. Event-Driven:** 基于 `epoll` (ET模式) + `Reactor` 模式，配合非阻塞 I/O 与有限状态机 (FSM) 处理高并发连接。
+
+
+
 
 ### 3. 异步与解耦 
 #### 服务端 (Broker Side)
@@ -64,7 +82,7 @@
 
 #### 客户端 (Client Side)
 * **Granular Async Callbacks:** 提供全异步的事件驱动接口。
-    * **Per-Message Callback:** 支持在 `push` 阶段为**每一条**消息单独注册回调函数，而非仅针对 Batch 级别。
+    * **Per-Message Callback:** 支持在 `push` 阶段为**每一条**消息单独注册回调函数。
     * **Commit Callback:** `commitAsync` 支持异步回调通知。
     * **Execution Flow:** 回调函数在客户端接收到服务端 ACK 并完成解析后自动触发，实现了从发送到确认的全链路闭环。
 
@@ -82,7 +100,7 @@
 ## 🛠️ 技术栈 (Tech Stack)
 
 * **Kernel/Network:** `Epoll (ET)`, `Reactor Pattern`, `Linux sendfile`, `OpenSSL kTLS`
-* **Concurrency:** `Intel TBB`, `Sharded ThreadPool (FD & Partition)`, `MurmurHash2`, `moodycamel`, `C++17`
+* **Concurrency:** `Intel TBB`, `Sharded ThreadPool (FD & Partition)`, `MurmurHash2`,  `Buffer(Push&Pull)``moodycamel`
 * **Storage/Algo:** `write (Sequential Log)`, `mmap (Index)`, `ZSTD`, `Sparse Indexing`, `CRC32`
 * **Build/Test:** `CMake`, `GTest`
 ---
