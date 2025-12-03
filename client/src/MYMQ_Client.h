@@ -23,7 +23,18 @@ using TopicPartition=MYMQ_Public::TopicPartition;
 
 
 
+
 class MYMQ_clientuse{
+
+    struct Workitem {
+        size_t index;
+        MYMQ::MYMQ_Client::TopicPartition tp;
+        std::vector<unsigned char> raw_big_chunk;
+        std::vector<MYMQ_Public::ConsumerRecord> parsed_records;
+        MYMQ_Public::ClientErrorCode err = Err_Client::NULL_ERROR;
+        Workitem(size_t i, MYMQ::MYMQ_Client::TopicPartition t, std::vector<unsigned char> r)
+            : index(i), tp(std::move(t)), raw_big_chunk(std::move(r)) {}
+    };
 
 public:
     MYMQ_clientuse(const std::string& clientid=std::string(),uint8_t ack_level=UINT8_MAX);
@@ -113,11 +124,11 @@ private:
     void push_timer_send();
     void out_group_reset();
     void cerr(const std::string& str){
-        Printqueue::instance().out(str,1,0);
+        // Printqueue::instance().out(str,1,0);
     }
 
     void out(const std::string& str){
-        Printqueue::instance().out(str,0,0);
+        // Printqueue::instance().out(str,0,0);
     }
 
 
@@ -181,7 +192,7 @@ private:
 
     tbb::concurrent_hash_map<MYMQ_Public::TopicPartition,MYMQ::MYMQ_Client::PollBuffer> map_poll_queue;
 
-    std::unordered_map<std::string,MYMQ::MYMQ_Client::Push_queue> map_push_queue;
+    std::unordered_map<TopicPartition,MYMQ::MYMQ_Client::Push_queue> map_push_queue;
 
 
 
@@ -208,7 +219,8 @@ private:
     ShardedThreadPool& pool_=ShardedThreadPool::instance(8);
 
 
-    std::atomic<size_t> local_pull_bytes{1048576};
+    std::atomic<size_t> local_pull_bytes{10000000};
+    std::vector<Workitem> m_todo_cache;
 
 
 

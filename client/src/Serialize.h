@@ -185,27 +185,24 @@ private:
 
 class MessageParser {
 private:
-    const unsigned char* m_data; // 数据起始地址
-    size_t m_size;               // 数据总长度
-    size_t m_offset;             // 当前读取偏移量
+    const unsigned char* m_data;
+    size_t m_size;
+    size_t m_offset;
 
-    // ntoh64 实现 (保持不变)
+
     uint64_t ntoh64(uint64_t value) {
         static const int num = 42;
-        if (*reinterpret_cast<const char*>(&num) == num) { // 小端系统
+        if (*reinterpret_cast<const char*>(&num) == num) {
             const uint32_t high = ntohl(static_cast<uint32_t>(value >> 32));
             const uint32_t low = ntohl(static_cast<uint32_t>(value & 0xFFFFFFFF));
             return (static_cast<uint64_t>(low) << 32) | high;
-        } else { // 大端系统
+        } else {
             return value;
         }
     }
 
 public:
-    // ==========================================
-    // 核心构造函数：仅允许 指针 + 长度
-    // 使用 void* 方便兼容 char*, unsigned char* 等
-    // ==========================================
+
     MessageParser(const void* data, size_t size)
         : m_data(static_cast<const unsigned char*>(data))
         , m_size(size)
@@ -216,30 +213,21 @@ public:
         }
     }
 
-    // 显式删除 vector 构造函数，防止隐式调用（或者你可以保留它作为 helper，内部调用上面的构造）
-    // 这里根据你的要求 "仅允许这样构造"，我删除了它，强迫调用者显式传递 .data() 和 .size()
     MessageParser(const std::vector<unsigned char>&) = delete;
 
-    // 辅助：获取当前解析进度是否结束
     bool eof() const { return m_offset >= m_size; }
 
-    // 辅助：获取剩余可读字节数
     size_t remaining() const { return m_size - m_offset; }
 
-    // ==========================================
-    // 读取基础类型
-    // ==========================================
 
     void read_bytes(void* buffer, size_t count) {
         if (m_offset + count > m_size) {
             throw std::out_of_range("Not enough data to read.");
         }
-        // 使用 memcpy 对原始指针操作更高效
         std::memcpy(buffer, m_data + m_offset, count);
         m_offset += count;
     }
 
-    // ⬇️ 优化：增加一个 peek 或者是 skip 的功能往往很有用
     void skip(size_t count) {
         if (m_offset + count > m_size) {
             throw std::out_of_range("Not enough data to skip.");
