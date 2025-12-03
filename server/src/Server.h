@@ -870,7 +870,7 @@ private:
     }
 
     bool register_clientid( int sock, const Mybyte& body,std::shared_ptr<ClientState> state) {
-        MessageParser mp(body);
+        MessageParser mp(body.data(),body.size());
         bool success = 0;
 
             auto userid = mp.read_string_view();
@@ -914,7 +914,7 @@ private:
         }
         else{
             // 状态：已注册
-            MessageParser mp(body);
+            MessageParser mp(body.data(),body.size());
             real_body = mp.read_uchar_vector();
 
         }
