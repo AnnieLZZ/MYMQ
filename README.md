@@ -20,7 +20,7 @@
 
 | Metric | Throughput | Description |
 | :--- | :--- | :--- |
-| **Push (Producer)** | **~753691 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
+| **Push (Producer)** | **~753,691 msg/s** | **End-to-End**: User API $\rightarrow$ Server PageCache $\rightarrow$ ACK $\rightarrow$ Client Callback Execution |
 | **Pull (Consumer)** | **~1,011,359 msg/s** | **Network Poll + Buffered Processing**: Fetch Buffer $\rightarrow$ **ZSTD Decompress** $\rightarrow$ **CRC32 Verify** $\rightarrow$ Batch Parsing $\rightarrow$ Object Construction |
 
 ---
