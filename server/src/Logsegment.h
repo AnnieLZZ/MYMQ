@@ -248,14 +248,14 @@ public:
         }
     }
 
-    std::pair<uint64_t, Err> append(std::vector<unsigned char>& msg) {
+    std::pair<uint64_t, Err> append(const std::pair<const unsigned char*, uint32_t>& msg_view) {
         std::unique_lock<std::shared_mutex> lock(rw_mutex_);
 
         // 1. 获取当前偏移量
         uint64_t current_offset = next_offset_;
 
         // msg 包含了 header(12字节) + payload，所以总大小就是 msg.size()
-        size_t total_log_entry_size = msg.size();
+        size_t total_log_entry_size = msg_view.second;
 
         // 2. 检查容量
         // 注意：这里一定要保证 msg 至少包含 Header(12B) + Payload Header(8B+8B) 的最小长度，防止越界
@@ -266,15 +266,16 @@ public:
         // 3. 准备数据：直接在 msg 内存上修改
         uint64_t curr_off_net = htonll(current_offset);
 
+        unsigned char* writeable_ptr = const_cast<unsigned char*>(msg_view.first);
         // -------------------------------------------------------
         // 修改点 A: 填充最外层的 Log Entry Header 中的 Offset (前8字节)
         // -------------------------------------------------------
-        std::memcpy(msg.data(), &curr_off_net, sizeof(uint64_t));
+        std::memcpy(writeable_ptr, &curr_off_net, sizeof(uint64_t));
 
         // 修改点 B: 填充 Payload 内部的 BaseOffset
         // 原来是在 msg.data()，现在 Header 占了 12 字节，所以偏移 12 字节
         // -------------------------------------------------------
-        std::memcpy(msg.data() + 12, &curr_off_net, sizeof(uint64_t));
+        std::memcpy(writeable_ptr + 12, &curr_off_net, sizeof(uint64_t));
 
         // -------------------------------------------------------
         // 解析 msg_num
@@ -283,14 +284,14 @@ public:
         // -------------------------------------------------------
         size_t msg_num;
         uint64_t msg_num_raw;
-        std::memcpy(&msg_num_raw, msg.data() + 12 + sizeof(uint64_t), sizeof(uint64_t));
+        std::memcpy(&msg_num_raw, writeable_ptr + 12 + sizeof(uint64_t), sizeof(uint64_t));
         msg_num = ntohll(msg_num_raw);
 
         // 4. 关键：记录写入前的物理位置用于索引
         uint32_t index_physical_pos = actual_physical_file_size;
 
         // 5. 执行单次 Write，不再需要 writev
-        ssize_t written = write(log_file_fd, msg.data(), total_log_entry_size);
+        ssize_t written = write(log_file_fd, writeable_ptr, total_log_entry_size);
 
         if (written != total_log_entry_size) {
             // truncate 文件到 actual_physical_file_size 以丢弃可能写入的一半数据
