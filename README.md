@@ -8,7 +8,9 @@
 ---
 
 ## ⚡ 核心性能 (Performance Benchmark)
-
+### 最新V3版本
+基准测试下，拥有比肩kafka单分区消费能力极限性能的80+% 的消费速率！！（1011359msg/s）（1KB/msg）
+---
 ### 📊 单机单分区性能指标 (Single Node, Single Partition)
 
 **测试环境:** 
