@@ -509,8 +509,8 @@ struct Push_queue {
 
     std::atomic<size_t> current_batch_count{0};
 
-    Push_queue(const std::string& t, size_t p, size_t buffer_size = 1024 * 1024)
-        : tp(t, p),
+    Push_queue(const TopicPartition& tp, size_t buffer_size = 1024 * 1024)
+        : tp(tp),
         buf_1(buffer_size),
         buf_2(buffer_size),
         active_buf(&buf_1),
@@ -526,6 +526,8 @@ struct Push_queue {
 
 
 
+
+
 struct endoffset_point
 {
     TopicPartition tp;
@@ -536,6 +538,8 @@ struct endoffset_point
 
 class PollBuffer {
 public:
+
+    mutable std::atomic<size_t> local_consume_offset{0};
     enum State {
         PAUSE,
         NEED_POLL
@@ -544,16 +548,27 @@ public:
     PollBuffer(size_t low, size_t high)
         : low_level_capacity(low), high_level_capacity(high), state(NEED_POLL) {}
 
-    // 【优化点 1】: 移除锁。
-    // 因为 state 是原子的，且这里是“提示性”查询，
-    // 即使在多线程极端的 race condition 下读到旧值，
-    // 对流控来说通常也是可以接受的（只差一个周期）。
+
     bool need_poll() const {
         return state.load(std::memory_order_acquire) == NEED_POLL;
     }
 
     bool is_paused() const {
         return state.load(std::memory_order_acquire) == PAUSE;
+    }
+    void clear_for_seek(size_t target_offset){
+        {
+            std::lock_guard<std::mutex> ulock(mtx);
+            {
+                std::deque<std::vector<unsigned char>> tmp{};
+                std::swap(tmp,queue_);
+            }
+
+            curr_size.store(0);
+            local_consume_offset.store(target_offset);
+            state.store(NEED_POLL);
+        }
+
     }
 
     bool try_pop(std::vector<unsigned char>& target) {
@@ -603,6 +618,7 @@ private:
 
     // 使用 atomic 允许无锁查询
     std::atomic<size_t> curr_size{0};
+
     std::atomic<State> state;
 
     const size_t high_level_capacity;

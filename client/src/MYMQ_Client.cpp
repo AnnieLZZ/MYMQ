@@ -81,16 +81,16 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     Err_Client MYMQ_clientuse::seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume){
 
 
-            Endoffsetmap::const_accessor cac;
-            auto it=map_end_offset.find(cac,tp);
+            Pollqueuemap::accessor ac;
+            auto it=map_poll_queue.find(ac,tp);
             if(!it){
                 cerr("ERROR :Invalid topic or partition in 'commit_inter' function");
                 return MYMQ_Public::ClientErrorCode::INVALID_PARTITION_OR_TOPIC;
             }
             else{
-                cac->second.off.store(offset_next_to_consume,std::memory_order_release);
+                ac->second.clear_for_seek(offset_next_to_consume);
             }
-            cac.release();
+            ac.release();
               out("[Seek offset] Current offset : "+std::to_string(offset_next_to_consume));
              return Err_Client::NULL_ERROR;
 
@@ -114,9 +114,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             return Err_Client::REACHED_MAX_FLYING_REQUEST;
         }
 
-        // 2. 查找对应的 Partition Queue
-        auto push_queue_key = tp.topic + "_" + std::to_string(tp.partition);
-        auto it = map_push_queue.find(push_queue_key);
+
+        auto it = map_push_queue.find(tp);
         if (it == map_push_queue.end()) {
             return Err_Client::INVALID_PARTITION_OR_TOPIC;
         }
@@ -173,6 +172,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             push_queue.is_flushing = true;
 
             // 5. 提交 Flush 任务
+            auto push_queue_key = tp.topic + "_" + std::to_string(tp.partition);
             uint32_t shard_id = MurmurHash2::hash(push_queue_key);
             pool_.submit(shard_id, [this, &push_queue]() {
                 this->flush_batch_task(push_queue);
@@ -427,46 +427,35 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                 }
 
                 // --- C. 解压 ---
-                // 注意：zstd_decompress_using_view 应该返回一个 vector 或者类似容器
-                auto records_nozstd = MYMQ::ZSTD::zstd_decompress_using_view(dctx, comp_ptr, comp_len);
 
-                // --- D. 解析 Records ---
-                if (records_nozstd.empty() && record_num > 0) {
-                    // 解压失败或为空
-                    continue;
-                }
+                auto records_nozstd_vec = MYMQ::ZSTD::zstd_decompress_using_view(dctx, comp_ptr, comp_len);
 
-                // 使用 MessageParser 解析解压后的数据
-                // 这是一个全新的 Parser，处理解压后的内存块
-                MessageParser inner_mp(records_nozstd.data(), records_nozstd.size());
+                if (records_nozstd_vec.empty() && record_num > 0) continue;
+
+                auto shared_buffer = std::make_shared<std::vector<unsigned char>>(std::move(records_nozstd_vec));
+                MessageParser inner_mp(shared_buffer->data(), shared_buffer->size());
 
                 for (size_t i = 0; i < record_num; ++i) {
                     if (inner_mp.eof()) break;
 
-                    // 1. 读取单条 Record 的总长度
-                    // read_bytes_view 读取 [uint32 len] [bytes body]
-                    // 返回的 body_view 包含了 [KeyLen][Key][ValLen][Val][Time]
-                    // 这样做的好处是：如果 Body 内部损坏，我们依然可以通过 View 机制安全地跳到下一条 Record
+                    // read_bytes_view 返回的是指向 shared_buffer 内部的指针
                     auto [rec_body_ptr, rec_body_len] = inner_mp.read_bytes_view();
 
-                    // 创建一个临时的 Parser 来解析这个 Record Body
                     MessageParser rec_parser(rec_body_ptr, rec_body_len);
 
                     try {
-                        // 解析 Key
-                        std::string key_str = rec_parser.read_string();
-                        // 解析 Value
-                        std::string val_str = rec_parser.read_string();
-                        // 解析 Timestamp
+                        std::string_view key_view = rec_parser.read_string_view();
+                        std::string_view val_view = rec_parser.read_string_view();
                         int64_t timestamp = rec_parser.read_int64();
 
                         out_records.emplace_back(
                             tp.topic,
                             tp.partition,
-                            std::move(key_str),
-                            std::move(val_str),
+                            key_view,       // 传入 view
+                            val_view,       // 传入 view
                             timestamp,
-                            inner_base + i
+                            inner_base + i,
+                            shared_buffer   // 传入 shared_ptr，引用计数 +1
                             );
                     } catch (const std::exception&) {
                         continue;
@@ -511,20 +500,6 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     Err_Client MYMQ_clientuse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_s) {
         if (!record_batch.empty()) return Err_Client::INVALID_OPRATION;
 
-        // Workitem 定义
-        struct Workitem {
-            size_t index;
-            MYMQ::MYMQ_Client::TopicPartition tp;
-            std::vector<unsigned char> raw_big_chunk;
-            std::vector<MYMQ_Public::ConsumerRecord> parsed_records;
-            Err_Client err = Err_Client::NULL_ERROR;
-            Workitem(size_t i, MYMQ::MYMQ_Client::TopicPartition t, std::vector<unsigned char> r)
-                : index(i), tp(std::move(t)), raw_big_chunk(std::move(r)) {}
-        };
-
-        std::vector<Workitem> todo_list;
-        todo_list.reserve(map_poll_queue.size());
-
         // --- 1. 数据收集阶段 (Accumulate Phase) ---
         size_t total_payload_bytes = 0;
 
@@ -532,28 +507,50 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         auto start_time = std::chrono::steady_clock::now();
         auto deadline = start_time + std::chrono::seconds(poll_wait_timeout_s);
 
+        size_t active_item_count = 0;
         while (true) {
             bool gained_new_data_this_round = false;
 
             // A. 轮询所有队列 (Fairness: Round-Robin)
             for (auto& [key, val_queue] : map_poll_queue) {
+
+                // 这里的 raw_chunk 是栈变量，没有堆分配（除非 try_pop 内部做拷贝，但你说它是 Move）
                 std::vector<unsigned char> raw_chunk;
 
-                // 【关键修改】：这里用 if 而不是 while，严格保证每个队列本轮只取一个包
                 if (val_queue.try_pop(raw_chunk)) {
                     size_t chunk_size = raw_chunk.size();
 
-                    todo_list.emplace_back(todo_list.size(), key, std::move(raw_chunk));
+                    // --- 【核心修改开始】：复用 m_todo_cache 逻辑 ---
+
+                    // 场景一：缓存池里有现成的对象 (active_item_count < m_todo_cache.size())
+                    // 直接拿出来重置状态，不要析构它，这样它内部的 parsed_records 内存就保住了！
+                    if (active_item_count < m_todo_cache.size()) {
+                        auto& item = m_todo_cache[active_item_count];
+
+                        item.index = active_item_count;
+                        item.tp = key; // 更新 Partition 信息
+                        item.raw_big_chunk = std::move(raw_chunk); // 把数据 Move 进去
+                        item.err = Err_Client::NULL_ERROR; // 重置错误状态
+
+                        item.parsed_records.clear();
+                    }
+                    else {
+                        m_todo_cache.emplace_back(active_item_count, key, std::move(raw_chunk));
+                    }
+
+                    // 指针后移，指向下一个可用槽位
+                    active_item_count++;
+
+                    // --- 【核心修改结束】 ---
+
                     total_payload_bytes += chunk_size;
                     gained_new_data_this_round = true;
 
-                    // 只要满足了本地拉取阈值，立即停止收集
                     if (total_payload_bytes >= local_pull_bytes) {
                         goto PROCESS_PHASE;
                     }
                 }
             }
-
             // B. 检查超时
             if (std::chrono::steady_clock::now() >= deadline) {
                 break;
@@ -583,13 +580,14 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
     PROCESS_PHASE:
 
-        if (todo_list.empty()) {
+        if (m_todo_cache.empty()) {
             return Err_Client::PULL_TIMEOUT;
         }
 
         // --- 2. 并行解析 (Parallel Parse) ---
-        tbb::parallel_for_each(todo_list.begin(), todo_list.end(),
+        tbb::parallel_for_each(m_todo_cache.begin(), m_todo_cache.begin() + active_item_count,
                                [this](Workitem& item) {
+                                   // 这里的 parsed_records 已经有很大的 capacity 了，push_back 不会触发 malloc
                                    this->call_parse_impl(item.raw_big_chunk, item.parsed_records, item.tp, item.err);
                                });
 
@@ -598,7 +596,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         // 标记是否发生了部分错误（可选，用于返回警告而非错误）
         bool has_partial_error = false;
 
-        for (auto& item : todo_list) {
+        for (size_t i = 0; i < active_item_count; ++i) {
+            auto& item = m_todo_cache[i];
             // 策略：如果出错，仅记录日志并跳过，不影响其他分区的正常数据
             if (item.err != Err_Client::NULL_ERROR) {
                 // [关键] 这里需要记录错误日志，告诉运维/开发者哪个分区数据坏了
@@ -633,23 +632,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             }
         }
 
-        // --- 4. 统一更新 Offset (Fix bug) ---
-        // 必须遍历所有成功解析的分区来更新 Offset，而不是只看 record_batch.back()
-        {
-           Endoffsetmap::const_accessor cac;
-            for (auto const& [tp, max_off] : max_offsets_this_round) {
-                if (map_end_offset.find(cac, tp)) {
-                    // Offset 应该是 消费到的最后一条 offset + 1
-                    cac->second.off.store(max_off,std::memory_order_release);
-                } else {
-                    // 理论上不应该发生，因为拉取时必然存在于 map 中，除非并发删除
-                    return Err_Client::INVALID_PARTITION_OR_TOPIC;
-                }
-            }
-        }
 
-        // 只有当没有任何数据返回，且确实发生了错误时，才返回错误码
-        // 如果有数据返回，即使发生了部分错误，通常也优先返回数据（用户可以处理数据）
         if (record_batch.empty() && has_partial_error) {
             return Err_Client::PARTIAL_PARASE_FAILED;
         }
@@ -1345,14 +1328,13 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                 {
                     Endoffsetmap tmp_map_endoffset;
                     Pollqueuemap tmp_map_poll_queue;
-                    std::unordered_map<std::string,MYMQ::MYMQ_Client::Push_queue> tmp_map_push_queue;
+                    std::unordered_map<TopicPartition,MYMQ::MYMQ_Client::Push_queue> tmp_map_push_queue;
                     auto size_tmp=tmp_queue_endoffset.size();
                     tmp_map_push_queue.reserve(size_tmp);
 
 
                     while(!tmp_queue_endoffset.empty()){
-                        auto [par,off] =tmp_queue_endoffset.front();
-                        std::string key=par.first+"_"+std::to_string( par.second);
+                        auto& [par,off] =tmp_queue_endoffset.front();
                         TopicPartition tp(par.first,par.second);
                         tmp_queue_endoffset.pop();
                         {
@@ -1372,12 +1354,13 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                 std::make_tuple(tp),
                                 std::make_tuple(16384,4000000000)
                                 );
+                            ac->second.local_consume_offset.store(off);
                         }
 
 
                         tmp_map_push_queue.emplace(std::piecewise_construct,
-                                                   std::forward_as_tuple(key),
-                                                   std::forward_as_tuple(par.first,par.second,batch_size));
+                                                   std::forward_as_tuple(tp),
+                                                   std::forward_as_tuple(tp,batch_size));
                     }
 
                     map_end_offset=std::move(tmp_map_endoffset);
@@ -1447,10 +1430,11 @@ MYMQ_clientuse::~MYMQ_clientuse(){
              auto message_collection= mp.read_uchar_vector();
             bool need_poll=0;
             // 2. 找到对应的队列
-            Pollqueuemap::accessor cac;
-            if(map_poll_queue.find(cac, TopicPartition(topicname_, partition_))){
-                auto& pollqueue = cac->second;
+            Pollqueuemap::accessor ac;
+            if(map_poll_queue.find(ac, TopicPartition(topicname_, partition_))){
+                auto& pollqueue = ac->second;
 
+                pollqueue.local_consume_offset=offset_next_to_consume;
                 // 3. 将整个大包直接推入队列
                 pollqueue.push(message_collection);
 
@@ -1465,7 +1449,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                 need_poll =pollqueue.need_poll();
             }
 
-            cac.release();
+            ac.release();
 
                 if( need_poll&&!is_no_record){
 
@@ -1600,7 +1584,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         // 如果是 TBB map，遍历通常是线程安全的，但要注意锁粒度
         for (auto& it : map_push_queue) {
             // key 是 partition string, value 是 Push_queue
-            const std::string& pq_key = it.first;
+            const TopicPartition& pq_key = it.first;
             auto& pq = it.second;
 
             // 【优化】无锁预检查 (Dirty Check)
@@ -1642,15 +1626,15 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             // ==========================================
             // D. 派发给线程池 (非阻塞)
             // ==========================================
-            // 使用 Key 做 Hash，保证依然由同一个分片线程处理，保持 CPU 亲和性
-            // 注意：这里 it.first 就是 key，不需要再拼字符串了，省了 malloc
-            uint32_t shard_id = MurmurHash2::hash(pq_key);
+
+            auto key_hash=pq_key.topic+"_"+std::to_string( pq_key.partition);
+            uint32_t shard_id = MurmurHash2::hash(key_hash);
 
             pool_.submit(shard_id, [this, &pq]() {
                 this->flush_batch_task(pq);
             });
 
-            // 锁在循环末尾自动释放，立即处理下一个 Queue
+
         }
     }
     void MYMQ_clientuse::out_group_reset(){
@@ -1685,14 +1669,13 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
         for(const auto& [tp,pollqueue]:map_poll_queue){
             if(pollqueue.need_poll()){
-                Endoffsetmap::const_accessor cac;
-                if(map_end_offset.find(cac,tp)){
-                    size_t now_off=  cac->second.off.load(std::memory_order_relaxed);
+
+                 size_t now_off= pollqueue.local_consume_offset.load();
                  size_t bytes= pull_bytes_once.load();
                     MB mb;
                     mb.append(groupid,tp.topic,tp.partition,now_off,bytes);
                     send(Eve:: CLIENT_REQUEST_PULL,mb.data);
-                }
+
             }
         }
 

@@ -9,6 +9,7 @@
 #include <iomanip>       // For std::put_time, std::setw, std::setfill
 #include <functional>
 #include <variant>
+#include<memory>
 namespace MYMQ_Public {
 
 // ----------------------------------------------------------------------
@@ -182,8 +183,14 @@ inline constexpr bool always_false_v = false;
 
 class ConsumerRecord{
 public:
-    ConsumerRecord(const std::string& topic ,size_t partition,const std::string& key,const std::string& value ,int64_t time_,size_t offset)
-        :tp(topic,partition),key(key),value(value),offset(offset),time(time_){
+    ConsumerRecord(const std::string& topic, size_t partition,
+                   std::string_view key_view, std::string_view value_view,
+                   int64_t time_, size_t offset,
+                   std::shared_ptr<void> data_owner) // <--- 关键参数
+        : tp(topic, partition), key(key_view), value(value_view),
+        offset(offset), time(time_),
+        owner(std::move(data_owner)) // 移动进来，增加引用计数
+    {
     }
     ConsumerRecord()=default;
 
@@ -197,9 +204,15 @@ public:
         return offset;
     }
     std::string getKey() const {
-        return key;
+        return std::string(key) ;
     }
     std::string getValue() const {
+        return std::string(value);
+    }
+    std::string_view getKey_view() const {
+        return key ;
+    }
+    std::string_view getValue_view() const {
         return value;
     }
     int64_t getTime() const{
@@ -208,11 +221,13 @@ public:
 
 private:
 
+private:
     TopicPartition tp;
     size_t offset;
-    std::string key;
-    std::string value;
     int64_t time;
+    std::string_view key;
+    std::string_view value;
+    std::shared_ptr<void> owner;
 };
 
 } // namespace MYMQ_Public
