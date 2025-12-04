@@ -1,5 +1,5 @@
 #include"MYMQ_Client.h"
-MYMQ_clientuse::MYMQ_clientuse(const std::string& clientid,uint8_t ack_level):path_(MYMQ::run_directory_DEFAULT),cmc_(MYMQ::run_directory_DEFAULT),tbb_dctx_pool([]() {
+MYMQ_clientuse::MYMQ_clientuse(const std::string& clientid,uint8_t ack_level):path_(MYMQ::run_directory_DEFAULT),cmc_(MYMQ::run_directory_DEFAULT,MYMQ::REQUEST_TIMEOUT_MS_DEFAULT),tbb_dctx_pool([]() {
         // 初始化函数：当新线程第一次访问时调用
         return ZSTD_createDCtx();
     }){
@@ -57,7 +57,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
     void MYMQ_clientuse::poll_perioric_start(){
         autopoll_taskid= timer.commit_ms([this]{
-            push_timer_send();
+            trigger_poll_for_low_cap_pollbuffer();
         },autopoll_perior_ms,autopoll_perior_ms);
     }
     void MYMQ_clientuse::poll_perioric_stop(){
@@ -497,7 +497,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         return cac->second.off.load(std::memory_order_relaxed);
     }
 
-    Err_Client MYMQ_clientuse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_s) {
+    Err_Client MYMQ_clientuse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_ms) {
         if (!record_batch.empty()) return Err_Client::INVALID_OPRATION;
 
         // --- 1. 数据收集阶段 (Accumulate Phase) ---
@@ -505,32 +505,25 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
         // 计算绝对截止时间
         auto start_time = std::chrono::steady_clock::now();
-        auto deadline = start_time + std::chrono::seconds(poll_wait_timeout_s);
+        auto deadline = start_time + std::chrono::milliseconds(poll_wait_timeout_ms);
 
         size_t active_item_count = 0;
         while (true) {
             bool gained_new_data_this_round = false;
 
-            // A. 轮询所有队列 (Fairness: Round-Robin)
             for (auto& [key, val_queue] : map_poll_queue) {
-
-                // 这里的 raw_chunk 是栈变量，没有堆分配（除非 try_pop 内部做拷贝，但你说它是 Move）
                 std::vector<unsigned char> raw_chunk;
 
                 if (val_queue.try_pop(raw_chunk)) {
                     size_t chunk_size = raw_chunk.size();
 
-                    // --- 【核心修改开始】：复用 m_todo_cache 逻辑 ---
-
-                    // 场景一：缓存池里有现成的对象 (active_item_count < m_todo_cache.size())
-                    // 直接拿出来重置状态，不要析构它，这样它内部的 parsed_records 内存就保住了！
                     if (active_item_count < m_todo_cache.size()) {
                         auto& item = m_todo_cache[active_item_count];
 
                         item.index = active_item_count;
-                        item.tp = key; // 更新 Partition 信息
-                        item.raw_big_chunk = std::move(raw_chunk); // 把数据 Move 进去
-                        item.err = Err_Client::NULL_ERROR; // 重置错误状态
+                        item.tp = key;
+                        item.raw_big_chunk = std::move(raw_chunk);
+                        item.err = Err_Client::NULL_ERROR;
 
                         item.parsed_records.clear();
                     }
@@ -562,7 +555,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             if (!gained_new_data_this_round) {
                 std::unique_lock<std::mutex> ulock(mtx_poll_ready);
 
-                // 等待直到超时或被 notify
+
                 bool signaled = cv_poll_ready.wait_until(ulock, deadline, [this] {
                     return poll_ready.load();
                 });
@@ -591,8 +584,6 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                    this->call_parse_impl(item.raw_big_chunk, item.parsed_records, item.tp, item.err);
                                });
 
-        std::unordered_map<TopicPartition, int64_t> max_offsets_this_round;
-
         // 标记是否发生了部分错误（可选，用于返回警告而非错误）
         bool has_partial_error = false;
 
@@ -600,14 +591,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             auto& item = m_todo_cache[i];
             // 策略：如果出错，仅记录日志并跳过，不影响其他分区的正常数据
             if (item.err != Err_Client::NULL_ERROR) {
-                // [关键] 这里需要记录错误日志，告诉运维/开发者哪个分区数据坏了
-                // LOG_ERROR("Parse failed for TP: %s, Error: %d", item.tp.toString(), item.err);
-
                 has_partial_error = true;
 
-                // 进阶策略：如果是致命的数据损坏(CORRUPT_MESSAGE)，
-                // 你可能需要在这里强制推进该分区的 Offset 以跳过坏块，
-                // 或者保留 Offset 不动让用户重试（但要小心死循环）。
                 continue;
             }
 
@@ -617,12 +602,6 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                 if (record_batch.capacity() < needed) {
                     record_batch.reserve(needed);
                 }
-
-                // 记录该分区的最大 Offset
-                // 假设 parsed_records 是按顺序排列的，那么最后一个就是最大的
-                long long last_offset = item.parsed_records.back().getOffset();
-                // 更新本地临时 Map
-                max_offsets_this_round[item.tp] = last_offset;
 
                 record_batch.insert(
                     record_batch.end(),
@@ -1352,7 +1331,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                                 ac,
                                 std::piecewise_construct,
                                 std::make_tuple(tp),
-                                std::make_tuple(16384,4000000000)
+                                std::make_tuple(400000000,6000000000)
                                 );
                             ac->second.local_consume_offset.store(off);
                         }
@@ -1376,7 +1355,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                 is_ingroup.store(1);
                 heartbeat_start();
                 push_perioric_start();
-                poll_perioric_start();
+                // poll_perioric_start();
                 if(is_auto_commit){
                     autocommit_start();
                 }
@@ -1416,11 +1395,6 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
             bool is_no_record=(error==Err::NO_RECORD);
             if(is_no_record){
-                {
-                    std::lock_guard<std::mutex> lock(mtx_poll_ready);
-                    poll_ready.store(true);
-                }
-                cv_poll_ready.notify_one();
             }
             if(error != Err::NULL_ERROR) {
                 return error;
@@ -1650,7 +1624,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         heartbeat_stop();
         autocommit_stop();
         push_perioric_stop();
-        poll_perioric_stop();
+        // poll_perioric_stop();
     }
 
 
@@ -1668,7 +1642,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         }
 
         for(const auto& [tp,pollqueue]:map_poll_queue){
-            if(pollqueue.need_poll()){
+
 
                  size_t now_off= pollqueue.local_consume_offset.load();
                  size_t bytes= pull_bytes_once.load();
@@ -1676,7 +1650,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     mb.append(groupid,tp.topic,tp.partition,now_off,bytes);
                     send(Eve:: CLIENT_REQUEST_PULL,mb.data);
 
-            }
+
         }
 
 

@@ -60,6 +60,7 @@ constexpr size_t LOG_FLUSH_INTERVAL_MS=360000;
 constexpr size_t LOG_CLEAN_S_DEFAULT=144000;
 constexpr size_t session_timeout_ms_=500000;
 constexpr size_t MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT=1000;
+constexpr size_t REQUEST_TIMEOUT_MS_DEFAULT=5000;
 
 enum class EventType : uint16_t {
     // 客户端请求事件

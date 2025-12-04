@@ -51,7 +51,7 @@ public:
     Err_Client push(const MYMQ_Public::TopicPartition& tp,const std::string& key,const std::string& value
                     ,MYMQ_Public::PushResponceCallback cb) ;
 
-    Err_Client pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batc,size_t poll_wait_timeout_s) ;
+    Err_Client pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batc,size_t poll_wait_timeout_ms) ;
     void create_topic(const std::string& topicname,size_t parti_num=1);
     void set_pull_bytes(size_t bytes);
 
@@ -153,6 +153,7 @@ private:
     bool is_auto_commit;
     size_t max_in_flight_requests_num;
     size_t autopoll_perior_ms;
+
     //Config配置项
 
 

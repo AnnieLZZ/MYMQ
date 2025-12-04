@@ -27,6 +27,7 @@
 #include"Printqueue.h"
 #include<openssl/ssl.h>
 #include<openssl/err.h>
+#include"Request_timeout_queue.h"
 
 
 
@@ -93,8 +94,8 @@ public:
         }
     };
 
-    Communication_client(const std::string& path_) :
-        path(path_), client_state(0) {
+    Communication_client(const std::string& path_,size_t request_timeout_ms) :
+        path(path_), client_state(0),request_timeout_timer(this->map_wait_responces,curr_flying_request_num,request_timeout_ms) {
     }
 
     ~Communication_client() {
@@ -120,8 +121,8 @@ public:
                 moodycamel::ReaderWriterQueue<PendingMessage> tmp_queue(send_queue_size);
                 send_queue = std::move(tmp_queue);
             }
-            request_timeout_s=config_mgr.get_size_t("request_timeout_s");
-            timer.set_max_queue_size(MYMQ::MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT+500);
+
+
             IO_buffer_size=config_mgr.get_size_t("IO_buffer_size");
             IO_buffer.resize(IO_buffer_size);
 
@@ -231,47 +232,17 @@ public:
         //// BODY 构建
         mb.append_uchar_vector(msg_body);
 
+        bool need_wait_response = !(event_type == static_cast<uint16_t>(Eve::CLIENT_REQUEST_PUSH) &&
+                                    ack_level == MYMQ::ACK_Level::ACK_NORESPONCE);
 
+        if (need_wait_response) {
 
-
-        if (!(event_type==static_cast<uint16_t>(Eve::CLIENT_REQUEST_PUSH)&&ack_level== MYMQ::ACK_Level::ACK_NORESPONCE) ) {
-
-            {
-                tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
-                if(map_wait_responces.insert(acc, coid)) {
-                    acc->second = std::move(handler);
-                     curr_flying_request_num++;
-                }
-
+            tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
+            if (map_wait_responces.insert(acc, coid)) {
+                acc->second = std::move(handler); // 转移所有权，保存回调
             }
-
-
-         auto task_id=timer.commit_s([this, coid] {
-                tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc_timer;
-                if (map_wait_responces.find(acc_timer, coid)) {
-                    cerr( "[Request Time out] Correlationid : " + std::to_string(coid));
-
-                    auto cb = std::move(acc_timer->second);
-                    map_wait_responces.erase(acc_timer);
-                    cb(static_cast<uint16_t>(Eve::EVENTTYPE_NULL) ,Mybyte{} );
-                    curr_flying_request_num--;
-                }
-            }, request_timeout_s,request_timeout_s,1);
-
-            if (task_id == 0) {//timer的背压机制，当有界队列满时回返回0,反之返回真的taskid
-                cerr("[Backpressure] Request counts overflow. Rollback callback for coid: " + std::to_string(coid));
-                // 回滚
-                tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
-                if (map_wait_responces.find(acc, coid)) {
-                    map_wait_responces.erase(acc);
-                    curr_flying_request_num--;
-                }
-
-
-                return 0; // 返回失败
-            }
-
-
+            curr_flying_request_num++;
+            request_timeout_timer.add(coid);
         }
 
         send_queue.try_emplace(std::move(mb.data), coid, ResponseCallback{});
@@ -770,7 +741,7 @@ private:
     std::string server_IP;
     int port;
     uint16_t HEADER_SIZE;
-    size_t request_timeout_s;
+
 
     SOCKET clientSocket;
     std::atomic<bool> running_{false};
@@ -792,9 +763,11 @@ private:
     MYMQ::ACK_Level ack_level=MYMQ::ACK_Level::ACK_PROMISE_INDISK;
 
     tbb::concurrent_hash_map<uint32_t, ResponseCallback> map_wait_responces;
+    RequestTimeoutQueue request_timeout_timer;
 
     std::atomic<uint32_t> Correlation_ID{0};
-    Timer timer;
+
+
 
     SSL_CTX* ctx_ = nullptr;
     SSL* ssl_ = nullptr;
