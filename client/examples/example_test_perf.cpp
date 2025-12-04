@@ -107,19 +107,17 @@ int main() {
 
     // 等待落盘/同步
     out("Waiting for server sync (5s)...");
-    std::this_thread::sleep_for(std::chrono::seconds(15));
+    std::this_thread::sleep_for(std::chrono::seconds(5));
 
 
     mc.trigger_pull();
-    std::this_thread::sleep_for(std::chrono::milliseconds(15000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10000));
     // ==========================================
     // Phase 2: Consumer Throughput (定量消费)
     // ==========================================
     out("\n--- [Phase 2] Consumer Benchmark Start ---");
 
     std::vector<MYMQ_Public::ConsumerRecord> res;
-    // 预分配内存，避免 vector 扩容带来的计时误差（可选优化）
-    res.reserve(1000);
 
     int consumed_count = 0;
     long long consumed_bytes = 0;
@@ -141,7 +139,7 @@ int main() {
         auto batch_start_time = high_resolution_clock::now();
 
         // 执行拉取
-        auto err = mc.pull(res, 0);
+        auto err = mc.pull(res, 2000);
 
         // 【修改点3】判断是否有数据
         if (!res.empty()) {
