@@ -54,7 +54,7 @@ ACK_NORESPONCE时不予设置回调，即发即忘，ACK_PROMISE_INDISK时保证
 
 ## v3.0.0(2025-12-5)
 
-- **版本更新**: 更新项目版本至 v3.1.0
+- **版本更新**: 更新项目版本至 v3.0.0
 - **更新细则**: 
  1 取消了定时触发poll的逻辑，当前来说这个逻辑没有意义
 2 增大了config的最大飞行请求数，防止高频请求时队列快速扩张导致拒绝请求
@@ -64,5 +64,18 @@ ACK_NORESPONCE时不予设置回调，即发即忘，ACK_PROMISE_INDISK时保证
 6pull第二个参数改为poll_wait_timeout_ms，用于精确调控等待时间
 - **其他**: 测试用例调整
 
+---
+
+## v3.1.0(2025-12-6)
+
+- **版本更新**: 更新项目版本至 v3.1.0
+- **更新细则**: 
+1 删除autopoll_perior_ms，pull_bytes更名pull_bytes_once_of_request
+2 测试用例不再是随机字符，而是按可以按模式修改的常见模拟格式字符串
+3 local_pull_bytes_once 改为运行时配置项，新增’set_local_pull_bytes_once‘ api来设置该值
+4 移除自动拉取相关逻辑
+5 新增用于开发测试的pull重载版本，传入最后一个参数int64_t来获取pull实际运行时间，单位us
+6 修正心跳逻辑，当世代不符时就代表需要重入组
+- **其他**: 测试用例调整
 
 
