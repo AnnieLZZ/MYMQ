@@ -60,6 +60,7 @@ constexpr size_t LOG_FLUSH_INTERVAL_MS=360000;
 constexpr size_t LOG_CLEAN_S_DEFAULT=144000;
 constexpr size_t session_timeout_ms_=500000;
 constexpr size_t MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT=1000;
+constexpr size_t REQUEST_TIMEOUT_MS_DEFAULT=5000;
 
 enum class EventType : uint16_t {
     // 客户端请求事件
@@ -155,6 +156,11 @@ inline std::string to_string(ACK_Level ackLevel) {
     default: return "UNKNOWN_ACK_LEVEL (" + std::to_string(static_cast<uint16_t>(ackLevel)) + ")";
     }
 }
+
+
+
+
+
 
 namespace ZSTD {
 
@@ -295,60 +301,13 @@ struct Record{
 };
 
 
-inline std::vector<unsigned char> build_Record(const std::string& key,const std::string& value) {
-    auto now = std::chrono::system_clock::now();
-    int64_t current_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-    MessageBuilder mb;
-    mb.reserve(2*sizeof(uint32_t)+key.size()+value.size()+sizeof(int64_t));
-    mb.append(key,value,current_time_ms);
-    uint32_t crc= MYMQ::Crc32::calculate_crc32(mb.data.data(),mb.data.size());
-    MessageBuilder mb2;
-    mb2.append(crc,mb.data);
-
-    return mb2.data;
-}
-
-inline std::vector<unsigned char> build_Record(const Record& unpacked_msg) {
-    MessageBuilder mb;
-    mb.reserve(2*sizeof(uint32_t)+unpacked_msg.key.size()+unpacked_msg.value.size()+sizeof(int64_t));
-    mb.append(unpacked_msg.key,unpacked_msg.value,unpacked_msg.time);
-    uint32_t crc= MYMQ::Crc32::calculate_crc32(mb.data.data(),mb.data.size());
-    MessageBuilder mb2;
-    mb2.append(crc,mb.data);
-
-    return mb2.data;
-}
-
-inline Record parase_Record(const std::vector<unsigned char>& binary_data) {
-    if (binary_data.empty()) {
-        return Record();
-    }
-
-    MessageParser mp(binary_data);
-    auto crc=mp.read_uint32();
-    auto msg=mp.read_uchar_vector();
-    if(!MYMQ::Crc32::verify_crc32(msg.data(),msg.size(),crc)){
-        throw std::out_of_range("Crc verify failed");
-    }
-    try {
-        MessageParser mp2(msg);
-        auto key=mp2.read_string();
-        auto value=mp2.read_string();
-        auto time=mp2.read_ll();
-        return Record(key, value, time);
-
-    } catch (std::exception& e) {
-
-       throw std::out_of_range("UNKNOWN ERROR IN RECORD PARASE");
-    }
 
 
 
-}
 
 
-// 预定义一个大 Buffer，专门用来挨个塞消息
-class BatchBuffer {
+
+class BatchBuffer {//生产者用的
 public:
     std::vector<unsigned char> data_;
     size_t write_pos_ = 0; // 当前写到了哪里
@@ -379,83 +338,61 @@ size_t record_count_ = 0;
     // --- 核心：替代 build_Record 的逻辑 ---
     // 返回 true 表示写入成功，false 表示空间不足
     bool append_record(const std::string& key, const std::string& value) {
-        // 1. 预计算总长度，判断是否溢出
-        // 结构：[外层Len(4)] + [CRC(4)] + [KeyLen(4)+Key] + [ValLen(4)+Val] + [Time(8)]
+        // 1. 预计算长度
         size_t key_len = key.size();
         size_t val_len = value.size();
 
-        // Record 内部的大小 (CRC + Key部分 + Val部分 + Time)
-        size_t record_inner_size = sizeof(uint32_t) + // CRC
-                                   sizeof(uint32_t) + key_len +
-                                   sizeof(uint32_t) + val_len +
-                                   sizeof(int64_t);   // Time
+        // ---------------------------------------------------------
+        // 逻辑: [TotalLen] -> [KeyLen][Key][ValLen][Val][Time]
+        // ---------------------------------------------------------
 
-        // 写入 Batch 需要的总空间 (包含外层长度头)
+        // Record 内部大小 = Key部分 + Val部分 + Time(8)
+        size_t record_inner_size = sizeof(uint32_t) + key_len +
+                                   sizeof(uint32_t) + val_len +
+                                   sizeof(uint64_t);   // Time
+
+        // 写入 Batch 需要的总空间 (包含开头的 4字节 TotalLen)
         size_t total_size_needed = sizeof(uint32_t) + record_inner_size;
 
-        // 检查容量
+        // 2. 检查容量
         if (write_pos_ + total_size_needed > data_.size()) {
             return false;
         }
 
-        // --- 开始写入 (模拟原来的多次 append 行为) ---
+        // --- 开始写入 ---
         unsigned char* ptr = data_.data() + write_pos_;
 
-        // A. 【核心修正】写入外层长度 (模拟 append_uchar_vector)
-        // 对应原来的：mb_records.append_uchar_vector(...) 里的 network_length
+        // A. 写入单条 Record 的总长度 (不包含自身 4 字节)
+        // 解析端：std::memcpy(&single_rec_len, rec_ptr, 4);
         uint32_t n_record_len = htonl(static_cast<uint32_t>(record_inner_size));
         std::memcpy(ptr, &n_record_len, sizeof(uint32_t));
         ptr += sizeof(uint32_t);
 
-        // B. 预留 CRC 位置
-        unsigned char* crc_ptr = ptr; // 记住 CRC 写在哪里
-        ptr += sizeof(uint32_t);      // 跳过 CRC 的 4 字节
-
-        // Body 开始的位置 (用于计算 CRC)
-        unsigned char* body_start_ptr = ptr;
-
-        // C. 写入 Key
+        // B. 写入 Key (Length + Data)
+        // 解析端：std::memcpy(&key_len, kv_start, 4);
         uint32_t n_key_len = htonl(static_cast<uint32_t>(key_len));
         std::memcpy(ptr, &n_key_len, sizeof(uint32_t)); ptr += sizeof(uint32_t);
         std::memcpy(ptr, key.data(), key_len);          ptr += key_len;
 
-        // D. 写入 Value
+        // C. 写入 Value (Length + Data)
+        // 解析端：std::memcpy(&val_len, kv_start, 4);
         uint32_t n_val_len = htonl(static_cast<uint32_t>(val_len));
         std::memcpy(ptr, &n_val_len, sizeof(uint32_t)); ptr += sizeof(uint32_t);
         std::memcpy(ptr, value.data(), val_len);        ptr += val_len;
 
-        // E. 写入 Time
         auto now = std::chrono::system_clock::now();
         int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
         uint64_t ts_value = static_cast<uint64_t>(ts);
 
-        // 1. 取出高 32 位，转网络序
-        uint32_t high_part = htonl(static_cast<uint32_t>(ts_value >> 32));
-        // 2. 取出低 32 位，转网络序
-        uint32_t low_part  = htonl(static_cast<uint32_t>(ts_value & 0xFFFFFFFF));
+        uint64_t n_time = htonll(ts_value);
+        std::memcpy(ptr, &n_time, sizeof(uint64_t));
+        ptr += sizeof(uint64_t);
 
-        // 3. 依次写入 (大端序规定：先写高位，再写低位)
-        std::memcpy(ptr, &high_part, sizeof(uint32_t));
-        ptr += sizeof(uint32_t);
-
-        std::memcpy(ptr, &low_part, sizeof(uint32_t));
-        ptr += sizeof(uint32_t);
-
-
-        // F. 回头计算并填入 CRC
-        // 计算范围：从 Body 开始，到当前位置
-        size_t body_len = ptr - body_start_ptr;
-        uint32_t crc = MYMQ::Crc32::calculate_crc32(body_start_ptr, body_len);
-        uint32_t n_crc = htonl(crc);
-        std::memcpy(crc_ptr, &n_crc, sizeof(uint32_t));
-
-        // 更新全局指针
         write_pos_ += total_size_needed;
 
         record_count_++;
         return true;
     }
-
  };
 
 
@@ -573,8 +510,8 @@ struct Push_queue {
 
     std::atomic<size_t> current_batch_count{0};
 
-    Push_queue(const std::string& t, size_t p, size_t buffer_size = 1024 * 1024)
-        : tp(t, p),
+    Push_queue(const TopicPartition& tp, size_t buffer_size = 1024 * 1024)
+        : tp(tp),
         buf_1(buffer_size),
         buf_2(buffer_size),
         active_buf(&buf_1),
@@ -590,12 +527,105 @@ struct Push_queue {
 
 
 
+
+
 struct endoffset_point
 {
     TopicPartition tp;
-    size_t off;
+    mutable std::atomic<size_t> off;
     endoffset_point(size_t off_,const std::string& t,size_t p):tp(t,p),off(off_){}
 };
+
+
+class PollBuffer {
+public:
+
+    mutable std::atomic<size_t> local_consume_offset{0};
+    enum State {
+        PAUSE,
+        NEED_POLL
+    };
+
+    PollBuffer(size_t low, size_t high)
+        : low_level_capacity(low), high_level_capacity(high), state(NEED_POLL) {}
+
+
+    bool need_poll() const {
+        return state.load(std::memory_order_acquire) == NEED_POLL;
+    }
+
+    bool is_paused() const {
+        return state.load(std::memory_order_acquire) == PAUSE;
+    }
+    void clear_for_seek(size_t target_offset){
+        {
+            std::lock_guard<std::mutex> ulock(mtx);
+            {
+                std::deque<std::vector<unsigned char>> tmp{};
+                std::swap(tmp,queue_);
+            }
+
+            curr_size.store(0);
+            local_consume_offset.store(target_offset);
+            state.store(NEED_POLL);
+        }
+
+    }
+
+    bool try_pop(std::vector<unsigned char>& target) {
+        std::lock_guard<std::mutex> ulock(mtx);
+
+        if (queue_.empty()) {
+            return false;
+        }
+
+        auto& item = queue_.front();
+        target = std::move(item);
+
+
+        size_t popped_size = target.size();
+        queue_.pop_front();
+
+        size_t current = curr_size.fetch_sub(popped_size, std::memory_order_relaxed) - popped_size;
+
+        // 迟滞判断
+        // 只有当前是 PAUSE 且水位降到 LOW 以下，才“切换”状态
+        if (state.load(std::memory_order_relaxed) == PAUSE && current <= low_level_capacity) {
+            state.store(NEED_POLL, std::memory_order_release);
+        }
+
+        return true;
+    }
+
+    void push(std::vector<unsigned char>& obj) {
+        std::lock_guard<std::mutex> ulock(mtx);
+
+        size_t obj_size = obj.size();
+        queue_.emplace_back(std::move(obj));
+
+        // 更新大小
+        size_t current = curr_size.fetch_add(obj_size, std::memory_order_relaxed) + obj_size;
+
+        // 迟滞判断
+        // 只有当前是 NEED_POLL 且水位涨到 HIGH 以上，才“切换”状态
+        if (state.load(std::memory_order_relaxed) == NEED_POLL && current >= high_level_capacity) {
+            state.store(PAUSE, std::memory_order_release);
+        }
+    }
+
+private:
+    std::mutex mtx;
+    std::deque<std::vector<unsigned char>> queue_;
+
+    // 使用 atomic 允许无锁查询
+    std::atomic<size_t> curr_size{0};
+
+    std::atomic<State> state;
+
+    const size_t high_level_capacity;
+    const size_t low_level_capacity;
+};
+
 
 }
 

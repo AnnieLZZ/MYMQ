@@ -50,5 +50,19 @@ ACK_NORESPONCE时不予设置回调，即发即忘，ACK_PROMISE_INDISK时保证
 - **其他**: 测试用例调整
 
 
+---
+
+## v3.0.0(2025-12-5)
+
+- **版本更新**: 更新项目版本至 v3.1.0
+- **更新细则**: 
+ 1 取消了定时触发poll的逻辑，当前来说这个逻辑没有意义
+2 增大了config的最大飞行请求数，防止高频请求时队列快速扩张导致拒绝请求
+3 将测试用例pull的延迟抬高，收集更多chuck并发解析
+4 request_timeout_s改为系统配置项request_timeout_ms，默认为为5000
+5 新增'Request_timeout_queue.h' 用deque加静默删除的模式，用于高并发场景下检测超时的timer，代替原有timer，平均每次行为从o(logn)降至o(1)，同时去掉了线程池，改为拒绝无意义线程压力和投递任务压力
+6pull第二个参数改为poll_wait_timeout_ms，用于精确调控等待时间
+- **其他**: 测试用例调整
+
 
 

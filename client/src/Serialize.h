@@ -184,21 +184,55 @@ private:
 
 
 class MessageParser {
+private:
+    const unsigned char* m_data;
+    size_t m_size;
+    size_t m_offset;
+
+
+    uint64_t ntoh64(uint64_t value) {
+        static const int num = 42;
+        if (*reinterpret_cast<const char*>(&num) == num) {
+            const uint32_t high = ntohl(static_cast<uint32_t>(value >> 32));
+            const uint32_t low = ntohl(static_cast<uint32_t>(value & 0xFFFFFFFF));
+            return (static_cast<uint64_t>(low) << 32) | high;
+        } else {
+            return value;
+        }
+    }
+
 public:
 
-    const std::vector<unsigned char>& data;
-    size_t offset;
+    MessageParser(const void* data, size_t size)
+        : m_data(static_cast<const unsigned char*>(data))
+        , m_size(size)
+        , m_offset(0)
+    {
+        if (!m_data && size > 0) {
+            throw std::invalid_argument("MessageParser received nullptr with non-zero size.");
+        }
+    }
 
+    MessageParser(const std::vector<unsigned char>&) = delete;
 
-    MessageParser(const std::vector<unsigned char>& msg_data) : data(msg_data), offset(0) {}
+    bool eof() const { return m_offset >= m_size; }
+
+    size_t remaining() const { return m_size - m_offset; }
 
 
     void read_bytes(void* buffer, size_t count) {
-        if (offset + count > data.size()) {
+        if (m_offset + count > m_size) {
             throw std::out_of_range("Not enough data to read.");
         }
-        std::copy(data.begin() + offset, data.begin() + offset + count, static_cast<unsigned char*>(buffer));
-        offset += count;
+        std::memcpy(buffer, m_data + m_offset, count);
+        m_offset += count;
+    }
+
+    void skip(size_t count) {
+        if (m_offset + count > m_size) {
+            throw std::out_of_range("Not enough data to skip.");
+        }
+        m_offset += count;
     }
 
     short read_short() {
@@ -219,9 +253,8 @@ public:
         return ntohl(network_value);
     }
 
-    // 注意：int32_t 的解析方式与 int 相同，因为 int 在大多数系统上就是 int32_t
     int32_t read_int32() {
-        uint32_t network_value; // 使用 uint32_t 来进行 ntohl 转换
+        uint32_t network_value;
         read_bytes(&network_value, sizeof(network_value));
         return static_cast<int32_t>(ntohl(network_value));
     }
@@ -232,129 +265,99 @@ public:
         return ntohs(network_value);
     }
 
-    // ⬇️ 补充：读取 uint64_t
     uint64_t read_uint64() {
         uint64_t network_value;
         read_bytes(&network_value, sizeof(network_value));
         return ntoh64(network_value);
     }
 
-    // ⬇️ 补充：读取 int64_t
     int64_t read_int64() {
-        uint64_t network_value; // 先读入无符号类型
+        uint64_t network_value;
         read_bytes(&network_value, sizeof(network_value));
-        // 转换为本地字节序后再 static_cast 到 int64_t
         return static_cast<int64_t>(ntoh64(network_value));
-    }
-
-
-    size_t read_size_t() {
-        // 假设 size_t 序列化为 uint64_t
-        return static_cast<size_t>(read_uint64());
-    }
-
-    bool read_bool() {
-        if (offset + sizeof(unsigned char) > data.size()) {
-            throw std::out_of_range("Not enough data to read bool.");
-        }
-        unsigned char byte_value = data[offset];
-        offset += sizeof(unsigned char);
-        return byte_value != 0;
-    }
-
-    std::string read_string() {
-        uint32_t network_length;
-        read_bytes(&network_length, sizeof(network_length));
-        uint32_t length = ntohl(network_length);
-
-        if (offset + length > data.size()) {
-            throw std::out_of_range("Not enough data to read string.");
-        }
-        std::string str(data.begin() + offset, data.begin() + offset + length);
-        offset += length;
-        return str;
-    }
-
-    std::vector<unsigned char> read_uchar_vector() {
-        uint32_t network_length;
-
-        read_bytes(&network_length, sizeof(network_length));
-        uint32_t length = ntohl(network_length);
-
-        if (offset + length > data.size()) {
-            throw std::out_of_range("Not enough data to read vector<unsigned char>.");
-        }
-
-        std::vector<unsigned char> vec(data.begin() + offset, data.begin() + offset + length);
-
-        offset += length;
-        return vec;
-    }
-
-
-    // 【新增 API 1】零拷贝读取字符串
-    // 返回 std::string_view，它只是一个指针+长度的轻量级对象
-    std::string_view read_string_view() {
-        uint32_t network_length;
-        // 注意：这里 peek 或者 read 都可以，只要保证 offset 正确移动
-        // 假设 read_bytes 会移动 offset，我们需要先读长度
-        read_bytes(&network_length, sizeof(network_length));
-        uint32_t length = ntohl(network_length);
-
-        if (offset + length > data.size()) {
-            throw std::out_of_range("Not enough data to read string_view.");
-        }
-
-        // 获取原始数据的指针
-        const char* ptr = reinterpret_cast<const char*>(data.data() + offset);
-
-        // 移动 offset
-        offset += length;
-
-        // 返回视图（不发生内存拷贝）
-        return std::string_view(ptr, length);
-    }
-
-    // 【新增 API 2】零拷贝读取二进制块 (用于 CRC, ZSTD)
-    // 返回 {指针, 长度}，完全避免 vector 的构造
-    std::pair<const unsigned char*, uint32_t> read_bytes_view() {
-        uint32_t network_length;
-        read_bytes(&network_length, sizeof(network_length));
-        uint32_t length = ntohl(network_length);
-
-        if (offset + length > data.size()) {
-            throw std::out_of_range("Not enough data to read bytes view.");
-        }
-
-        // 获取当前 payload 的起始地址
-        const unsigned char* ptr = data.data() + offset;
-
-        // 移动 offset
-        offset += length;
-
-        return {ptr, length};
     }
 
     long long read_ll() {
         return static_cast<long long>(read_int64());
     }
 
-
-private:
-
-    // ntoh64 实现 (保持不变)
-    uint64_t ntoh64(uint64_t value) {
-        static const int num = 42;
-        if (*reinterpret_cast<const char*>(&num) == num) { // 小端系统
-            const uint32_t high = ntohl(static_cast<uint32_t>(value >> 32));
-            const uint32_t low = ntohl(static_cast<uint32_t>(value & 0xFFFFFFFF));
-            return (static_cast<uint64_t>(low) << 32) | high;
-        } else { // 大端系统
-            return value;
-        }
+    size_t read_size_t() {
+        return static_cast<size_t>(read_uint64());
     }
-};
 
+    bool read_bool() {
+        if (m_offset + 1 > m_size) {
+            throw std::out_of_range("Not enough data to read bool.");
+        }
+        unsigned char byte_value = m_data[m_offset];
+        m_offset += 1;
+        return byte_value != 0;
+    }
+
+    // ==========================================
+    // 字符串与容器读取
+    // ==========================================
+
+    std::string read_string() {
+        uint32_t length = read_uint32(); // 复用 read_uint32
+
+        if (m_offset + length > m_size) {
+            throw std::out_of_range("Not enough data to read string.");
+        }
+
+        // 直接从原始指针构造 string
+        std::string str(reinterpret_cast<const char*>(m_data + m_offset), length);
+        m_offset += length;
+        return str;
+    }
+
+    std::vector<unsigned char> read_uchar_vector() {
+        uint32_t length = read_uint32();
+
+        if (m_offset + length > m_size) {
+            throw std::out_of_range("Not enough data to read vector<unsigned char>.");
+        }
+
+        const unsigned char* start = m_data + m_offset;
+        std::vector<unsigned char> vec(start, start + length);
+
+        m_offset += length;
+        return vec;
+    }
+
+    // ==========================================
+    // 零拷贝 / View API / 嵌套解析
+    // ==========================================
+
+    std::string_view read_string_view() {
+        uint32_t length = read_uint32();
+
+        if (m_offset + length > m_size) {
+            throw std::out_of_range("Not enough data to read string_view.");
+        }
+
+        const char* ptr = reinterpret_cast<const char*>(m_data + m_offset);
+        m_offset += length;
+
+        return std::string_view(ptr, length);
+    }
+
+    // 返回 {指针, 长度}，用于 ZSTD 解压或 CRC 校验
+    std::pair<const unsigned char*, uint32_t> read_bytes_view() {
+        uint32_t length = read_uint32();
+
+        if (m_offset + length > m_size) {
+            throw std::out_of_range("Not enough data to read bytes view.");
+        }
+
+        const unsigned char* ptr = m_data + m_offset;
+        m_offset += length;
+
+        return {ptr, length};
+    }
+
+
+};
 
 
 
