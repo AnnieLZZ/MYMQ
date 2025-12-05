@@ -80,7 +80,7 @@ int main() {
 
     // 等待数据落盘/同步
     out("Waiting for server sync (3s)...");
-    std::this_thread::sleep_for(std::chrono::seconds(3));
+    std::this_thread::sleep_for(std::chrono::seconds(5));
 
     // --- 4. 拉取并校验数据 (Consumer Phase) ---
     out("\n--- [Phase 2] Verifying Messages ---");

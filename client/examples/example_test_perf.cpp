@@ -47,7 +47,7 @@ int main() {
     std::cout << "Preparing dataset (" << actual_gen_count << " items)... " << std::flush;
 
     // 生成随机 Value
-    auto message_values = generateRandomStringVector(actual_gen_count, MESSAGE_MIN_LEN, MESSAGE_MAX_LEN, 2);
+    auto message_values = generateRandomStringVector(actual_gen_count, MESSAGE_MIN_LEN, MESSAGE_MAX_LEN,1);
 
     // 生成 Key
     std::vector<std::string> message_keys(actual_gen_count);
@@ -61,6 +61,7 @@ int main() {
     mc.create_topic(TOPIC_NAME);
     mc.subscribe_topic(TOPIC_NAME);
     mc.join_group(GROUP_ID);
+    mc.set_local_pull_bytes_once(1048576000);
 
     // 等待连接建立
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -107,13 +108,13 @@ int main() {
 
     // 等待落盘/同步
     out("Waiting for server sync (5s)...");
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    std::this_thread::sleep_for(std::chrono::seconds(20));
 
 
     mc.trigger_pull();
-    std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
     // ==========================================
-    // Phase 2: Consumer Throughput (定量消费)
+    // Phase 2: Consumer Benchmark (Modified)
     // ==========================================
     out("\n--- [Phase 2] Consumer Benchmark Start ---");
 
@@ -122,79 +123,82 @@ int main() {
     int consumed_count = 0;
     long long consumed_bytes = 0;
 
-    // 超时保护
-    const int STALL_LIMIT_SEC = 30;
+    // 超时保护（Wall Clock）
+    const int STALL_LIMIT_SEC = 50;
     auto last_data_time = high_resolution_clock::now();
 
-    // 【修改点1】不再使用单一的 start/end，而是使用累积时间
-    std::chrono::duration<double> total_active_duration(0);
-
-    // 用于超时判断的墙钟时间（Wall Clock）依旧需要保留
+    // 用于记录总墙钟时间（仅供参考）
     auto wall_clock_start = high_resolution_clock::now();
+
+    // 【修改点1】定义累加器，用于存储 pull 返回的内部有效耗时
+    // 单位为 微秒(us
+    int64_t total_internal_cost_time = 0;
 
     while (consumed_count < NUM_MESSAGES) {
         res.clear();
 
-        // 【修改点2】记录本次操作的开始时间
-        auto batch_start_time = high_resolution_clock::now();
+        // 【修改点2】定义单次调用的耗时变量
+        int64_t current_batch_cost_us = 0;
 
-        // 执行拉取
-        auto err = mc.pull(res, 2000);
+        // 【修改点3】调用 pull，传入引用接收实际耗时
+        // 5000 是最大超时(ms)，current_batch_cost 将被赋值为实际处理时间
+        auto err = mc.pull(res, 5000, current_batch_cost_us);
 
-        // 【修改点3】判断是否有数据
         if (!res.empty()) {
-            // 只有获取到了数据，才进行统计和计时累加
+            // 只有成功拉取到数据，才计入有效吞吐量统计
             consumed_count += res.size();
+
+            // 【修改点4】直接累加底层返回的有效时间
+            total_internal_cost_time += current_batch_cost_us;
 
             for (const auto& msg : res) {
                 consumed_bytes += msg.getValue_view().size() + msg.getKey_view().size();
             }
 
-            // 记录本次操作结束时间
-            auto batch_end_time = high_resolution_clock::now();
-
-            // 【关键】：只累加这一段有效工作的时间
-            total_active_duration += (batch_end_time - batch_start_time);
-
-            // 更新活跃时间戳用于防死锁
+            // 更新活跃时间戳用于防死锁 (Wall Clock)
             last_data_time = high_resolution_clock::now();
 
             if (consumed_count % 500000 == 0) {
-                // 打印进度时，可以用 wall clock 算一个大概的进度感，或者只打印数量
                 std::cout << "Consumed " << consumed_count << " / " << NUM_MESSAGES << "...\r" << std::flush;
             }
         } else {
-            // --- 这里是空闲分支 ---
-            // 这里的耗时完全不计入 total_active_duration
+            // --- 空闲/超时分支 ---
+            // 这里没有数据，意味着 current_batch_cost 可能是纯等待时间，
+            // 对于"有效吞吐量"计算，通常不累加这段时间，或者根据你的定义决定是否累加。
+            // 这里保持原逻辑：只统计处理数据的部分，因此不操作 total_internal_cost_time。
 
-            // 错误检查与超时处理 (逻辑不变)
+            // 错误检查
             if (err != MYMQ_Public::ClientErrorCode::PULL_TIMEOUT &&
                 err != MYMQ_Public::ClientErrorCode::EMPTY_RECORD) {
                 std::cerr << "\nCritical Pull Error: " << MYMQ_Public::to_string(err) << std::endl;
                 break;
             }
+
+            // 全局超时判断
             auto now = high_resolution_clock::now();
             if (duration_cast<std::chrono::seconds>(now - last_data_time).count() > STALL_LIMIT_SEC) {
                 std::cerr << "\n[Timeout] Aborting." << std::endl;
                 break;
             }
-            // 避免空转占满 CPU，适当 yield，因为这里的时间已经被剔除了，所以 yield 不会影响你的吞吐量成绩
             std::this_thread::yield();
         }
     }
 
     std::cout << std::endl;
 
-    // 【修改点4】计算使用累积时间，防止时间为0导致除零异常
-    double duration_sec = total_active_duration.count();
+    double duration_sec = total_internal_cost_time / 1000000.0;
+
+    // 防止除零
     if (duration_sec < 0.000001) duration_sec = 0.000001;
 
-    // 额外打印总墙钟耗时供参考（可选）
+    // 额外打印总墙钟耗时供参考
     auto wall_clock_end = high_resolution_clock::now();
     duration<double> wall_diff = wall_clock_end - wall_clock_start;
-    std::cout << "Total Wall Clock Time: " << wall_diff.count() << " s (Includes idle wait)" << std::endl;
 
-    // 打印只包含有效处理时间的吞吐量
+    std::cout << "Total Wall Clock Time: " << wall_diff.count() << " s (Includes network wait)" << std::endl;
+    std::cout << "Total Effective Processing Time: " << duration_sec << " s" << std::endl;
+
+    // 打印吞吐量
     print_stats("Consumer (Effective)", duration_sec, consumed_count, consumed_bytes);
 
     return 0;

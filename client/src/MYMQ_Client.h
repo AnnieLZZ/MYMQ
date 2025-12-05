@@ -52,6 +52,12 @@ public:
                     ,MYMQ_Public::PushResponceCallback cb) ;
 
     Err_Client pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batc,size_t poll_wait_timeout_ms) ;
+    Err_Client pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
+                                    size_t poll_wait_timeout_ms,
+                                    int64_t& out_latency_us);
+
+
+
     void create_topic(const std::string& topicname,size_t parti_num=1);
     void set_pull_bytes(size_t bytes);
 
@@ -76,6 +82,7 @@ public:
      bool get_is_ingroup(){
         return is_ingroup.load();
     }
+    void set_local_pull_bytes_once(size_t bytes);
 
        void  trigger_poll_for_low_cap_pollbuffer();
 
@@ -86,6 +93,8 @@ private:
         const MYMQ::MYMQ_Client::TopicPartition& tp,                // 所属分区
         Err_Client& out_error                                       // 错误码传出
         ) ;
+
+
 
 
 
@@ -124,11 +133,11 @@ private:
     void push_timer_send();
     void out_group_reset();
     void cerr(const std::string& str){
-        // Printqueue::instance().out(str,1,0);
+        Printqueue::instance().out(str,1,0);
     }
 
     void out(const std::string& str){
-        // Printqueue::instance().out(str,0,0);
+        Printqueue::instance().out(str,0,0);
     }
 
 
@@ -143,7 +152,7 @@ private:
     size_t heartbeat_interval_ms;
     size_t memberid_wait_timeout_s;
     size_t commit_wait_timeout_s;
-    size_t poll_wait_timeout_s;
+
     size_t zstd_level;
     size_t local_pollqueue_size;
     size_t batch_size;
@@ -152,7 +161,8 @@ private:
     size_t autocommit_perior_ms;
     bool is_auto_commit;
     size_t max_in_flight_requests_num;
-    size_t autopoll_perior_ms;
+    std::atomic<size_t> local_pull_bytes_once{10000000};
+
 
     //Config配置项
 
@@ -200,7 +210,7 @@ private:
     std::string group_assign_str_retry{""};
 
 
-    std::atomic<size_t>  pull_bytes_once;
+    std::atomic<size_t>  pull_bytes_once_of_request;
 
     std::condition_variable cv_commit_ready;
     std::atomic<bool> commit_ready{0};
@@ -220,7 +230,7 @@ private:
     ShardedThreadPool& pool_=ShardedThreadPool::instance(8);
 
 
-    std::atomic<size_t> local_pull_bytes{10000000};
+
     std::vector<Workitem> m_todo_cache;
 
 
