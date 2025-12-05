@@ -22,14 +22,11 @@
 // 仅声明 cerr 函数
 void cerr(const std::string& message);
 void out(const std::string& str);
-std::string generateRandomString(int length, std::mt19937& rng, const std::string& charSet, int randomnessLevel);
-double getRepetitionProbability(int randomnessLevel);
 std::vector<std::string> generateRandomStringVector(
     int numStrings,
     int minLength,
     int maxLength,
-    int randomnessLevel, // 随机性级别参数 (1-5)，越高越随机
-    const std::string& charSet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789");
+    int mode);
 
 
 #endif // TEST_COMMON_HEADER_H

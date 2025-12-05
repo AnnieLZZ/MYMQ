@@ -55,16 +55,16 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         },10,10,1);
     }
 
-    void MYMQ_clientuse::poll_perioric_start(){
-        autopoll_taskid= timer.commit_ms([this]{
-            trigger_poll_for_low_cap_pollbuffer();
-        },autopoll_perior_ms,autopoll_perior_ms);
-    }
-    void MYMQ_clientuse::poll_perioric_stop(){
-        timer.commit_ms([this]{
-            timer.cancel_task(autopoll_taskid);
-        },10,10,1);
-    }
+    // void MYMQ_clientuse::poll_perioric_start(){
+    //     autopoll_taskid= timer.commit_ms([this]{
+    //         trigger_poll_for_low_cap_pollbuffer();
+    //     },autopoll_perior_ms,autopoll_perior_ms);
+    // }
+    // void MYMQ_clientuse::poll_perioric_stop(){
+    //     timer.commit_ms([this]{
+    //         timer.cancel_task(autopoll_taskid);
+    //     },10,10,1);
+    // }
 
 
     void MYMQ_clientuse::autocommit_start(){
@@ -183,6 +183,18 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
         return Err_Client::NULL_ERROR;
     }
+
+
+
+
+
+
+
+    void MYMQ_clientuse:: set_local_pull_bytes_once(size_t bytes){
+
+        local_pull_bytes_once.store(bytes);
+    }
+
 
     void MYMQ_clientuse::flush_batch_task(MYMQ::MYMQ_Client::Push_queue& pq) {
         MYMQ::MSG_serial::BatchBuffer* src_buf = pq.flushing_buf;
@@ -539,7 +551,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     total_payload_bytes += chunk_size;
                     gained_new_data_this_round = true;
 
-                    if (total_payload_bytes >= local_pull_bytes) {
+                    if (total_payload_bytes >= local_pull_bytes_once) {
                         goto PROCESS_PHASE;
                     }
                 }
@@ -618,6 +630,141 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
         return record_batch.empty() ? Err_Client::EMPTY_RECORD : Err_Client::NULL_ERROR;
     }
+
+    // 建议单位使用微秒 (us) 以获得更高精度，如果需要毫秒改为 milliseconds 即可
+    Err_Client MYMQ_clientuse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
+                                    size_t poll_wait_timeout_ms,
+                                    int64_t& out_latency_us) { // [修改1] 新增引用参数
+
+        // [修改2] 函数入口立即开始计时
+        auto start_time = std::chrono::steady_clock::now();
+
+        // [修改3] 定义一个简单的 lambda 用于在返回前更新时间
+        // 这样做的好处是不用在每个 return 前都写一遍 duration_cast
+        auto update_latency = [&]() {
+            auto now = std::chrono::steady_clock::now();
+            out_latency_us = std::chrono::duration_cast<std::chrono::microseconds>(now - start_time).count();
+        };
+
+        if (!record_batch.empty()) {
+            update_latency(); // 返回前更新
+            return Err_Client::INVALID_OPRATION;
+        }
+
+        // --- 1. 数据收集阶段 (Accumulate Phase) ---
+        size_t total_payload_bytes = 0;
+
+        // 计算绝对截止时间
+        // 注意：这里可以直接复用上面的 start_time，无需再次调用 now()，减少一次系统调用开销
+        auto deadline = start_time + std::chrono::milliseconds(poll_wait_timeout_ms);
+
+        size_t active_item_count = 0;
+        while (true) {
+            bool gained_new_data_this_round = false;
+
+            for (auto& [key, val_queue] : map_poll_queue) {
+                std::vector<unsigned char> raw_chunk;
+
+                if (val_queue.try_pop(raw_chunk)) {
+                    size_t chunk_size = raw_chunk.size();
+
+                    if (active_item_count < m_todo_cache.size()) {
+                        auto& item = m_todo_cache[active_item_count];
+
+                        item.index = active_item_count;
+                        item.tp = key;
+                        item.raw_big_chunk = std::move(raw_chunk);
+                        item.err = Err_Client::NULL_ERROR;
+
+                        item.parsed_records.clear();
+                    }
+                    else {
+                        m_todo_cache.emplace_back(active_item_count, key, std::move(raw_chunk));
+                    }
+
+                    // 指针后移，指向下一个可用槽位
+                    active_item_count++;
+
+                    total_payload_bytes += chunk_size;
+                    gained_new_data_this_round = true;
+
+                    if (total_payload_bytes >= local_pull_bytes_once) {
+                        goto PROCESS_PHASE;
+                    }
+                }
+            }
+            // B. 检查超时
+            if (std::chrono::steady_clock::now() >= deadline) {
+                break;
+            }
+
+            // C. 等待逻辑
+            if (!gained_new_data_this_round) {
+                std::unique_lock<std::mutex> ulock(mtx_poll_ready);
+
+                // 这里的 deadline 逻辑保持不变
+                bool signaled = cv_poll_ready.wait_until(ulock, deadline, [this] {
+                    return poll_ready.load();
+                });
+
+                if (signaled) {
+                    poll_ready.store(false);
+                } else {
+                    break;
+                }
+            }
+        }
+
+    PROCESS_PHASE:
+
+        if (m_todo_cache.empty()) {
+            update_latency(); // [修改4] 返回前更新 (超时返回)
+            return Err_Client::PULL_TIMEOUT;
+        }
+
+        // --- 2. 并行解析 (Parallel Parse) ---
+        tbb::parallel_for_each(m_todo_cache.begin(), m_todo_cache.begin() + active_item_count,
+                               [this](Workitem& item) {
+                                   this->call_parse_impl(item.raw_big_chunk, item.parsed_records, item.tp, item.err);
+                               });
+
+        // 标记是否发生了部分错误
+        bool has_partial_error = false;
+
+        for (size_t i = 0; i < active_item_count; ++i) {
+            auto& item = m_todo_cache[i];
+
+            if (item.err != Err_Client::NULL_ERROR) {
+                has_partial_error = true;
+                continue;
+            }
+
+            if (!item.parsed_records.empty()) {
+                size_t needed = record_batch.size() + item.parsed_records.size();
+                if (record_batch.capacity() < needed) {
+                    record_batch.reserve(needed);
+                }
+
+                record_batch.insert(
+                    record_batch.end(),
+                    std::make_move_iterator(item.parsed_records.begin()),
+                    std::make_move_iterator(item.parsed_records.end())
+                    );
+            }
+        }
+
+        if (record_batch.empty() && has_partial_error) {
+            update_latency(); // [修改5] 返回前更新 (错误返回)
+            return Err_Client::PARTIAL_PARASE_FAILED;
+        }
+
+        update_latency(); // [修改6] 返回前更新 (正常返回)
+        return record_batch.empty() ? Err_Client::EMPTY_RECORD : Err_Client::NULL_ERROR;
+    }
+
+
+
+
     void MYMQ_clientuse::create_topic(const std::string& topicname,size_t parti_num){
         MessageBuilder mb;
         mb.append_string(topicname);
@@ -629,7 +776,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     }
     void MYMQ_clientuse::set_pull_bytes(size_t bytes){
         if(bytes>1&&bytes<=MYMQ::pull_bytes_max){
-            pull_bytes_once.store(bytes);
+            pull_bytes_once_of_request.store(bytes);
         }
         else{
             cerr("Set pull bytes : OUT OF LIMITATION");
@@ -931,11 +1078,12 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             join_collect_timeout_ms=MYMQ::join_collect_timeout_ms;
             memberid_wait_timeout_s=MYMQ::memberid_ready_timeout_s;
             commit_wait_timeout_s=MYMQ::commit_ready_timeout_s;
-            pull_bytes_once=cm_business.get_size_t("pull_bytes");
+            pull_bytes_once_of_request=cm_business.get_size_t("pull_bytes_once_of_request");
             batch_size=cm_business.get_size_t("batch_size");
             autopush_perior_ms=cm_business.get_size_t ("autopush_perior_ms");
             autocommit_perior_ms=cm_business.get_size_t ("autocommit_perior_ms");
-            autopoll_perior_ms=cm_business.get_size_t("autopoll_perior_ms");
+            local_pull_bytes_once=cm_business.get_size_t("local_pull_bytes_once");
+
 
 
         }
@@ -1440,7 +1588,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     }
 
 
-                    size_t bytes= pull_bytes_once.load();
+                    size_t bytes= pull_bytes_once_of_request.load();
                     MB mb;
                     mb.append(groupid,topicname_,partition_,offset_next_to_consume,bytes);
                     send(Eve:: CLIENT_REQUEST_PULL,mb.data);
@@ -1465,7 +1613,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                 generation_id_local=info_consumer.generation_id;
             }
 
-            if(generation_id!=generation_id_local&&(groupstate_digit!=2)){
+            if(generation_id!=generation_id_local){
                 need_to_join=1;
             }
 
@@ -1645,7 +1793,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
                  size_t now_off= pollqueue.local_consume_offset.load();
-                 size_t bytes= pull_bytes_once.load();
+                 size_t bytes= pull_bytes_once_of_request.load();
                     MB mb;
                     mb.append(groupid,tp.topic,tp.partition,now_off,bytes);
                     send(Eve:: CLIENT_REQUEST_PULL,mb.data);

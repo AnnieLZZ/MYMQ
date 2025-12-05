@@ -1,4 +1,8 @@
 #include"test_common_header.h"
+
+#include <iomanip>
+#include <sstream>
+#include <chrono>
 void cerr(const std::string& str){
     std::cout<<str<<std::endl;
 }
@@ -7,87 +11,212 @@ void out(const std::string& str){
     std::cerr<<str<<std::endl;
 }
 
-double getRepetitionProbability(int randomnessLevel) {
-    switch (randomnessLevel) {
-    case 1: return 0.9; // 很高几率重复前一个字符
-    case 2: return 0.6; // 较高几率
-    case 3: return 0.3; // 中等几率
-    case 4: return 0.1; // 较低几率
-    case 5: return 0.0; // 不重复前一个字符，完全随机选择
-    default: return 0.0; // 默认最高随机性
-    }
+
+
+
+// 辅助函数：获取当前模拟时间字符串
+std::string getCurrentTimeStr() {
+    // 这里简单模拟一个时间戳，实际项目可用 std::put_time
+    static int sec_offset = 0;
+    sec_offset++;
+    int h = (10 + (sec_offset / 3600)) % 24;
+    int m = (sec_offset / 60) % 60;
+    int s = sec_offset % 60;
+
+    std::stringstream ss;
+    ss << "2025-12-04 "
+       << std::setw(2) << std::setfill('0') << h << ":"
+       << std::setw(2) << std::setfill('0') << m << ":"
+       << std::setw(2) << std::setfill('0') << s;
+    return ss.str();
 }
 
-// generateRandomString 函数保持不变，因为它需要一个已初始化的 rng
-std::string generateRandomString(int length, std::mt19937& rng, const std::string& charSet, int randomnessLevel) {
-    if (charSet.empty()) {
-        return ""; // 如果字符集为空，无法生成字符串
-    }
-    if (length <= 0) {
-        return ""; // 长度为零或负数，返回空字符串
-    }
+// 辅助函数：从列表中随机选一个
+std::string pickRandom(std::mt19937& rng, const std::vector<std::string>& list) {
+    std::uniform_int_distribution<> dist(0, list.size() - 1);
+    return list[dist(rng)];
+}
 
-    std::string randomString(length, ' ');
-    std::uniform_int_distribution<> charDist(0, charSet.length() - 1);
-    std::uniform_real_distribution<> probDist(0.0, 1.0); // 用于判断是否重复的概率分布
+// 1. 生成模拟日志行
+// 格式: [TIME] [LEVEL] [MODULE] Message...
+std::string generateLogLine(int targetLength, std::mt19937& rng) {
+    const std::vector<std::string> levels = {"INFO", "DEBUG", "WARN", "ERROR", "FATAL"};
+    const std::vector<std::string> modules = {"AuthSvc", "OrderDB", "PayGate", "UiRender", "NetWorker"};
+    const std::vector<std::string> msgs = {
+        "User login success", "Connection timed out", "Database query slow",
+        "Payment processed", "Invalid token received", "Cache miss", "Retrying connection"
+    };
 
-    double p_repeat = getRepetitionProbability(randomnessLevel);
+    std::stringstream ss;
+    ss << "[" << getCurrentTimeStr() << "] ";
+    ss << "[" << pickRandom(rng, levels) << "] ";
+    ss << "[" << pickRandom(rng, modules) << "] ";
+    ss << pickRandom(rng, msgs);
 
-    // 第一个字符总是从字符集中随机选择
-    randomString[0] = charSet[charDist(rng)];
+    std::string base = ss.str();
 
-    // 从第二个字符开始，考虑重复概率
-    for (int i = 1; i < length; ++i) {
-        if (p_repeat > 0.0 && probDist(rng) < p_repeat) {
-            // 如果满足重复条件，则重复前一个字符
-            randomString[i] = randomString[i-1];
-        } else {
-            // 否则，从字符集中随机选择一个新字符
-            randomString[i] = charSet[charDist(rng)];
+    // 如果长度不够，补全 trace ID 或 padding
+    if (base.length() < targetLength) {
+        base += " | tid:";
+        while (base.length() < targetLength) {
+            base += std::to_string(rng() % 10);
         }
     }
-    return randomString;
+    // 如果长度超出（一般保留截断或原样返回，这里选择截断以符合严格长度要求，但尽量保留头部）
+    if (base.length() > targetLength) {
+        base = base.substr(0, targetLength);
+    }
+    return base;
 }
 
-// 修改 generateRandomStringQueue 函数：
-// - 移除 seed 参数
-// - 将种子生成逻辑封装在函数内部
+// 2. 生成模拟 JSON
+// 格式: {"id": 123, "event": "...", "data": "..."}
+std::string generateJson(int targetLength, std::mt19937& rng) {
+    const std::vector<std::string> events = {"click", "view", "purchase", "heartbeat", "logout"};
+
+    std::stringstream ss;
+    ss << "{\"id\":" << (rng() % 100000) << ",";
+    ss << "\"ts\":" << std::time(nullptr) << ",";
+    ss << "\"type\":\"" << pickRandom(rng, events) << "\",";
+    ss << "\"payload\":\"";
+
+    std::string base = ss.str();
+    // 计算还需要填充多少字符才能凑够 targetLength (预留最后 "})
+    int paddingNeeded = targetLength - base.length() - 2;
+
+    if (paddingNeeded > 0) {
+        const char alphanum[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        std::uniform_int_distribution<> dist(0, sizeof(alphanum) - 2);
+        for(int i=0; i<paddingNeeded; ++i) {
+            base += alphanum[dist(rng)];
+        }
+    }
+
+    base += "\"}";
+    return base;
+}
+
+// 3. 生成 CSV / 结构化记录
+// 格式: UUID,UserId,Amount,Status,Region
+std::string generateCSV(int targetLength, std::mt19937& rng) {
+    const std::vector<std::string> status = {"PAID", "PENDING", "FAILED", "REFUNDED"};
+    const std::vector<std::string> regions = {"CN-HZ", "CN-BJ", "US-WEST", "EU-CENTRAL"};
+
+    std::stringstream ss;
+    // UUID part (fake)
+    ss << std::hex << rng() << rng() << "-" << std::dec;
+    ss << (1000 + rng() % 9000) << ","; // UserID
+    ss << (rng() % 1000) << "." << (rng() % 100) << ","; // Amount
+    ss << pickRandom(rng, status) << ",";
+    ss << pickRandom(rng, regions);
+
+    std::string base = ss.str();
+    // CSV 填充通常用 padding 字段
+    if (base.length() < targetLength) {
+        base += ",pad:";
+        while(base.length() < targetLength) {
+            base += 'X';
+        }
+    }
+    if (base.length() > targetLength) {
+        base = base.substr(0, targetLength);
+    }
+    return base;
+}
+
+// 4. 生成 URL / API 请求路径
+// 格式: /api/v1/user/12345/profile?token=xyz...
+std::string generateUrl(int targetLength, std::mt19937& rng) {
+    const std::vector<std::string> resources = {"user", "order", "product", "image", "static"};
+    const std::vector<std::string> actions = {"get", "update", "delete", "list", "sync"};
+
+    std::stringstream ss;
+    ss << "/api/v1/" << pickRandom(rng, resources) << "/"
+       << (rng() % 10000) << "/" << pickRandom(rng, actions) << "?t=";
+
+    std::string base = ss.str();
+    // 填充 Token 参数
+    if (base.length() < targetLength) {
+        const char hex[] = "0123456789abcdef";
+        std::uniform_int_distribution<> dist(0, 15);
+        while(base.length() < targetLength) {
+            base += hex[dist(rng)];
+        }
+    }
+    return base;
+}
+
+// 5. IoT 传感器数据
+// 格式: device_id=A101;temp=24.5;humid=60;vibration=0.02
+std::string generateSensorData(int targetLength, std::mt19937& rng) {
+    std::stringstream ss;
+    ss << "dev=" << (rng()%100) << ";";
+    ss << "T=" << (20 + (rng()%100)/10.0) << ";";
+    ss << "H=" << (40 + (rng()%100)/2.0) << ";";
+    ss << "V=" << (rng()%1000)/1000.0;
+
+    std::string base = ss.str();
+    // 填充
+    if (base.length() < targetLength) {
+        base += ";raw=";
+        while(base.length() < targetLength) {
+            base += std::to_string(rng() % 9);
+        }
+    }
+    return base;
+}
+
+// ==========================================
+// 主入口函数
+// ==========================================
+
 std::vector<std::string> generateRandomStringVector(
     int numStrings,
     int minLength,
     int maxLength,
-    int randomnessLevel, // 随机性级别参数 (1-5)
-    const std::string& charSet) {
+    int mode // 现在代表数据模式 (1-5)
 
+    ) {
     std::vector<std::string> stringVector;
-
     if (numStrings <= 0) return stringVector;
 
-    // 【优化】预分配内存，避免 vector 扩容带来的性能损耗
     stringVector.reserve(numStrings);
 
-    if (minLength <= 0) minLength = 1;
-    if (maxLength < minLength) maxLength = minLength;
-
-    // 验证随机性级别
-    if (randomnessLevel < 1) randomnessLevel = 1;
-    if (randomnessLevel > 5) randomnessLevel = 5;
-
-    // 种子生成逻辑
+    // 种子生成
     std::mt19937 rng;
     try {
         std::random_device rd;
         rng.seed(rd());
-    } catch (const std::exception& e) {
+    } catch (...) {
         rng.seed(static_cast<unsigned int>(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
     }
 
+    // 长度分布
+    if (minLength <= 0) minLength = 10;
+    if (maxLength < minLength) maxLength = minLength;
     std::uniform_int_distribution<> lengthDist(minLength, maxLength);
 
+    // 确保 mode 在范围内
+    int safeMode = mode;
+    if (safeMode < 1) safeMode = 1;
+    if (safeMode > 5) safeMode = 5;
+
     for (int i = 0; i < numStrings; ++i) {
-        // 使用 emplace_back 直接在 vector 尾部构造
-        stringVector.emplace_back(generateRandomString(lengthDist(rng), rng, charSet, randomnessLevel));
+        int currentLen = lengthDist(rng);
+        std::string result;
+
+        switch (safeMode) {
+        case 1: result = generateLogLine(currentLen, rng); break;
+        case 2: result = generateJson(currentLen, rng); break;
+        case 3: result = generateCSV(currentLen, rng); break;
+        case 4: result = generateUrl(currentLen, rng); break;
+        case 5: result = generateSensorData(currentLen, rng); break;
+        default: result = generateLogLine(currentLen, rng); break;
+        }
+        stringVector.emplace_back(std::move(result));
     }
 
     return stringVector;
 }
+
+
