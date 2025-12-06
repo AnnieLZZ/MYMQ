@@ -22,6 +22,95 @@ using Pollqueuemap=tbb::concurrent_hash_map<MYMQ_Public::TopicPartition,MYMQ::MY
 using TopicPartition=MYMQ_Public::TopicPartition;
 
 
+class MYMQ_Produceruse{
+public:
+    MYMQ_Produceruse(const std::string& clientid=std::string(),uint8_t ack_level=UINT8_MAX);
+    MYMQ_Produceruse(const MYMQ_Produceruse&)=delete;
+    MYMQ_Produceruse& operator= (const MYMQ_Produceruse&)=delete;
+    ~MYMQ_Produceruse();
+
+
+
+
+    Err_Client push(const MYMQ_Public::TopicPartition& tp,const std::string& key,const std::string& value
+                    ,MYMQ_Public::PushResponceCallback cb) ;
+
+  \
+
+
+    void create_topic(const std::string& topicname,size_t parti_num=1);
+
+private:
+
+
+    void flush_batch_task(MYMQ::MYMQ_Client::Push_queue& pq);
+    void finish_flush(MYMQ::MYMQ_Client::Push_queue& pq);
+
+
+    void push_perioric_start();
+    void push_perioric_stop();
+
+
+    void init(const std::string& clientid,uint8_t ack_level);
+
+
+    bool send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_=std::vector<MYMQ::MYMQ_Client::SparseCallback>());
+
+    MYMQ_Public::ResultVariant handle_response(Eve event_type,const Mybyte& msg_body);
+
+    void push_timer_send();
+    void cerr(const std::string& str){
+        Printqueue::instance().out(str,1,0);
+    }
+
+    void out(const std::string& str){
+        Printqueue::instance().out(str,0,0);
+    }
+
+
+    bool inrange(size_t obj,size_t min,size_t max){
+        return (obj<=max&&obj>=min);
+    }
+
+private:
+    //Config配置项
+    size_t zstd_level;
+    size_t batch_size;
+    size_t autopush_perior_ms;
+    size_t max_in_flight_requests_num;
+    size_t local_push_buffer_size;
+
+    //Config配置项
+    std::string path_;
+    Communication_client cmc_;
+
+    Timer timer;
+    size_t push_perioric_taskid{0};
+
+    ClientState state;
+    std::mutex mtx_state;
+
+
+    Consumerbasicinfo info_basic;
+
+    std::unordered_map<TopicPartition,MYMQ::MYMQ_Client::Push_queue> map_push_queue;
+
+
+    ZSTD_DCtx* dctx;
+    MYMQ::ACK_Level ack_level_;
+
+    tbb::enumerable_thread_specific<ZSTD_DCtx*> tbb_dctx_pool;
+    ShardedThreadPool& pool_=ShardedThreadPool::instance(8);
+
+
+};
+
+
+
+
+
+
+
 
 
 class MYMQ_clientuse{
@@ -180,7 +269,7 @@ private:
     size_t autopoll_taskid{0};
 
 
-
+    MYMQ::MYMQ_Client::RecordAccumulator accmulator;
 
     ClientState state;
     std::mutex mtx_state;

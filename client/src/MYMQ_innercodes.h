@@ -33,7 +33,8 @@
 #include <iomanip>
 #include<functional>
 #include"MYMQ_Publiccodes.h"
-
+#include"tbb/concurrent_unordered_map.h"
+#include<memory>
 
 
 namespace MYMQ { // 推荐使用命名空间进一步封装
@@ -624,6 +625,30 @@ private:
 
     const size_t high_level_capacity;
     const size_t low_level_capacity;
+};
+
+
+
+class RecordAccumulator {
+public:
+    using PushQueuePtr = std::shared_ptr<Push_queue>;
+
+private:
+    tbb::concurrent_unordered_map<MYMQ_Public::TopicPartition, PushQueuePtr> batches;
+
+public:
+    PushQueuePtr get_queue(const MYMQ_Public::TopicPartition& tp,size_t buffer_size) {
+        auto it = batches.find(tp);
+        if (it != batches.end()) {
+            return it->second;
+        }
+
+        auto new_queue = std::make_shared<Push_queue>(tp,buffer_size);
+
+        // 原子插入
+        auto result = batches.emplace(tp, new_queue);
+        return result.first->second;
+    }
 };
 
 
