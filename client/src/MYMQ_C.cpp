@@ -1,6 +1,36 @@
 #include "MYMQ_C.h"
 #include "MYMQ_CLIENT.H"
 
+
+
+
+
+MYMQ_Producer::MYMQ_Producer(const std::string& clientid, uint8_t ack_level)
+    : pimpl(std::make_unique<MYMQ_Produceruse>(clientid, ack_level)) {
+}
+
+
+MYMQ_Producer::~MYMQ_Producer() = default;
+
+Err_Client MYMQ_Producer::push(const MYMQ_Public::TopicPartition& tp,
+                               const std::string& key,
+                               const std::string& value,
+                               MYMQ_Public::PushResponceCallback cb) {
+    return pimpl->push(tp, key, value, cb);
+}
+
+void MYMQ_Producer::create_topic(const std::string& topicname, size_t parti_num) {
+    pimpl->create_topic(topicname, parti_num);
+}
+
+
+
+
+
+
+
+
+
 MYMQ_Client::MYMQ_Client(const std::string& clientid, uint8_t ack_level)
     : pimpl(std::make_unique<MYMQ_clientuse>(clientid, ack_level))
 {
