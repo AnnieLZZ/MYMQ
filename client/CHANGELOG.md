@@ -79,3 +79,14 @@ ACK_NORESPONCE时不予设置回调，即发即忘，ACK_PROMISE_INDISK时保证
 - **其他**: 测试用例调整
 
 
+---
+
+## v3.2.0(2025-12-6)
+
+- **版本更新**: 更新项目版本至 v3.2.0
+- **更新细则**: 
+1 新增了MYMQ_Produceruse类，外部用MYMQ_Producer，调用原类的生产者方法
+2 新增了MYMQ::MYMQ_Client::RecordAccumulator，是对map_pushqueue的封装
+- **其他**: 测试用例调整
+
+
