@@ -7,16 +7,17 @@
 #include <chrono>
 #include <atomic>
 
+// 假设头文件中已包含 MYMQ_Producer 的定义，如果没有请确保包含
+// #include "MYMQ_Producer.h"
+
 // --- 性能测试配置 ---
-const int NUM_MESSAGES = 4000000;      // 总测试消息量
+const int NUM_MESSAGES = 4000000;       // 总测试消息量
 const int MESSAGE_MIN_LEN = 1023;
 const int MESSAGE_MAX_LEN = 1024;
 const std::string TOPIC_NAME = "perf_test_topic";
 const std::string GROUP_ID = "perf_group";
 
 // --- 内存优化配置 ---
-// true: 只生成 POOL_SIZE 条随机数据，发送时循环使用（节省内存，推荐）
-// false: 生成 NUM_MESSAGES 条全量唯一数据（如果 NUM_MESSAGES 很大，可能占用 5GB+ 内存导致崩溃）
 const bool USE_DATA_POOL = true;
 const int POOL_SIZE = 100000;    // 随机数据池大小
 
@@ -29,7 +30,7 @@ void print_stats(const std::string& phase, double duration_sec, int total_msgs, 
 
     std::cout << "\n[" << phase << " Results]" << std::endl;
     std::cout << "  Duration:   " << std::fixed << std::setprecision(3) << duration_sec << " s" << std::endl;
-    std::cout << "  Count:      " << total_msgs << " messages" << std::endl;
+    std::cout << "  Count:       " << total_msgs << " messages" << std::endl;
     std::cout << "  Throughput: " << std::fixed << std::setprecision(2) << ops << " ops/sec" << std::endl;
     std::cout << "  Bandwidth:  " << std::fixed << std::setprecision(2) << mb_s << " MB/sec" << std::endl;
     std::cout << "-------------------------------------------" << std::endl;
@@ -37,8 +38,8 @@ void print_stats(const std::string& phase, double duration_sec, int total_msgs, 
 
 int main() {
     std::cout << "===========================================" << std::endl;
-    std::cout << "       MYMQ Performance Benchmark          " << std::endl;
-    std::cout << "       (Random Payload / ZSTD Ready)       " << std::endl;
+    std::cout << "        MYMQ Performance Benchmark          " << std::endl;
+    std::cout << "      (Producer / Consumer Separated)       " << std::endl;
     std::cout << "===========================================" << std::endl;
     std::cout << "Target Messages: " << NUM_MESSAGES << std::endl;
 
@@ -47,7 +48,7 @@ int main() {
     std::cout << "Preparing dataset (" << actual_gen_count << " items)... " << std::flush;
 
     // 生成随机 Value
-    auto message_values = generateRandomStringVector(actual_gen_count, MESSAGE_MIN_LEN, MESSAGE_MAX_LEN,1);
+    auto message_values = generateRandomStringVector(actual_gen_count, MESSAGE_MIN_LEN, MESSAGE_MAX_LEN, 1);
 
     // 生成 Key
     std::vector<std::string> message_keys(actual_gen_count);
@@ -56,9 +57,13 @@ int main() {
     }
     std::cout << "Done." << std::endl;
 
-    // --- 2. 初始化客户端 ---
-    MYMQ_Client mc("perf_client", 0);
-    mc.create_topic(TOPIC_NAME);
+    // --- 2. 初始化客户端与生产者 ---
+    // [修改点] 初始化生产者，负责建Topic和发消息
+    MYMQ_Producer mp("perf_producer", 1);
+    mp.create_topic(TOPIC_NAME);
+
+    // [修改点] 初始化消费者(Client)，负责订阅和拉取
+    MYMQ_Client mc("perf_consumer", 0);
     mc.subscribe_topic(TOPIC_NAME);
     mc.join_group(GROUP_ID);
     mc.set_local_pull_bytes_once(1048576000);
@@ -83,7 +88,8 @@ int main() {
         const std::string& key = message_keys[index];
         const std::string& val = message_values[index];
 
-        MYMQ_Public::ClientErrorCode err = mc.push(
+        // [修改点] 使用 mp (Producer) 发送消息
+        MYMQ_Public::ClientErrorCode err = mp.push(
             MYMQ_Public::TopicPartition(TOPIC_NAME, 0),
             key,
             val
@@ -107,12 +113,13 @@ int main() {
     print_stats("Producer", diff_push.count(), push_count, push_bytes);
 
     // 等待落盘/同步
-    out("Waiting for server sync (5s)...");
+    out("Waiting for server sync (20s)...");
     std::this_thread::sleep_for(std::chrono::seconds(20));
 
-
+    // [修改点] 触发消费者的拉取预热 (如果是Client端主动拉取模式，通常需要先触发一下或者让后台线程跑起来)
     mc.trigger_pull();
     std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+
     // ==========================================
     // Phase 2: Consumer Benchmark (Modified)
     // ==========================================
@@ -130,25 +137,23 @@ int main() {
     // 用于记录总墙钟时间（仅供参考）
     auto wall_clock_start = high_resolution_clock::now();
 
-    // 【修改点1】定义累加器，用于存储 pull 返回的内部有效耗时
-    // 单位为 微秒(us
+    // 定义累加器，用于存储 pull 返回的内部有效耗时 (us)
     int64_t total_internal_cost_time = 0;
 
     while (consumed_count < NUM_MESSAGES) {
         res.clear();
 
-        // 【修改点2】定义单次调用的耗时变量
+        // 定义单次调用的耗时变量
         int64_t current_batch_cost_us = 0;
 
-        // 【修改点3】调用 pull，传入引用接收实际耗时
-        // 5000 是最大超时(ms)，current_batch_cost 将被赋值为实际处理时间
+        // [修改点] 使用 mc (Consumer) 拉取消息
         auto err = mc.pull(res, 5000, current_batch_cost_us);
 
         if (!res.empty()) {
             // 只有成功拉取到数据，才计入有效吞吐量统计
             consumed_count += res.size();
 
-            // 【修改点4】直接累加底层返回的有效时间
+            // 直接累加底层返回的有效时间
             total_internal_cost_time += current_batch_cost_us;
 
             for (const auto& msg : res) {
@@ -163,10 +168,6 @@ int main() {
             }
         } else {
             // --- 空闲/超时分支 ---
-            // 这里没有数据，意味着 current_batch_cost 可能是纯等待时间，
-            // 对于"有效吞吐量"计算，通常不累加这段时间，或者根据你的定义决定是否累加。
-            // 这里保持原逻辑：只统计处理数据的部分，因此不操作 total_internal_cost_time。
-
             // 错误检查
             if (err != MYMQ_Public::ClientErrorCode::PULL_TIMEOUT &&
                 err != MYMQ_Public::ClientErrorCode::EMPTY_RECORD) {

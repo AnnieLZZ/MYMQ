@@ -621,28 +621,28 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     // 建议单位使用微秒 (us) 以获得更高精度，如果需要毫秒改为 milliseconds 即可
     Err_Client MYMQ_clientuse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
                                     size_t poll_wait_timeout_ms,
-                                    int64_t& out_latency_us) { // [修改1] 新增引用参数
+                                    int64_t& out_latency_us) {
 
-        // [修改2] 函数入口立即开始计时
+        // --- 0. 初始化计时器 ---
         auto start_time = std::chrono::steady_clock::now();
+        // 用于累计纯等待（Sleep）的时间
+        std::chrono::microseconds total_wait_duration(0);
 
-        // [修改3] 定义一个简单的 lambda 用于在返回前更新时间
-        // 这样做的好处是不用在每个 return 前都写一遍 duration_cast
-        auto update_latency = [&]() {
+        // 定义计算纯净耗时的 Lambda：总时间 - 睡大觉的时间 = 真正干活的时间
+        auto update_pure_latency = [&]() {
             auto now = std::chrono::steady_clock::now();
-            out_latency_us = std::chrono::duration_cast<std::chrono::microseconds>(now - start_time).count();
+            auto total_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - start_time);
+            out_latency_us = (total_elapsed - total_wait_duration).count();
         };
 
         if (!record_batch.empty()) {
-            update_latency(); // 返回前更新
+            out_latency_us = 0;
             return Err_Client::INVALID_OPRATION;
         }
 
         // --- 1. 数据收集阶段 (Accumulate Phase) ---
         size_t total_payload_bytes = 0;
 
-        // 计算绝对截止时间
-        // 注意：这里可以直接复用上面的 start_time，无需再次调用 now()，减少一次系统调用开销
         auto deadline = start_time + std::chrono::milliseconds(poll_wait_timeout_ms);
 
         size_t active_item_count = 0;
@@ -652,9 +652,11 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             for (auto& [key, val_queue] : map_poll_queue) {
                 std::vector<unsigned char> raw_chunk;
 
+                // try_pop 是内存操作，属于有效工作时间，会自动计入
                 if (val_queue.try_pop(raw_chunk)) {
                     size_t chunk_size = raw_chunk.size();
 
+                    // 缓存复用逻辑
                     if (active_item_count < m_todo_cache.size()) {
                         auto& item = m_todo_cache[active_item_count];
 
@@ -680,19 +682,27 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     }
                 }
             }
+
             // B. 检查超时
             if (std::chrono::steady_clock::now() >= deadline) {
                 break;
             }
 
-            // C. 等待逻辑
+            // C. 等待逻辑 (核心修改点)
             if (!gained_new_data_this_round) {
                 std::unique_lock<std::mutex> ulock(mtx_poll_ready);
 
-                // 这里的 deadline 逻辑保持不变
+                // === [开始] 记录等待时间 ===
+                auto wait_start = std::chrono::steady_clock::now();
+
                 bool signaled = cv_poll_ready.wait_until(ulock, deadline, [this] {
                     return poll_ready.load();
                 });
+
+                auto wait_end = std::chrono::steady_clock::now();
+                // 累加这段“无用”时间
+                total_wait_duration += std::chrono::duration_cast<std::chrono::microseconds>(wait_end - wait_start);
+                // === [结束] 记录等待时间 ===
 
                 if (signaled) {
                     poll_ready.store(false);
@@ -705,11 +715,12 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     PROCESS_PHASE:
 
         if (m_todo_cache.empty()) {
-            update_latency(); // [修改4] 返回前更新 (超时返回)
+            update_pure_latency(); // 计算耗时
             return Err_Client::PULL_TIMEOUT;
         }
 
         // --- 2. 并行解析 (Parallel Parse) ---
+        // CPU 密集型操作，属于有效工作时间
         tbb::parallel_for_each(m_todo_cache.begin(), m_todo_cache.begin() + active_item_count,
                                [this](Workitem& item) {
                                    this->call_parse_impl(item.raw_big_chunk, item.parsed_records, item.tp, item.err);
@@ -732,6 +743,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     record_batch.reserve(needed);
                 }
 
+                // 结果聚合，内存拷贝，属于有效工作时间
                 record_batch.insert(
                     record_batch.end(),
                     std::make_move_iterator(item.parsed_records.begin()),
@@ -740,15 +752,15 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             }
         }
 
+        // --- 3. 最终耗时计算 ---
+        update_pure_latency();
+
         if (record_batch.empty() && has_partial_error) {
-            update_latency(); // [修改5] 返回前更新 (错误返回)
             return Err_Client::PARTIAL_PARASE_FAILED;
         }
 
-        update_latency(); // [修改6] 返回前更新 (正常返回)
         return record_batch.empty() ? Err_Client::EMPTY_RECORD : Err_Client::NULL_ERROR;
     }
-
 
 
 
@@ -1488,7 +1500,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
                 is_ingroup.store(1);
-                trigger_poll_for_low_cap_pollbuffer();
+                //trigger_poll_for_low_cap_pollbuffer();
                 heartbeat_start();
                 push_perioric_start();
 
@@ -1816,6 +1828,9 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
         // 1. 基础状态检查
 
+        if(!is_register()){
+            return Err_Client::NOT_REGISTER;
+        }
 
         size_t curr_fly = SIZE_MAX;
         cmc_.get_curr_flying_request_num(curr_fly);
@@ -1958,6 +1973,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             local_push_buffer_size=cm_business.get_size_t("local_push_buffer_size");
         }
 
+        push_perioric_start();
     }
 
 
@@ -2208,7 +2224,14 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         return MYMQ_Public::CommonErrorCode::NULL_ERROR;
     }
 
+
+    bool MYMQ_Produceruse::is_register(){
+        return cmc_.get_is_register();
+    }
     void MYMQ_Produceruse::push_timer_send() {
+        if(!is_register()){
+            return ;
+        }
 
         // 2. 遍历所有分区队列
         // 假设 map_push_queue 是 tbb::concurrent_hash_map 或 std::unordered_map
