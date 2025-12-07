@@ -633,10 +633,16 @@ class RecordAccumulator {
 public:
     using PushQueuePtr = std::shared_ptr<Push_queue>;
 
+    using PushqueueMap = tbb::concurrent_unordered_map<TopicPartition, std::shared_ptr<Push_queue>>;
+
 private:
-    tbb::concurrent_unordered_map<MYMQ_Public::TopicPartition, PushQueuePtr> batches;
+    PushqueueMap batches;
 
 public:
+
+
+    PushqueueMap::iterator begin() { return batches.begin(); }
+    PushqueueMap::iterator end() { return batches.end(); }
     PushQueuePtr get_queue(const MYMQ_Public::TopicPartition& tp,size_t buffer_size) {
         auto it = batches.find(tp);
         if (it != batches.end()) {

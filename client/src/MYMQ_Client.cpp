@@ -1825,14 +1825,9 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         }
 
 
-        auto it = map_push_queue.find(tp);
-        if (it == map_push_queue.end()) {
-            map_push_queue.emplace(std::piecewise_construct,
-                                       std::forward_as_tuple(tp),
-                                       std::forward_as_tuple(tp,batch_size));
-        }
+        auto it=recordaccumulator.get_queue(tp,local_push_buffer_size);
 
-        auto& push_queue = it->second;
+        auto& push_queue=*it;
         std::unique_lock<std::mutex> ulock(push_queue.mtx);
 
         // 3. 检查压缩上下文
@@ -2218,10 +2213,10 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         // 2. 遍历所有分区队列
         // 假设 map_push_queue 是 tbb::concurrent_hash_map 或 std::unordered_map
         // 如果是 TBB map，遍历通常是线程安全的，但要注意锁粒度
-        for (auto& it : map_push_queue) {
+        for (auto it = recordaccumulator.begin(); it != recordaccumulator.end(); ++it) {
             // key 是 partition string, value 是 Push_queue
-            const TopicPartition& pq_key = it.first;
-            auto& pq = it.second;
+            const TopicPartition& pq_key = (*it).first;
+            auto& pq = *((*it).second);
 
             // 【优化】无锁预检查 (Dirty Check)
             // active_buf 是指针，读取指针指向的 size 是相对安全的（哪怕读到旧值也没事，下次再发）

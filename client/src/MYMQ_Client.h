@@ -23,6 +23,8 @@ using TopicPartition=MYMQ_Public::TopicPartition;
 
 
 class MYMQ_Produceruse{
+
+
 public:
     MYMQ_Produceruse(const std::string& clientid=std::string(),uint8_t ack_level=UINT8_MAX);
     MYMQ_Produceruse(const MYMQ_Produceruse&)=delete;
@@ -93,7 +95,7 @@ private:
 
     Consumerbasicinfo info_basic;
 
-    std::unordered_map<TopicPartition,MYMQ::MYMQ_Client::Push_queue> map_push_queue;
+    MYMQ::MYMQ_Client::RecordAccumulator recordaccumulator;
 
 
     ZSTD_DCtx* dctx;
