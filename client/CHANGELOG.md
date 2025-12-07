@@ -89,4 +89,13 @@ ACK_NORESPONCE时不予设置回调，即发即忘，ACK_PROMISE_INDISK时保证
 2 新增了MYMQ::MYMQ_Client::RecordAccumulator，是对map_pushqueue的封装
 - **其他**: 测试用例调整
 
+---
+
+## v3.2.1(2025-12-7)
+
+- **版本更新**: 更新项目版本至 v3.2.1
+- **更新细则**: 
+1 增加错误码NOT_REGISTER标识该实例未注册
+2 新增生产者新增检查注册的函数，所有网络请求方法都必须先检查
+3 pull的测试重载版本修正，现在不会记录空等时间
 
