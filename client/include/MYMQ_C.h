@@ -32,7 +32,7 @@ public:
     ClientErrorCode push(const MYMQ_Public::TopicPartition& tp,
                     const std::string& key,
                     const std::string& value,
-                    MYMQ_Public::PushResponceCallback cb);
+                    MYMQ_Public::PushResponceCallback cb=MYMQ_Public::PushResponceCallback());
 
     void create_topic(const std::string& topicname, size_t parti_num = 1);
 

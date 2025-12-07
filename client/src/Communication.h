@@ -216,6 +216,9 @@ public:
         ack_level=set;
     }
 
+    bool get_is_register(){
+        return is_registered.load();
+    }
     bool send_msg(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler) {
         MessageBuilder mb;
         // 1. 获取 ID
@@ -692,6 +695,7 @@ private:
                                 } else {
                                     std::cerr << "[" << now_ms_time_gen_str() << "] Not yet registered but received Event." << std::endl;
                                 }
+
                             } else {
 
                                 MP mp(client_state.body_buffer.data(),client_state.body_buffer.size());

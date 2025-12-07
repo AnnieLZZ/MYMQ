@@ -61,6 +61,7 @@ private:
     MYMQ_Public::ResultVariant handle_response(Eve event_type,const Mybyte& msg_body);
 
     void push_timer_send();
+    bool is_register();
     void cerr(const std::string& str){
         Printqueue::instance().out(str,1,0);
     }
