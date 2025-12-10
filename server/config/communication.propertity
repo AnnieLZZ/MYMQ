@@ -1,3 +1,4 @@
+IP=192.168.60.128
 port=50000
 headersize=12
 msgbodylimit_len=1048576

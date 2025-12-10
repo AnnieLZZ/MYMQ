@@ -15,6 +15,7 @@
 #include"Logsegment.h"
 #include"MYMQ_innercodes.h"
 #include"MYMQ_Server_ns.h"
+#include"Controller.h"
 
 
 using Record=MYMQ::MSG_serial::Record;
@@ -28,16 +29,11 @@ using Eve=MYMQ::EventType;
 using ConsumerGroupState=MYMQ_Server::ConsumerGroupState;
 using ServerConsumerInfo=MYMQ_Server::ServerConsumerInfo;
 using Byte_view_pair=std::pair<const unsigned char*, uint32_t>;
-
-
-class Topic;
-struct Topicmap{
-    std::unordered_map<std::string,std::unique_ptr<Topic>> topics_;
-    std::shared_mutex mtx_topic;
-};
-
-
 using Gstate=ConsumerGroupState::GroupState;
+class Partition;
+using TopicPartition=MYMQ_Public::TopicPartition;
+using TopicPartition_to_Log_Map=tbb::concurrent_hash_map<TopicPartition,std::shared_ptr< Partition>,TbbHashCompare>;
+
 /////函数声明区
 
 
@@ -69,34 +65,73 @@ public:
     }
 
     Err save_msg(const Byte_view_pair& msg_view) {
-        std::unique_lock<std::shared_mutex> lock(mtx_file);
-        auto [offset,err] = curr_write_segment->append(msg_view);
+        LogSegment* segment_to_write = nullptr;
 
-                if (err==Err::FULL_SEGMENT) {
-            create_new_segment(curr_write_segment->next_offset());
-            curr_write_segment = segments_.back().get();
-            auto  pair = curr_write_segment->append(msg_view);
-            if (pair.second != Err::NULL_ERROR) {
-                throw std::runtime_error("Failed to append message even after creating new segment.");
+        // 1. 尝试使用共享锁获取当前 Segment 并写入
+        // 共享锁允许 Reader 和其他 Writer 同时进入这里
+        {
+            std::shared_lock<std::shared_mutex> read_lock(mtx_file);
+            segment_to_write = curr_write_segment;
+
+            // 注意：这里我们持有的是 Partition 的读锁，
+            // 但 LogSegment::append 内部有它自己的互斥锁，所以是安全的。
+            auto [offset, err] = segment_to_write->append(msg_view);
+
+            if (err != Err::FULL_SEGMENT) {
+                // 写入成功（或非 Full 错误），更新 EndOffset 并返回
+                if (err == Err::NULL_ERROR) {
+                    uint64_t next_val = curr_write_segment->next_offset();
+                    end_offset.store(next_val, std::memory_order_release);
+                }
+                return err;
             }
-            offset=pair.first;
+        }
+        // <--- 读锁释放
+
+        // 2. 如果走到这里，说明 Segment 满了，需要轮转文件
+        // 获取独占锁（写锁），这会阻塞 Reader 和其他 Writer
+        std::unique_lock<std::shared_mutex> write_lock(mtx_file);
+
+        // Double Check Pattern (双重检查)
+        // 可能在释放读锁到获取写锁期间，别的线程已经创建了新 Segment
+        if (curr_write_segment != segment_to_write) {
+            // 已经被别的线程轮转过了，尝试直接写入新的 Segment
+            auto [offset, err] = curr_write_segment->append(msg_view);
+            if (err == Err::NULL_ERROR) {
+
+            }
+            return err; // 无论是否再次 Full，这里简单返回，或者你可以做循环重试
         }
 
-        uint64_t next_val = curr_write_segment->next_offset();
-            end_offset.store(next_val, std::memory_order_release);
-        return Err::NULL_ERROR;
+        // 确实满了，创建新 Segment
+        create_new_segment(curr_write_segment->next_offset());
+        curr_write_segment = segments_.back().get();
+
+        // 写入新 Segment
+        auto pair = curr_write_segment->append(msg_view);
+        if (pair.second == Err::NULL_ERROR) {
+             uint64_t next_val = curr_write_segment->next_offset();
+             end_offset.store(next_val, std::memory_order_release);
+        }
+
+        return pair.second;
     }
 
-    MesLoc get_msg(size_t target_offset,size_t byte_need) {
-        std::shared_lock<std::shared_mutex> lock(mtx_file);
 
-        LogSegment* target_seg= find_segment(target_offset);
-        if (target_seg==nullptr) {
+    MesLoc get_msg(size_t target_offset, size_t byte_need) {
+        LogSegment* target_seg = nullptr;
+
+        // 1. 临界区仅限于查找 Segment 指针
+        {
+            std::shared_lock<std::shared_mutex> lock(mtx_file);
+            target_seg = find_segment(target_offset);
+        }
+
+        if (target_seg == nullptr) {
             return MesLoc{};
         }
 
-        return target_seg->find(target_offset,byte_need);
-
+        return target_seg->find(target_offset, byte_need);
     }
 
 
@@ -279,7 +314,7 @@ private:
 
 class Partition {
 public:
-    Partition(const std::string& data_root_dir, const std::string& topicname, int parti_id,bool is_belong_consumer_offset=0)
+    Partition(const std::string& data_root_dir, const std::string& topicname, size_t parti_id,bool is_belong_consumer_offset=0)
         :   owner_topic_(topicname) {
         // 构建分区的数据目录路径：data_root_dir/topicname/ParX
         partition_data_dir_ = data_root_dir + "/" + topicname + "/Par" + std::to_string(parti_id);
@@ -298,7 +333,7 @@ public:
 
     }
 
-    MesLoc pull(size_t target_offset,size_t byte_need){
+    MesLoc pull(size_t target_offset,size_t byte_need) const{
 
         return msg_stor->get_msg(target_offset,byte_need);
     }
@@ -497,8 +532,8 @@ class GroupCoordinator :public std::enable_shared_from_this<GroupCoordinator>{
 
 public:
 
-    GroupCoordinator(const std::shared_ptr<ConsumerOffset>& consumer_offset_manager,Topicmap& topics_)
-        : consumer_offset_manager_(consumer_offset_manager),topics_map(topics_) {
+    GroupCoordinator(const std::shared_ptr<ConsumerOffset>& consumer_offset_manager,std::shared_ptr<MetadataCache> metadata_ptr)
+        : consumer_offset_manager_(consumer_offset_manager),cache_metadata_ptr(metadata_ptr) {
 
 
     }
@@ -892,28 +927,6 @@ private:
 
         }
 
-        mb.append_size_t(set_this_group_partitionnum_of_topic.size());
-
-
-        {
-             std::shared_lock<std::shared_mutex> slock(topics_map.mtx_topic);
-            for(auto& topic:set_this_group_partitionnum_of_topic){
-
-                mb.append_string(topic);
-                auto it=topics_map.topics_.find(topic);
-                if(it==topics_map.topics_.end()){
-                    mb.append_size_t(0);
-                }
-                else{
-                    mb.append_size_t( it->second->get_parti_num());
-                }
-            }
-
-        }
-
-
-
-
         return mb.data;
     }
 
@@ -1137,7 +1150,7 @@ private:
     int rebalance_timeout_ms=MYMQ::rebalance_timeout_ms; // 重平衡超时时长
     bool init_ed{0};
 
-    Topicmap& topics_map;
+   std::shared_ptr<MetadataCache>  cache_metadata_ptr;
 
 };
 
@@ -1147,7 +1160,7 @@ class MessageQueue : public std::enable_shared_from_this<MessageQueue> {
 public:
     explicit MessageQueue(const std::string& data_root_dir = "./data/")
         : data_root_dir_(data_root_dir),
-          topics_metadata_filename_(data_root_dir_ + "/topics_metadata.conf")
+          topics_metadata_filename_(data_root_dir_ + "/topics_metadata.conf"),cache_metadata(nullptr)
 
     {
         std::filesystem::create_directories(data_root_dir_);
@@ -1158,7 +1171,7 @@ public:
         if (!consumer_offset_topic_ptr_) {
             // 如果元数据文件不存在，或者文件中没有 MYMQ::consumeroffset_name 的条目，则在此处创建
             std::cerr << "Warning: Special topic '" << MYMQ::consumeroffset_name << "' not found in metadata. Creating with default partitions (10)." << std::endl;
-            consumer_offset_topic_ptr_ = std::make_unique<Topic>(MYMQ::consumeroffset_name, data_root_dir_, 10);
+            consumer_offset_topic_ptr_ = std::make_unique<Topic>(MYMQ::consumeroffset_name, data_root_dir_, MYMQ::PARTITION_NUM_OF_CONSUMER_OFFSET_TOPIC);
             // 由于是新创建的，需要立即保存到元数据文件
             save_topics_metadata();
         }
@@ -1185,31 +1198,36 @@ public:
         Config_manager cm_sys("config/system.properity");
         auto core_num=cm_sys.getint("max_threadnum");
         ThreadPool::instance(core_num).start();
+        Config_manager cm_communication("config/communication.propertity");
+
+        std::string server_IP;
+        size_t PORT;
+        try {
+           server_IP= cm_communication.getstring("communication.propertity");
+        } catch (std::exception& e) {
+            cerr("IP not found");
+        }
+        PORT= cm_communication.get_size_t("port");
+        cache_metadata=std::make_shared<MetadataCache>(server_IP,PORT);
     }
 
 
     size_t get_partition_endoffset(const std::string& topicname,size_t partition ){
 
-
-        std::shared_lock<std::shared_mutex> slock(topicmap.mtx_topic);
-        auto it= topicmap.topics_.find(topicname);
-        if(it==topicmap.topics_.end()){
-            cerr("Topic not found.") ;
-            slock.unlock();
-            return UINT64_MAX;
-
+        TopicPartition_to_Log_Map::const_accessor cac;
+        if(! map_tp_to_log .find(cac,TopicPartition(topicname,partition))){
+           return SIZE_MAX;
         }
-        slock.unlock();
-        return   it->second->get_endoffset(partition);
+        auto partition_ptr=cac->second;
+        cac.release();
 
-
-
+        return  partition_ptr->get_endoffset();
     }
     void load_topics_metadata() {
         std::ifstream ifs(topics_metadata_filename_);
         if (!ifs.is_open()) {
-            std::cerr << "Warning: Topic metadata file not found, will be created on save: " << topics_metadata_filename_ << std::endl;
-            return; // 文件不存在，consumer_offset_topic_ptr_ 将在构造函数中创建
+            std::cerr << "Warning: Topic metadata file not found..." << std::endl;
+            return;
         }
 
         std::string line;
@@ -1217,26 +1235,28 @@ public:
             std::istringstream iss(line);
             std::string topicname;
             size_t parti_num;
-            if (!(iss >> topicname >> parti_num)) {
-                std::cerr << "Error: Malformed line in topics_metadata.conf: " << line << std::endl;
-                continue;
-            }
+            if (!(iss >> topicname >> parti_num)) continue;
 
+            // 1. 同步到 MetadataCache (这是新增的逻辑)
+            // 告诉元数据缓存：我有这个 Topic，我有这么多分区，Leader 都是我自己
+            cache_metadata->createTopic(topicname, parti_num);
+
+            // 2. 同步到 TopicMap (保持原逻辑)
             if (topicname == MYMQ::consumeroffset_name) {
-                // 这是特殊的消费者偏移量 Topic
-                if (!consumer_offset_topic_ptr_) { // 避免重复创建
-                    consumer_offset_topic_ptr_ = std::make_unique<Topic>(topicname, data_root_dir_, parti_num);
-                } else {
-                    std::cerr << "Warning: Duplicate entry for '" << MYMQ::consumeroffset_name << "' in metadata file. Ignoring subsequent entries." << std::endl;
+                if (!consumer_offset_topic_ptr_) {
+                    consumer_offset_topic_ptr_ = std::make_unique<Topic>(topicname, data_root_dir_, parti_num,1);
                 }
             } else {
-                // 普通 Topic，添加到 topicmap
-                std::unique_lock<std::shared_mutex> ulock(topicmap.mtx_topic);
-                topicmap.topics_.emplace(topicname, std::make_unique<Topic>(topicname, data_root_dir_, parti_num));
+                for(size_t i=0;i<parti_num;i++){
+                    TopicPartition_to_Log_Map::accessor ac;
+                    map_tp_to_log.insert(ac,TopicPartition(topicname,i));
+                    ac->second=std::make_shared<Partition>( data_root_dir_, topicname,parti_num);
+
+                }
+
             }
         }
     }
-
 
 
     void save_topics_metadata() {
@@ -1251,12 +1271,17 @@ public:
             ofs_tmp << consumer_offset_topic_ptr_->get_topicname() << " " << consumer_offset_topic_ptr_->get_parti_num() << std::endl;
         }
 
+        std::unordered_map<std::string,size_t> tmp_metadata_map;
         {
-            std::shared_lock<std::shared_mutex> slock(topicmap.mtx_topic);
-            for (const auto& pair : topicmap.topics_) {
-                ofs_tmp << pair.first << " " << pair.second->get_parti_num() << std::endl;
+            for(const auto& [tp,parti]:map_tp_to_log){
+               tmp_metadata_map[tp.topic]++;
             }
+
         }
+        for(const auto& [t,p_num]:tmp_metadata_map){
+            ofs_tmp << t << " " << p_num << std::endl;
+        }
+
 
         ofs_tmp.close();
 
@@ -1267,19 +1292,16 @@ public:
     }
 
     Err push(const Byte_view_pair& msg_view ,const std::string& topicname,size_t partition) {
-        auto it = topicmap.topics_.find(topicname);
-        if (it == topicmap.topics_.end()) {
-            throw std::runtime_error("Topic not found: " + topicname);
+        TopicPartition_to_Log_Map::const_accessor cac;
+        if (!map_tp_to_log.find(cac,TopicPartition(topicname,partition))) {
+            return Err::PARTITION_NOT_FOUND;
         }
-        Topic* topic_ptr = it->second.get();
-        if (partition < 0 || partition>= topic_ptr->get_parti_num()) {
-            throw std::out_of_range("Invalid partition ID for topic " + topicname + ": " + std::to_string(partition));
-            return Err::NO_ASSIGNED_PARTITION;
-        }
-       return topic_ptr->push(msg_view,partition);
+        auto partition_ptr=cac->second;
+        cac.release();
+       return partition_ptr->push(msg_view);
     }
 
-    std::pair<MesLoc,Err>  pull(size_t target_offset,const std::string& groupid,const std::string& topicname, size_t partition,size_t byte_need) {
+    std::pair<MesLoc,Err>  pull(size_t target_offset,const std::string& groupid,const std::string& topicname, size_t partition_id,size_t byte_need) {
 
         auto statepair=get_SpecificState(groupid);
         if(!statepair.second){
@@ -1298,16 +1320,13 @@ public:
 
 
 
-        std::unique_lock<std::shared_mutex> ulock(topicmap.mtx_topic);
-        auto it = topicmap.topics_.find(topicname);
-        if (it == topicmap.topics_.end()) {
-            ulock.unlock();
-            return {MesLoc{},Err::TOPIC_NOT_FOUND};
+        TopicPartition_to_Log_Map::const_accessor cac;
+        if(!map_tp_to_log.find(cac,TopicPartition(topicname,partition_id))){
+           return {MesLoc{},Err::PARTITION_NOT_FOUND};;
         }
-        Topic* topic_ptr = it->second.get();
-        ulock.unlock();
-
-        auto locinf= topic_ptr->pull(target_offset,partition,byte_need);
+        auto partition_ptr = cac->second;
+        cac.release();
+        auto locinf= partition_ptr->pull(target_offset,byte_need);
         if(!locinf.found){
             return {MesLoc{},Err::NO_RECORD};
         }
@@ -1327,14 +1346,19 @@ public:
             return false;
         }
 
-        {
-            std::unique_lock<std::shared_mutex> ulock(topicmap.mtx_topic);
-            if (topicmap.topics_.count(topicname)) {
-                out("CREATE TOPIC: Topic '"+ topicname + "' already exists." );
-                return false;
-            }
-            topicmap.topics_.emplace(topicname, std::make_unique<Topic>(topicname, data_root_dir_, parti_num));
+        auto res= cache_metadata->createTopic(topicname,parti_num);
+        if(!res){
+             out("CREATE TOPIC: Topic '"+ topicname + "' already exists." );
+             return 0;
         }
+
+        for(size_t i=0;i<parti_num;i++){
+            TopicPartition_to_Log_Map::accessor ac;
+            map_tp_to_log.insert(ac,TopicPartition(topicname,i));
+            ac->second= std::make_shared<Partition>(data_root_dir_,topicname,i);
+
+        }
+
 
         save_topics_metadata(); // 保存新的 Topic 元数据
         return true;
@@ -1342,7 +1366,7 @@ public:
 
 
     Err commit_sync(const std::string& topicname, size_t partition ,uint32_t consumeroffset_parid_hash,const std::string& key,uint32_t offset_digit) {
-        if(!check_topic_and_partition_outlock(topicname,partition)){
+        if(cache_metadata->getPartitionLeader(topicname,partition)=std::nullopt){
             return Err::TOPIC_NOT_FOUND;
         }
         if (!consumer_offset_manager_ptr_) {
@@ -1352,23 +1376,6 @@ public:
     }
 
 
-
-
-    void clear_partition(const std::string& topicname,size_t partition) {
-        std::unique_lock<std::shared_mutex> ulock(topicmap.mtx_topic);
-        auto it = topicmap.topics_.find(topicname);
-        if (it == topicmap.topics_.end()) {
-            throw std::runtime_error("Topic not found: " + topicname);
-        }
-        Topic* topic_ptr = it->second.get();
-
-        ulock.unlock();
-        if (partition >= 0 && partition < topic_ptr->get_parti_num()) {
-            topic_ptr->clear_partition(partition);
-        } else {
-            throw std::out_of_range("Invalid partition ID for clear_partition.");
-        }
-    }
 
     std::pair<int,Err> joinGroup(const std::string& groupid, ServerConsumerInfo& inf){
         for(const auto&it:inf.subscribed_topics){
@@ -1406,30 +1413,7 @@ public:
 
 private:
 
-    bool check_topic_and_partition_outlock(const std::string& topicname,size_t partition,std::string description_if_needed=std::string{}){
-        if(!description_if_needed.empty()){
-            cerr("Description : "+description_if_needed);
-        }
-        std::unique_lock<std::shared_mutex> ulock(topicmap.mtx_topic);
-        auto it = topicmap.topics_.find(topicname);
-        if (it == topicmap.topics_.end()) {
-            cerr("Topic not found: " + topicname);
-            return 0;
 
-        }
-        Topic* topic_ptr = it->second.get();
-
-        ulock.unlock();
-
-        if (partition < 0 || partition>= topic_ptr->get_parti_num()) {
-            cerr("Invalid partition ID for topic " + topicname + ": " + std::to_string(partition));
-            return 0;
-
-        }
-
-
-        return 1;
-    }
 
 
     void start_server(){
@@ -1604,7 +1588,7 @@ private:
 
 
                 MB mb;
-                mb.append(static_cast<short>(sync_res.second),groupid,memberid );
+                mb.append(static_cast<uint16_t>(sync_res.second),groupid,memberid );
 
                 if(sync_res.second==Err::NULL_ERROR){
                     mb.append(sync_res.first.size());
@@ -1666,7 +1650,7 @@ private:
         if (!consumer_offset_manager_ptr_) {
             throw std::runtime_error("ConsumerOffset manager not initialized before starting GroupCoordinator.");
         }
-        groupcoordinator_ = std::make_shared<GroupCoordinator>(consumer_offset_manager_ptr_, topicmap);
+        groupcoordinator_ = std::make_shared<GroupCoordinator>(consumer_offset_manager_ptr_, cache_metadata);
 
         timer_.commit_ms([this]{
             start_group_checkliveness();
@@ -1728,7 +1712,8 @@ private:
     std::shared_ptr<ConsumerOffset> consumer_offset_manager_ptr_;
     std::string data_root_dir_;
     std::string topics_metadata_filename_;
-    Topicmap topicmap;
+    TopicPartition_to_Log_Map map_tp_to_log;
+    std::shared_ptr< MetadataCache > cache_metadata;
 
 
     std::shared_ptr<GroupCoordinator> groupcoordinator_;

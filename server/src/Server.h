@@ -137,6 +137,11 @@ public:
 
     void init_sys(){
         Config_manager cm("config/communication.propertity");
+        try {
+           server_IP= cm.get_size_t("IP");
+        } catch (std::exception& e) {
+            cerr("IP not found");
+        }
         PORT= cm.getint("port");
         HEADER_SIZE=MYMQ::HEADER_SIZE;
         msg_body_limit=cm.getull("msgbodylimit_len");
@@ -1083,6 +1088,7 @@ private:
     std::atomic<bool> running_{0};
     int server_fd;
     struct sockaddr_in address;
+    std::string server_IP;
 
 
     tbb::concurrent_hash_map<int,  std::shared_ptr<ClientState>> map_client_states;

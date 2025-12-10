@@ -48,10 +48,6 @@ Err MYMQ_S::commit_sync(const std::string& topicname, size_t partition, uint32_t
     return pimpl->commit_sync(topicname, partition, consumeroffset_parid_hash, key, offset_digit);
 }
 
-void MYMQ_S::clear_partition(const std::string& topicname, size_t partition)
-{
-    pimpl->clear_partition(topicname, partition);
-}
 
 
 Err MYMQ_S::leave_group(const std::string& groupid, const std::string& memberid)

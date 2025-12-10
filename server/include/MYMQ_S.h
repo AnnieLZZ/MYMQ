@@ -46,7 +46,7 @@ public:
 
 
 
-    void clear_partition(const std::string& topicname,size_t partition) ;
+
 
     Err leave_group(const std::string& groupid,const std::string& memberid);
 

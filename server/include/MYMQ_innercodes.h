@@ -59,6 +59,8 @@ constexpr size_t index_build_interval_bytes_DEFAULT=4096;
 constexpr size_t LOG_FLUSH_INTERVAL_MS=360000;
 constexpr size_t LOG_CLEAN_S_DEFAULT=144000;
 constexpr size_t session_timeout_ms_=500000;
+constexpr size_t LOGSEG_MAXSIZE_MB_DEFAULT=1024;
+constexpr size_t PARTITION_NUM_OF_CONSUMER_OFFSET_TOPIC=10;
 
 enum class EventType : uint16_t {
     // 客户端请求事件
@@ -353,50 +355,6 @@ struct HeartbeatResponce{
     int generation_id;
     uint16_t groupstate_digit;//mapto {0,1,2,3} enum GroupState { STABLE, JOIN_COLLECTING, AWAITING_SYNC,EMPTY};
 };
-
-
-
-namespace MYMQ_Client{
-
-
-struct ClientState {
-    enum State {
-        READING_ID,       // 正在读取客户端 ID (10 字节)
-        READING_HEADER,   // 正在读取消息头 (HEADER_SIZE 字节)
-        READING_BODY      // 正在读取消息体
-    };
-
-    using ClientMessageCallback = std::function<void(int client_fd, short event_type, const Byte& msg_body)>;
-};
-
-struct Consumerbasicinfo
-{
-    std::string groupid="";
-    std::string clientid="";
-    std::shared_mutex mtx;
-    std::atomic<bool> is_ingroup=0;
-};
-
-using TopicPartition=MYMQ_Public::TopicPartition;
-using CallbackQueue = std::deque<MYMQ_Public::SupportedCallbacks>;
-struct  Push_queue{
-    std::mutex mtx;
-    std::deque<std::vector<unsigned char>> queue_{};
-    CallbackQueue callbacks_;
-    std::atomic<size_t>  since_last_send=0;
-    ZSTD_CCtx* cctx = ZSTD_createCCtx();
-    TopicPartition tp;
-    Push_queue(const std::string& t,size_t p):tp(t,p){}
-};
-
-struct endoffset_point
-{
-    TopicPartition tp;
-    size_t off;
-    endoffset_point(size_t off_,const std::string& t,size_t p):tp(t,p),off(off_){}
-};
-
-}
 
 
 
