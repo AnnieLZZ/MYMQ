@@ -99,3 +99,21 @@ ACK_NORESPONCE时不予设置回调，即发即忘，ACK_PROMISE_INDISK时保证
 2 新增生产者新增检查注册的函数，所有网络请求方法都必须先检查
 3 pull的测试重载版本修正，现在不会记录空等时间
 
+---
+
+## v4.0.0(2025-12-10)
+
+- **版本更新**: 更新项目版本至 v4.0.0
+- **更新细则**: 
+1 客户端版本更新至v4.0.0
+2 现在分离出MYMQ_Producer和MYMQ_Consumer类，用于职责分离
+3 相关测试用例对应调整
+4 CommonErrorCode新增UPDATE_GENERATION，不属于一种错误，仅作为标识字段
+5 去除了繁杂的sync，join，group leader逻辑，完全依赖心跳和服务器分区分配算法来维持的分区分配
+6 去除了ClientErrorCode中的INVALID_PARTITION_OR_TOPIC， INVALID_PARTITION，INVALID_TOPIC
+三个错误码，合并为INVALID_TOPIC_PARTITION，并补齐错误码输出
+7 新增TP_Point来绑定一个tp的pollbuffer与endoffset的指针，并统一映射表
+8  get_position_consumed更名为get_local_consumed_position，同时接收一个size_t& 来获取pos，返回错误码标识是否成功获取
+9 heartbeat接受两个参数，标识此次心跳是否是新入组，以及，是否要同步topic列表到server
+10 endoffset构造函数调整
+11 原来consumerinfo的本地字段移交到info_basic
