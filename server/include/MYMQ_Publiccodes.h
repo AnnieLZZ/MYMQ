@@ -39,7 +39,7 @@ enum class CommonErrorCode : uint16_t {
     REQUEST_TIMEOUT=4018,
     UNKNOWN_TOPICPARTITION=4019,
     CLIENT_NOT_IN_GROUP=4020,
-    PARTITION_NOT_FOUND=4021,
+    UPDATE_GENERATION=4021,
 
 
 
@@ -85,13 +85,11 @@ inline std::string to_string(CommonErrorCode code) {
 
 enum class ClientErrorCode :uint16_t{
     NOT_IN_GROUP=1000,
-    INVALID_TOPIC=1001,
-    INVALID_PARTITION=1002,
     NULL_ERROR=1003,
     PULL_TIMEOUT=1004,
     PULL_OTHER_IN_PULL=1005,
     COMMIT_SYNC_TIMEOUT=1006,
-    INVALID_PARTITION_OR_TOPIC=1007,
+    INVALID_TOPIC_PARTITION=1007,
     ZSTD_UNAVAILABLE=1008,
     AUTOCOMMIT_ENABLE=1009,
     INVALID_GROUPID=1010,
@@ -110,13 +108,11 @@ enum class ClientErrorCode :uint16_t{
 inline std::string to_string(ClientErrorCode code) {
     switch (code) {
     case ClientErrorCode::NOT_IN_GROUP: return "NOT_IN_GROUP";
-    case ClientErrorCode::INVALID_TOPIC: return "INVALID_TOPIC";
-    case ClientErrorCode::INVALID_PARTITION: return "INVALID_PARTITION";
     case ClientErrorCode::NULL_ERROR: return "NULL_ERROR";
     case ClientErrorCode::PULL_TIMEOUT: return "PULL_TIMEOUT";
     case ClientErrorCode::PULL_OTHER_IN_PULL: return "PULL_OTHER_IN_PULL";
     case ClientErrorCode::COMMIT_SYNC_TIMEOUT: return "COMMIT_SYNC_TIMEOUT";
-    case ClientErrorCode::INVALID_PARTITION_OR_TOPIC: return "INVALID_PARTITION_OR_TOPIC";
+    case ClientErrorCode::INVALID_TOPIC_PARTITION: return "INVALID_PARTITION_OR_TOPIC";
     case ClientErrorCode::ZSTD_UNAVAILABLE: return "ZSTD_UNAVAILABLE";
     case ClientErrorCode::AUTOCOMMIT_ENABLE: return "AUTOCOMMIT_ENABLE";
     case ClientErrorCode::INVALID_GROUPID: return "INVALID_GROUPID";
@@ -256,8 +252,6 @@ struct hash<MYMQ_Public::TopicPartition> {
        return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
     }
 };
-
-
 } // namespace std
 
 struct TbbHashCompare {
@@ -273,6 +267,4 @@ struct TbbHashCompare {
         return x == y;
     }
 };
-
-
 #endif // MYMQ_PUBLICCODES_H

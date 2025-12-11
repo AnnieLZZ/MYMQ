@@ -16,6 +16,7 @@
 #include"MYMQ_innercodes.h"
 #include"MYMQ_Server_ns.h"
 #include"Controller.h"
+#include"unordered_set"
 
 
 using Record=MYMQ::MSG_serial::Record;
@@ -623,94 +624,6 @@ public:
     }
 
 
-    // 2. SyncGroup: 消费者获取其分配的分区 (或领导者提交分配)
-    // 返回 member_id -> topic -> partitions 的映射
-    std::pair<std::map<std::string, std::set<size_t>>,Err>  syncGroup(
-            const std::string& group_id,
-            const std::string& member_id,
-            int generation_id,
-            const std::map<std::string, std::map<std::string, std::set<size_t>>>& leader_assignments) {
-
-        std::pair<std::map<std::string, std::set<size_t>>,Err> res{std::map<std::string, std::set<size_t>>(),Err::NULL_ERROR};
-
-        std::shared_lock<std::shared_mutex> global_lock(group_states_mutex_);
-        auto it = group_states_.find(group_id);
-        if (it == group_states_.end()) {
-            global_lock.unlock();
-            res.second=Err::GROUP_NOT_FOUND;
-
-            return res;
-        }
-        ConsumerGroupState& group_state = it->second;
-
-        std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
-        global_lock.unlock();
-
-        // 检查成员是否存在
-        if (group_state.members.find(member_id) == group_state.members.end()) {
-            res.second=Err::MEMBER_NOT_FOUND;
-            return res;
-        }
-
-        // 检查世代ID是否匹配
-        if (group_state.generation_id != generation_id) {
-            res.second=Err::ILLEGAL_GENERATION;
-            return res;
-        }
-
-        if (member_id == group_state.leader_id) {
-            // 这是领导者提交分配
-            if (group_state.state != Gstate::AWAITING_SYNC) {
-                // 领导者在非 AWAITING_SYNC 状态提交分配，可能是旧的 SyncGroup 请求或状态错误
-                res.second=Err::REBALANCE_IN_PROGRESS;
-            }
-            group_state.assignments = leader_assignments;
-            group_state.state = ConsumerGroupState::STABLE;
-            group_state.rebalance_ing.store(0);
-            timer.cancel_task(group_state.rebalance_timeout_taskid);
-            timer.cancel_task(group_state.join_collect_timeout_taskid);
-
-            cerr("SYNC RESULT : Leader '"+member_id+ "' submitted the assignment");
-
-
-
-        } else {
-            // 非领导者成员请求分配
-            if (group_state.state == ConsumerGroupState::JOIN_COLLECTING) {
-                res.second=Err::REBALANCE_IN_PROGRESS;
-                return res;
-            }
-            if (group_state.state == ConsumerGroupState::AWAITING_SYNC) {
-                if (group_state.assignments.empty()) {
-                    // 领导者尚未提交分配
-                    res.second=Err::AWAITING_LEADER_SYNC;
-                    return res;
-
-                }
-            }
-            // 如果是 STABLE 状态，或者 AWAITING_SYNC 且 assignments 不为空，则继续返回分配
-        }
-
-        // 返回该成员的分配
-        auto member_assignments_it = group_state.assignments.find(member_id);
-        if (member_assignments_it != group_state.assignments.end()) {
-            out("'"+member_id+"' sync successfully");
-            return {member_assignments_it->second,Err::NULL_ERROR};
-        } else {
-            // 领导者提交后，可能某个成员没有分配到分区（例如，没有订阅任何主题或所有分区都被其他成员分配）
-            // 或者在 AWAITING_SYNC 状态下，领导者已提交但该成员的分配还未准备好（不应该发生如果分配逻辑正确）
-            if (group_state.state == ConsumerGroupState::STABLE) {
-                res.second=Err::NO_ASSIGNED_PARTITION;
-                return res; // 稳定状态下，如果没找到分配，返回空，表示没有分配到分区
-            } else {
-                // 非稳定状态下，如果没找到分配，可能是重平衡未完成，或者其他问题
-                res.second=Err::REBALANCE_IN_PROGRESS;
-
-                return res;
-            }
-        }
-        return res;
-    }
 
     // 3. Heartbeat: 消费者发送心跳
     HeartbeatResponce heartbeat(const std::string& group_id, const std::string& member_id) {
@@ -729,24 +642,17 @@ public:
         if (group_state.members.find(member_id) == group_state.members.end()) {
             throw (Err::MEMBER_NOT_FOUND);
         }
+
+
+
+
         auto now=std::chrono::steady_clock::now();
         if(group_state.state==Gstate::STABLE){
             group_state.last_heartbeat[member_id] = now;
         }
 
-        if(group_state.state==Gstate::STABLE){
-            responce.groupstate_digit=0;
-        }
-        else  if(group_state.state==Gstate::JOIN_COLLECTING){
-            responce.groupstate_digit=1;
-        }
-        else  if(group_state.state==Gstate::AWAITING_SYNC){
-            responce.groupstate_digit=2;
-        }
-        else  if(group_state.state==Gstate::EMPTY){
-            responce.groupstate_digit=3;
-        }
 
+        group_state.generation_id++;
         responce.generation_id=group_state.generation_id;
 
         return responce;
@@ -1294,7 +1200,7 @@ public:
     Err push(const Byte_view_pair& msg_view ,const std::string& topicname,size_t partition) {
         TopicPartition_to_Log_Map::const_accessor cac;
         if (!map_tp_to_log.find(cac,TopicPartition(topicname,partition))) {
-            return Err::PARTITION_NOT_FOUND;
+            return Err::UNKNOWN_TOPICPARTITION;
         }
         auto partition_ptr=cac->second;
         cac.release();
@@ -1322,7 +1228,7 @@ public:
 
         TopicPartition_to_Log_Map::const_accessor cac;
         if(!map_tp_to_log.find(cac,TopicPartition(topicname,partition_id))){
-           return {MesLoc{},Err::PARTITION_NOT_FOUND};;
+           return {MesLoc{},Err::UNKNOWN_TOPICPARTITION};;
         }
         auto partition_ptr = cac->second;
         cac.release();
@@ -1389,15 +1295,7 @@ public:
        return groupcoordinator_->leaveGroup(groupid,memberid);
     }
 
-    std::pair<std::map<std::string, std::set<size_t>>,Err> sync_group(
-            const std::string& group_id,
-            const std::string& member_id,
-            int generation_id,
-            const std::map<std::string, std::map<std::string, std::set<size_t>>>& leader_assignments = {}
-            ) {
-        return groupcoordinator_->syncGroup(group_id, member_id, generation_id, leader_assignments);
 
-    }
 
 
     HeartbeatResponce heartbeat(const std::string& group_id, const std::string& member_id) {
@@ -1535,32 +1433,7 @@ private:
                 mb.append_bool(mp.read_bool());
                 session.send(Eve::SERVER_RESPONSE_REGISTER,correlation_id,ack_level,mb.data);
             }
-            else if( type==MYMQ::EventType::CLIENT_REQUEST_JOIN_GROUP){
-
-                auto groupid=mp.read_string();
-                auto memberid=mp.read_string();
-                auto generationid=mp.read_int();
-                auto client_id=mp.read_string();
-                auto topics=mp.read_uchar_vector();
-
-                MessageParser mp2(topics.data(),topics.size());
-                size_t topicsnum=mp2.read_size_t();
-                std::set<std::string> topicset;
-                for(size_t i=0;i<topicsnum;i++){
-                    topicset.emplace(mp2.read_string());
-                }
-                ServerConsumerInfo inf(std::move(topicset),std::move(memberid) , generationid,correlation_id,session,client_id);
-                auto res= joinGroup(groupid,inf);
-
-                if(res.second!=Err::NULL_ERROR){
-                    MessageBuilder mb;
-                    mb.append(static_cast<uint16_t>(res.second),groupid,res.first);
-                    session.send(Eve::SERVER_RESPONSE_JOIN_REQUEST_HANDLED,correlation_id,ack_level,mb.data);
-                }
-
-
-            }
-            else if(type==MYMQ::EventType::CLIENT_REQUEST_LEAVE_GROUP){
+           else if(type==MYMQ::EventType::CLIENT_REQUEST_LEAVE_GROUP){
                 auto groupid=mp.read_string();
                 auto memberid=mp.read_string();
                 auto res=  leave_group(groupid,memberid);
@@ -1568,58 +1441,33 @@ private:
                 mb.append(static_cast<uint16_t>(res),groupid);
                session.send(Eve::SERVER_RESPONCE_LEAVE_GROUP,correlation_id,ack_level,mb.data);
             }
-            else if(type==MYMQ::EventType::CLIENT_REQUEST_SYNC_GROUP){
+             else if(type==MYMQ::EventType::CLIENT_REQUEST_HEARTBEAT){
 
                 auto groupid=mp.read_string();
+                auto is_join_group=mp.read_bool();
                 auto memberid=mp.read_string();
                 auto generationid=mp.read_int();
-                auto pull_option= static_cast<MYMQ::PullSet>( mp.read_uint16());
-                auto isleader=is_leader(groupid,memberid);
-                std::pair<std::map<std::string, std::set<size_t>>,Err> sync_res;
-                if(isleader){
-                    auto assignment=parse_assignments_message(mp.read_uchar_vector());
-                    sync_res= sync_group(groupid,memberid,generationid,assignment);
-                }
-                else{
-                    sync_res= sync_group(groupid,memberid,generationid);
-                }
+                auto need_update_topics=mp.read_bool();
+                std::unordered_set<std::string> topics;
 
 
-
-
-                MB mb;
-                mb.append(static_cast<uint16_t>(sync_res.second),groupid,memberid );
-
-                if(sync_res.second==Err::NULL_ERROR){
-                    mb.append(sync_res.first.size());
-                    for(const auto& [topic,parti_set]:sync_res.first){
-                        mb.append(topic);
-                        mb.append_size_t( parti_set.size());
-                        for(const auto& parti_id:parti_set){
-                            //需要放入每个分区的起始消费的那个偏移
-                            if(pull_option==MYMQ::PullSet::END_OFFSET){
-                                auto endoff= get_partition_endoffset(topic,parti_id);
-                                mb.append(parti_id,endoff);
-                            }
-                            else if(pull_option==MYMQ::PullSet::EARLIEST_OFFSET){
-                                mb.append(parti_id,size_t(0));
-                            }
-
-
-                        }
+                if(need_update_topics){
+                    auto topicnum=mp.read_size_t();
+                    topics.reserve(topicnum);
+                    for(size_t i=0;i<topicnum;i++){
+                        topics.emplace(mp.read_string());
                     }
                 }
 
 
+                if(is_join_group){
+                    ServerConsumerInfo inf;
+                    auto joinres= joinGroup(groupid,inf);
+                }
 
-                session.send(Eve::SERVER_RESPONSE_SYNC_GROUP_ACK,correlation_id,ack_level,mb.data);
-            }
-            else if(type==MYMQ::EventType::CLIENT_REQUEST_HEARTBEAT){
-                auto groupid=mp.read_string();
-                auto memberid=mp.read_string();
                 auto res= heartbeat(groupid,memberid);
                 MB mb;
-                mb.append(res.generation_id,res.groupstate_digit);
+                mb.append(groupid,res.generation_id,res.groupstate_digit);
                session.send(Eve::SERVER_RESPONCE_HEARTBEAT,correlation_id,ack_level,mb.data);
 
 

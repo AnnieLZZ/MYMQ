@@ -55,14 +55,7 @@ Err MYMQ_S::leave_group(const std::string& groupid, const std::string& memberid)
     return pimpl->leave_group(groupid, memberid);
 }
 
-std::pair<std::map<std::string, std::set<size_t>>, Err> MYMQ_S::sync_group(
-    const std::string& group_id,
-    const std::string& member_id,
-    int generation_id,
-    const std::map<std::string, std::map<std::string, std::set<size_t>>>& leader_assignments)
-{
-    return pimpl->sync_group(group_id, member_id, generation_id, leader_assignments);
-}
+
 
 HeartbeatResponce MYMQ_S::heartbeat(const std::string& group_id, const std::string& member_id)
 {
