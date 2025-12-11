@@ -63,7 +63,7 @@ int main() {
     mp.create_topic(TOPIC_NAME);
 
     // [修改点] 初始化消费者(Client)，负责订阅和拉取
-    MYMQ_Client mc("perf_consumer", 0);
+    MYMQ_Consumer mc("perf_consumer", 0);
     mc.subscribe_topic(TOPIC_NAME);
     mc.join_group(GROUP_ID);
     mc.set_local_pull_bytes_once(1048576000);

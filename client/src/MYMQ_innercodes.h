@@ -422,33 +422,6 @@ struct RecordBatch
         baseoffset(baseoffset_),record_num(record_num_),records_body(records_body_){}
 };
 
-struct UserInfo
-{
-    std::string clientid;
-    int sock;
-    UserInfo():clientid(MYMQ::CLIENTID_DEFAULT),sock(-1) {}
-    UserInfo(const std::string& clientid_,int sock_):sock(sock_),clientid(clientid_){}
-};
-
-
-struct ConsumerInfo{
-    std::set<std::string> subscribed_topics;
-    std::string memberid;
-    int generation_id;
-    UserInfo userinfo;
-    uint32_t correlation_id_lastjoin;
-    ConsumerInfo(std::set<std::string> topics,std::string memberid,int generation_id,uint32_t correlation_id_lastjoin,std::string clientid=MYMQ::CLIENTID_DEFAULT,int sock=-1)
-        :subscribed_topics(topics),memberid(memberid),generation_id(generation_id),userinfo(clientid,sock),correlation_id_lastjoin(correlation_id_lastjoin){}
-    ConsumerInfo():subscribed_topics(std::set<std::string>()),memberid(std::string()),generation_id(-1),userinfo(MYMQ::CLIENTID_DEFAULT,-1),correlation_id_lastjoin(0){}
-};
-
-struct LeaderAssignmentData {
-    std::string group_id;
-    std::string leader_member_id;
-    int generation_id;
-    std::vector<ConsumerInfo> all_group_members; // 组内所有活跃成员及其订阅信息
-    std::map<std::string, size_t> topic_partition_counts; // 主题名称 -> 分区总数
-};
 
 
 struct HeartbeatResponce{
@@ -475,8 +448,10 @@ struct Consumerbasicinfo
 {
     std::string groupid="";
     std::string clientid="";
+    std::set<std::string> subscribed_topics;
+    std::string memberid="";
+    int generation_id=-1;
     std::shared_mutex mtx;
-    std::atomic<bool> is_ingroup=0;
 };
 
 struct SparseCallback {
@@ -534,7 +509,7 @@ struct endoffset_point
 {
     TopicPartition tp;
     mutable std::atomic<size_t> off;
-    endoffset_point(size_t off_,const std::string& t,size_t p):tp(t,p),off(off_){}
+    endoffset_point(size_t off_,const TopicPartition& tp_):tp(tp_),off(off_){}
 };
 
 
@@ -658,6 +633,12 @@ public:
 };
 
 
+
+struct TP_Point
+{
+    std::shared_ptr<endoffset_point> endoffset_ptr=nullptr;
+    std::shared_ptr<PollBuffer> pollqueue_ptr=nullptr;
+};
 }
 
 

@@ -10,17 +10,21 @@
 #include"Timer.h"
 #include <unordered_set>
 
-using ConsumerInfo=MYMQ::ConsumerInfo;
+
 using Consumerbasicinfo=MYMQ::MYMQ_Client::Consumerbasicinfo;
 using Eve=MYMQ::EventType;
 using Err=MYMQ_Public::CommonErrorCode;
 using MB=MessageBuilder;
 using Err_Client=MYMQ_Public::ClientErrorCode;
 using Mybyte=std::vector<unsigned char>;
-using Endoffsetmap=tbb::concurrent_hash_map<MYMQ::MYMQ_Client::TopicPartition,MYMQ::MYMQ_Client::endoffset_point>;
-using Pollqueuemap=tbb::concurrent_hash_map<MYMQ_Public::TopicPartition,MYMQ::MYMQ_Client::PollBuffer>;
 using TopicPartition=MYMQ_Public::TopicPartition;
-
+using TP_Point=MYMQ::MYMQ_Client::TP_Point;
+using TP_PointMap =tbb::concurrent_hash_map<TopicPartition,TP_Point >;
+// struct TP_Point
+// {
+//     std::shared_ptr<endoffset_point> endoffset_ptr=nullptr;
+//     std::shared_ptr<PollBuffer> pollqueue_ptr=nullptr;
+// };
 
 class MYMQ_Produceruse{
 
@@ -136,7 +140,7 @@ public:
 
 
 
-    size_t get_position_consumed(const MYMQ_Public::TopicPartition& tp);
+    Err_Client get_local_consumed_position(const MYMQ_Public::TopicPartition& tp,size_t& pos);
 
 
 
@@ -163,7 +167,7 @@ public:
     Err_Client commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb=MYMQ_Public::CommitAsyncResponceCallback()) ;
 
     Err_Client join_group(const std::string& groupid);
-    Err_Client leave_group(const std::string& groupid);
+    Err_Client leave_group();
 
 
 
@@ -188,22 +192,13 @@ private:
 
 
 
-
-
-
-    void flush_batch_task(MYMQ::MYMQ_Client::Push_queue& pq);
-    void finish_flush(MYMQ::MYMQ_Client::Push_queue& pq);
-
     void sync_group() ;
-    void heartbeat() ;
-    void exit_rebalance();
+    void heartbeat(bool topics_updated=0,std::string groupid ="") ;
+
 
     void heartbeat_start();
 
     void heartbeat_stop();
-
-    void push_perioric_start();
-    void push_perioric_stop();
 
     void poll_perioric_start();
     void poll_perioric_stop();
@@ -216,13 +211,8 @@ private:
     void timer_commit_async();
     bool send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_=std::vector<MYMQ::MYMQ_Client::SparseCallback>());
 
-    std::map<std::string, std::map<std::string, std::set<size_t>>> assign_leaderdo(
-        const std::unordered_map<std::string, std::set<std::string>>& member_to_topics,
-        const std::unordered_map<std::string, size_t>& topic_num_map) ;
-    std::string weave_assignments_message(const std::map<std::string, std::map<std::string, std::set<size_t>>>& assignments) ;
     Err_Client commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb);
     MYMQ_Public::ResultVariant handle_response(Eve event_type,const Mybyte& msg_body);
-    void push_timer_send();
     void out_group_reset();
     void cerr(const std::string& str){
         Printqueue::instance().out(str,1,0);
@@ -264,42 +254,21 @@ private:
 
 
     Timer timer;
-    size_t rebalance_timeout_taskid{0};
-    size_t join_collect_timeout_taskid{0};
     size_t heartbeat_taskid{0};
     size_t push_perioric_taskid{0};
     size_t autocommit_taskid{0};
     size_t autopoll_taskid{0};
 
 
-    MYMQ::MYMQ_Client::RecordAccumulator accmulator;
-
     ClientState state;
     std::mutex mtx_state;
-
-
-    ConsumerInfo info_consumer;
-    std::shared_mutex mtx_consumerinfo;
 
     Consumerbasicinfo info_basic;
 
     std::atomic<bool> is_ingroup{0};
     bool is_leader{0};
 
-
-
-    std::unordered_map<std::string,std::unordered_set<TopicPartition> > map_final_assign;
-    std::shared_mutex mtx_map_final_assign;
-
-    tbb::concurrent_hash_map<MYMQ_Public::TopicPartition,MYMQ::MYMQ_Client::endoffset_point> map_end_offset;
-
-    tbb::concurrent_hash_map<MYMQ_Public::TopicPartition,MYMQ::MYMQ_Client::PollBuffer> map_poll_queue;
-
-    std::unordered_map<TopicPartition,MYMQ::MYMQ_Client::Push_queue> map_push_queue;
-
-
-
-    std::string group_assign_str_retry{""};
+    TP_PointMap map_final_assign;
 
 
     std::atomic<size_t>  pull_bytes_once_of_request;

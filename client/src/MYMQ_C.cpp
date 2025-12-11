@@ -19,7 +19,7 @@ Err_Client MYMQ_Producer::push(const MYMQ_Public::TopicPartition& tp,
     return pimpl->push(tp, key, value, cb);
 }
 
-void MYMQ_Producer::create_topic(const std::string& topicname, size_t parti_num) {
+void MYMQ_Producer::create_topic(std::string topicname, size_t parti_num) {
     pimpl->create_topic(topicname, parti_num);
 }
 
@@ -31,91 +31,87 @@ void MYMQ_Producer::create_topic(const std::string& topicname, size_t parti_num)
 
 
 
-MYMQ_Client::MYMQ_Client(const std::string& clientid, uint8_t ack_level)
+MYMQ_Consumer::MYMQ_Consumer(const std::string& clientid, uint8_t ack_level)
     : pimpl(std::make_unique<MYMQ_clientuse>(clientid, ack_level))
 {
 
 }
 
-MYMQ_Client::~MYMQ_Client() = default;
+MYMQ_Consumer::~MYMQ_Consumer() = default;
 
-MYMQ_Client::MYMQ_Client(MYMQ_Client&&) noexcept = default;
-MYMQ_Client& MYMQ_Client::operator=(MYMQ_Client&&) noexcept = default;
+MYMQ_Consumer::MYMQ_Consumer(MYMQ_Consumer&&) noexcept = default;
+MYMQ_Consumer& MYMQ_Consumer::operator=(MYMQ_Consumer&&) noexcept = default;
 
 
-void  MYMQ_Client::set_local_pull_bytes_once(size_t bytes){
+void  MYMQ_Consumer::set_local_pull_bytes_once(size_t bytes){
 
     return pimpl->set_local_pull_bytes_once(bytes);
 }
 
-MYMQ_Client::ClientErrorCode MYMQ_Client::commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
+MYMQ_Consumer::ClientErrorCode MYMQ_Consumer::commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
                                                        ,MYMQ_Public::CommitAsyncResponceCallback cb) {
     return pimpl->commit_async(tp,next_offset_to_consume,cb);
 }
 
-MYMQ_Client::ClientErrorCode MYMQ_Client::seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume){
+MYMQ_Consumer::ClientErrorCode MYMQ_Consumer::seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume){
     return pimpl->seek(tp,offset_next_to_consume);
 }
 
-MYMQ_Client::ClientErrorCode MYMQ_Client::push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value
-                                               ,MYMQ_Public::PushResponceCallback cb) {
-    return pimpl->push(tp, key, value,cb);
-}
 
-MYMQ_Client::ClientErrorCode MYMQ_Client::pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_ms) {
+MYMQ_Consumer::ClientErrorCode MYMQ_Consumer::pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_ms) {
     return pimpl->pull(record_batch,poll_wait_timeout_ms);
 }
 
-MYMQ_Client::ClientErrorCode MYMQ_Client::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
+MYMQ_Consumer::ClientErrorCode MYMQ_Consumer::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
                      size_t poll_wait_timeout_ms,
                                   int64_t& out_latency_us){
     return pimpl->pull(record_batch,poll_wait_timeout_ms,out_latency_us);
 }
 
-void MYMQ_Client::trigger_pull(){
+void MYMQ_Consumer::trigger_pull(){
     return pimpl->trigger_poll_for_low_cap_pollbuffer();
 }
 
-void MYMQ_Client::create_topic(const std::string& topicname, size_t parti_num) {
+void MYMQ_Consumer::create_topic(const std::string& topicname, size_t parti_num) {
     pimpl->create_topic(topicname, parti_num);
 }
-size_t MYMQ_Client::get_position_consumed(const MYMQ_Public::TopicPartition& tp){
-    return pimpl->get_position_consumed(tp);
+MYMQ_Consumer::ClientErrorCode MYMQ_Consumer::get_position_consumed(const MYMQ_Public::TopicPartition& tp,size_t& pos){
+    return pimpl->get_local_consumed_position(tp,pos);
 }
 
-void MYMQ_Client::set_pull_bytes(size_t bytes) {
+void MYMQ_Consumer::set_pull_bytes(size_t bytes) {
     pimpl->set_pull_bytes(bytes);
 }
 
-void MYMQ_Client::subscribe_topic(const std::string& topicname) {
+void MYMQ_Consumer::subscribe_topic(const std::string& topicname) {
     pimpl->subscribe_topic(topicname);
 }
 
-void MYMQ_Client::unsubscribe_topic(const std::string& topicname) {
+void MYMQ_Consumer::unsubscribe_topic(const std::string& topicname) {
     pimpl->unsubscribe_topic(topicname);
 }
 
-MYMQ_Client::ClientErrorCode MYMQ_Client::commit_sync(const MYMQ_Public::TopicPartition& tp, size_t next_offset_to_consume) {
+MYMQ_Consumer::ClientErrorCode MYMQ_Consumer::commit_sync(const MYMQ_Public::TopicPartition& tp, size_t next_offset_to_consume) {
     return pimpl->commit_sync(tp, next_offset_to_consume);
 }
 
 
-void MYMQ_Client::join_group(const std::string& groupid) {
+void MYMQ_Consumer::join_group(std::string groupid) {
     pimpl->join_group(groupid);
 }
 
-MYMQ_Client::ClientErrorCode MYMQ_Client::leave_group(const std::string& groupid) {
-   return pimpl->leave_group(groupid);
+MYMQ_Consumer::ClientErrorCode MYMQ_Consumer::leave_group() {
+   return pimpl->leave_group();
 }
 
 
 
-std::unordered_set<MYMQ_Public::TopicPartition> MYMQ_Client::get_assigned_partition() {
+std::unordered_set<MYMQ_Public::TopicPartition> MYMQ_Consumer::get_assigned_partition() {
    return pimpl->get_assigned_partition();
 }
 
 
 
-bool MYMQ_Client::get_is_ingroup() {
+bool MYMQ_Consumer::get_is_ingroup() {
     return pimpl->get_is_ingroup();
 }

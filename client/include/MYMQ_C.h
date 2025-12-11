@@ -34,7 +34,7 @@ public:
                     const std::string& value,
                     MYMQ_Public::PushResponceCallback cb=MYMQ_Public::PushResponceCallback());
 
-    void create_topic(const std::string& topicname, size_t parti_num = 1);
+    void create_topic(std::string topicname, size_t parti_num = 1);
 
 private:
     // 2. 唯一的成员变量：指向实现的指针
@@ -45,7 +45,7 @@ private:
 
 
 
-class MYMQ_Client {
+class MYMQ_Consumer {
 public:
 
     using ConsumerRecord = MYMQ_Public::ConsumerRecord;
@@ -54,23 +54,22 @@ public:
 
 
 
-    MYMQ_Client(const std::string& clientid = std::string(), uint8_t ack_level = UINT8_MAX);
+    MYMQ_Consumer(const std::string& clientid = std::string(), uint8_t ack_level = UINT8_MAX);
 
-    ~MYMQ_Client();
+    ~MYMQ_Consumer();
 
 
-    MYMQ_Client(const MYMQ_Client&) = delete;
-    MYMQ_Client& operator=(const MYMQ_Client&) = delete;
-    MYMQ_Client(MYMQ_Client&&) noexcept;
-    MYMQ_Client& operator=(MYMQ_Client&&) noexcept;
+    MYMQ_Consumer(const MYMQ_Consumer&) = delete;
+    MYMQ_Consumer& operator=(const MYMQ_Consumer&) = delete;
+    MYMQ_Consumer(MYMQ_Consumer&&) noexcept;
+    MYMQ_Consumer& operator=(MYMQ_Consumer&&) noexcept;
 
     // --- Public API (Mirrored from MYMQ_clientuse) ---
 
 
 void  trigger_pull();
 
-    ClientErrorCode push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value
-                         ,MYMQ_Public::PushResponceCallback cb=MYMQ_Public::PushResponceCallback());
+
     ClientErrorCode pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_ms=5000);
     ClientErrorCode pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
                     size_t poll_wait_timeout_ms,
@@ -81,15 +80,15 @@ void  trigger_pull();
     ClientErrorCode commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb=MYMQ_Public::CommitAsyncResponceCallback());
     void create_topic(const std::string& topicname, size_t parti_num = 1);
     void set_pull_bytes(size_t bytes);
-    size_t get_position_consumed(const MYMQ_Public::TopicPartition& tp);
+    ClientErrorCode get_position_consumed(const MYMQ_Public::TopicPartition& tp,size_t& pos);
 
     void subscribe_topic(const std::string& topicname);
     void unsubscribe_topic(const std::string& topicname);
 
     ClientErrorCode commit_sync(const MYMQ_Public::TopicPartition& tp, size_t next_offset_to_consume);
 
-    void join_group(const std::string& groupid);
-    ClientErrorCode leave_group(const std::string& groupid);
+    void join_group(std::string groupid);
+    ClientErrorCode leave_group();
 
     std::unordered_set<MYMQ_Public::TopicPartition> get_assigned_partition();
 

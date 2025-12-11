@@ -1,12 +1,11 @@
 #ifndef MYMQ_PUBLICCODES_H
 #define MYMQ_PUBLICCODES_H
 
-// --- 必需的 C++ 标准库头文件 ---
-#include <cstdint>       // For uint16_t, size_t
-#include <string>        // For std::string
-#include <sstream>       // For ConsumerRecord::turn_time_to_string
-#include <ctime>         // For std::time_t, std::tm, std::localtime
-#include <iomanip>       // For std::put_time, std::setw, std::setfill
+#include <cstdint>
+#include <string>
+#include <sstream>
+#include <ctime>
+#include <iomanip>
 #include <functional>
 #include <variant>
 #include<memory>
@@ -40,6 +39,7 @@ enum class CommonErrorCode : uint16_t {
     REQUEST_TIMEOUT=4018,
     UNKNOWN_TOPICPARTITION=4019,
     CLIENT_NOT_IN_GROUP=4020,
+    UPDATE_GENERATION=4021,
 
 
 
@@ -70,25 +70,26 @@ inline std::string to_string(CommonErrorCode code) {
     case CommonErrorCode::CRC_VERIFY_FAILED: return "CRC_VERIFY_FAILED";
     case CommonErrorCode::FAILED_PARASE_PULL_DATA: return "FAILED_PARASE_PULL_DATA";
     case CommonErrorCode::COMMIT_OFFSET_TIMEOUT: return "COMMIT_OFFSET_TIMEOUT";
+    case CommonErrorCode::REQUEST_TIMEOUT: return "REQUEST_TIMEOUT";
+    case CommonErrorCode::UNKNOWN_TOPICPARTITION: return "UNKNOWN_TOPICPARTITION";
+    case CommonErrorCode::CLIENT_NOT_IN_GROUP: return "CLIENT_NOT_IN_GROUP";
     case CommonErrorCode::FULL_SEGMENT: return "FULL_SEGMENT";
     case CommonErrorCode::FAILED_ALLOCATE: return "FAILED_ALLOCATE";
+    case CommonErrorCode::IO_ERROR: return "IO_ERROR";
     default: return "UNKNOWN_SERVER_ERROR (" + std::to_string(static_cast<uint16_t>(code)) + ")";
     }
 }
-
 // ----------------------------------------------------------------------
 // 2. 公共客户端错误码定义 (对应 MYMQ::MYMQ_Client::ErrorCode)
 // ----------------------------------------------------------------------
 
 enum class ClientErrorCode :uint16_t{
     NOT_IN_GROUP=1000,
-    INVALID_TOPIC=1001,
-    INVALID_PARTITION=1002,
     NULL_ERROR=1003,
     PULL_TIMEOUT=1004,
     PULL_OTHER_IN_PULL=1005,
     COMMIT_SYNC_TIMEOUT=1006,
-    INVALID_PARTITION_OR_TOPIC=1007,
+    INVALID_TOPIC_PARTITION=1007,
     ZSTD_UNAVAILABLE=1008,
     AUTOCOMMIT_ENABLE=1009,
     INVALID_GROUPID=1010,
@@ -107,20 +108,24 @@ enum class ClientErrorCode :uint16_t{
 inline std::string to_string(ClientErrorCode code) {
     switch (code) {
     case ClientErrorCode::NOT_IN_GROUP: return "NOT_IN_GROUP";
-    case ClientErrorCode::INVALID_TOPIC: return "INVALID_TOPIC";
-    case ClientErrorCode::INVALID_PARTITION: return "INVALID_PARTITION";
     case ClientErrorCode::NULL_ERROR: return "NULL_ERROR";
     case ClientErrorCode::PULL_TIMEOUT: return "PULL_TIMEOUT";
     case ClientErrorCode::PULL_OTHER_IN_PULL: return "PULL_OTHER_IN_PULL";
     case ClientErrorCode::COMMIT_SYNC_TIMEOUT: return "COMMIT_SYNC_TIMEOUT";
-    case ClientErrorCode::INVALID_PARTITION_OR_TOPIC: return "INVALID_PARTITION_OR_TOPIC";
+    case ClientErrorCode::INVALID_TOPIC_PARTITION: return "INVALID_PARTITION_OR_TOPIC";
     case ClientErrorCode::ZSTD_UNAVAILABLE: return "ZSTD_UNAVAILABLE";
     case ClientErrorCode::AUTOCOMMIT_ENABLE: return "AUTOCOMMIT_ENABLE";
     case ClientErrorCode::INVALID_GROUPID: return "INVALID_GROUPID";
+    case ClientErrorCode::UNKNOWN_ERROR: return "UNKNOWN_ERROR"; // <-- 补齐
+    case ClientErrorCode::EMPTY_RECORD: return "EMPTY_RECORD"; // <-- 补齐
+    case ClientErrorCode::INVALID_OPRATION: return "INVALID_OPRATION"; // <-- 补齐
+    case ClientErrorCode::REACHED_MAX_FLYING_REQUEST: return "REACHED_MAX_FLYING_REQUEST"; // <-- 补齐
+    case ClientErrorCode::CRC_VERIFY_FAILED: return "CRC_VERIFY_FAILED"; // <-- 补齐
+    case ClientErrorCode::PARTIAL_PARASE_FAILED: return "PARTIAL_PARASE_FAILED"; // <-- 补齐
+    case ClientErrorCode::NOT_REGISTER: return "NOT_REGISTER"; // <-- 补齐
     default: return "UNKNOWN_CLIENT_ERROR_CODE (" + std::to_string(static_cast<uint16_t>(code)) + ")";
     }
 }
-
 
 
 struct TopicPartition
