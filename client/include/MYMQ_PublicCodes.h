@@ -249,9 +249,22 @@ struct hash<MYMQ_Public::TopicPartition> {
 
         const std::size_t h2 = std::hash<size_t>{}(tp.partition);
 
-       return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
+        return h1 ^ (h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2));
     }
 };
 } // namespace std
 
+struct TbbHashCompare {
+    // 1. TBB 要求静态 hash 函数
+    static size_t hash(const MYMQ_Public::TopicPartition& x) {
+        // 这里直接复用你已经写好的 std::hash 特化
+        return std::hash<MYMQ_Public::TopicPartition>{}(x);
+    }
+
+    // 2. TBB 要求静态 equal 函数
+    static bool equal(const MYMQ_Public::TopicPartition& x, const MYMQ_Public::TopicPartition& y) {
+        // 复用你已经写好的 operator==
+        return x == y;
+    }
+};
 #endif // MYMQ_PUBLICCODES_H

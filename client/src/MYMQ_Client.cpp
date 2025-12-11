@@ -633,12 +633,13 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-        std::string memberid;
+        std::string memberid{""};
         int gen_id=-1;
         std::set<std::string> topics;
+        bool is_join=0;
 
 
-            if(!groupid.empty()){
+            if(groupid.empty()){
                  std::shared_lock<std::shared_mutex>  slock(info_basic.mtx);
              groupid=info_basic.groupid;
              memberid==info_basic.memberid;
@@ -648,10 +649,13 @@ MYMQ_clientuse::~MYMQ_clientuse(){
              }
 
             }
+            else{
+                is_join=1;
+            }
 
 
         MessageBuilder mb;
-        mb.append(groupid,memberid,gen_id,topics_updated);
+        mb.append(groupid,is_join,memberid,gen_id,topics_updated);
         if(topics_updated){
             mb.append_size_t(topics.size());
             for(const auto& t:topics){
