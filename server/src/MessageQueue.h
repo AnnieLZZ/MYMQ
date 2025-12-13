@@ -8,7 +8,6 @@
 #include <bitset>
 #include <semaphore.h>
 #include <type_traits>
-#include "uuid/uuid.h"
 #include <optional>
 #include <tbb/tbb.h>
 #include"MYMQ_Publiccodes.h"
@@ -30,10 +29,10 @@ using Eve=MYMQ::EventType;
 using ConsumerGroupState=MYMQ_Server::ConsumerGroupState;
 using ServerConsumerInfo=MYMQ_Server::ServerConsumerInfo;
 using Byte_view_pair=std::pair<const unsigned char*, uint32_t>;
-using Gstate=ConsumerGroupState::GroupState;
 class Partition;
 using TopicPartition=MYMQ_Public::TopicPartition;
 using TopicPartition_to_Log_Map=tbb::concurrent_hash_map<TopicPartition,std::shared_ptr< Partition>,TbbHashCompare>;
+using MemberMap=tbb::concurrent_hash_map<std::string,ServerConsumerInfo> ;
 
 /////函数声明区
 
@@ -539,40 +538,6 @@ public:
 
     }
 
-    bool is_leader(const std::string& groupid,const std::string& memberid){
-        std::shared_lock<std::shared_mutex> global_lock(group_states_mutex_);
-        auto it=group_states_.find(groupid);
-        if(it==group_states_.end()){
-            return 0;
-        }
-        ConsumerGroupState& group_state = it->second;
-        std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
-        global_lock.unlock();
-        if(group_state.leader_id!=memberid){
-            return 0;
-        }
-
-        return 1;
-    }
-
-
-
-
-    Err send_notice(const std::string& groupid,uint32_t correlation_id,const std::string& memberid,Eve event_type,const Mybyte& msg_){
-        std::shared_lock<std::shared_mutex> global_lock(group_states_mutex_);
-        auto it=group_states_.find(groupid);
-        if(it==group_states_.end()){
-            return Err::GROUP_NOT_FOUND;
-        }
-        ConsumerGroupState& group_state = it->second;
-        std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
-        global_lock.unlock();
-
-
-  return Err::NULL_ERROR;
-
-    }
-
 
     void initialize() {
         if(!init_ed){
@@ -581,114 +546,102 @@ public:
         }
 
     }
-    std::pair< ConsumerGroupState::GroupState,bool> get_SpecificState(const std::string& groupid){
-        std::shared_lock<std::shared_mutex> global_lock(group_states_mutex_);
-        auto it=group_states_.find(groupid);
-        if(it==group_states_.end()){
-            return {ConsumerGroupState::GroupState::EMPTY,0};
-        }
-        ConsumerGroupState& group_state = it->second;
-        std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
-        global_lock.unlock();
-        return {group_state.state,1};
+
+
+     Err leave_group(const std::string& group_id,const std::string& memberid){
+
+         std::shared_lock<std::shared_mutex> global_lock(group_states_mutex_);
+         auto it = group_states_.find(group_id);
+         if (it == group_states_.end()) {
+             global_lock.unlock();
+             throw (Err::GROUP_NOT_FOUND);
+
+         }
+         auto  group_state_ptr = it->second;
+
+         global_lock.unlock();
+
+       auto res=  group_state_ptr->handle_leave(memberid,*cache_metadata_ptr);
+
+       if(!res){
+           return Err::MEMBER_NOT_FOUND;
+       }
+       return Err::NULL_ERROR;
     }
-
-
-    // 1. JoinGroup: 消费者加入组
-    std::pair<int,Err>  joinGroup(const std::string& group_id, ServerConsumerInfo& consumer_info) {
-        std::pair<int,Err> res{-1,Err::NULL_ERROR};
-        std::string member_id = consumer_info.memberid.empty() ? uuid_gen_str() : consumer_info.memberid;
-        consumer_info.memberid=std::move(member_id) ;
-
-        std::unique_lock<std::shared_mutex> global_lock(group_states_mutex_);
-        auto [it, is_new_group] = group_states_.emplace(std::piecewise_construct,
-                std::forward_as_tuple(group_id),
-                std::forward_as_tuple(group_id));
-                ConsumerGroupState& group_state = it->second;
-                std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
-                global_lock.unlock();
-
-                res.first=group_state.generation_id;
-                if(group_state.state==Gstate::AWAITING_SYNC){
-            group_lock.unlock();
-            res.second=Err::REBALANCE_IN_PROGRESS;
-
-            return res;
-        }
-        else{
-            group_lock.unlock();
-            ServerConsumerInfo captured_consumer_info = consumer_info;
-            triggerRebalance(group_id, captured_consumer_info);
-            return res;
-        }
-    }
-
-
 
     // 3. Heartbeat: 消费者发送心跳
-    HeartbeatResponce heartbeat(const std::string& group_id, const std::string& member_id) {
-        HeartbeatResponce responce={-1,0};
+    HeartbeatResponce heartbeat(const std::string& group_id, const std::string& member_id,size_t gen_id) {
+        HeartbeatResponce resp;
         std::shared_lock<std::shared_mutex> global_lock(group_states_mutex_);
         auto it = group_states_.find(group_id);
         if (it == group_states_.end()) {
             global_lock.unlock();
-            throw (Err::GROUP_NOT_FOUND);
+             resp.errorcode=Err::GROUP_NOT_FOUND;
+            return resp;
 
         }
-        ConsumerGroupState& group_state = it->second;
-        std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
+        auto  group_state_ptr = it->second;
+
         global_lock.unlock();
 
-        if (group_state.members.find(member_id) == group_state.members.end()) {
-            throw (Err::MEMBER_NOT_FOUND);
-        }
+       auto res= group_state_ptr->handle_heartbeat(member_id,gen_id);
+       if(res.first==0){
+           resp.errorcode=Err::MEMBER_NOT_FOUND;
+       }
+       else if(res.first!=gen_id){
+           resp.assign=std::move(res.second);
+           resp.errorcode=Err::UPDATE_GENERATION;
+       }
+       resp.generation_id=res.first;
+       return resp;
 
 
 
-
-        auto now=std::chrono::steady_clock::now();
-        if(group_state.state==Gstate::STABLE){
-            group_state.last_heartbeat[member_id] = now;
-        }
-
-
-        group_state.generation_id++;
-        responce.generation_id=group_state.generation_id;
-
-        return responce;
     }
 
-    // 4. LeaveGroup: 消费者主动离开组
-    Err leaveGroup(const std::string& group_id, const std::string& member_id) {
+    HeartbeatResponce update_subscription(const std::string& group_id, std::string& member_id, size_t gen_id, const std::set<std::string>& client_full_list) {
+        HeartbeatResponce resp;
+
+
         std::unique_lock<std::shared_mutex> global_lock(group_states_mutex_);
+
         auto it = group_states_.find(group_id);
         if (it == group_states_.end()) {
-            global_lock.unlock();
-            cerr("Warning: LeaveGroup: Group not found: " + group_id );
-            return Err::GROUP_NOT_FOUND;
-        }
-        ConsumerGroupState& group_state = it->second;
-
-        std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
-        global_lock.unlock();
-        if (group_state.members.erase(member_id) > 0) {
-            group_state.last_heartbeat.erase(member_id);
-            group_state.map_subscribed_topics.erase(member_id);
-            if (group_state.members.empty()) {
-                group_state.state = ConsumerGroupState::EMPTY;
-                group_lock.unlock();
+            if (gen_id == 0) {
+                // 自动创建
+                auto new_group = std::make_shared<ConsumerGroupState>(group_id);
+                group_states_.emplace(group_id, new_group);
+                it = group_states_.find(group_id);
+            } else {
+                // 找不到 Group 且不是新建请求
+                resp.errorcode=Err::GROUP_NOT_FOUND;
+                return resp;
             }
-            triggerRebalance(group_id);
-        } else {
-            cerr("Warning: LeaveGroup: Member '" + member_id + "' not found in group '" + group_id+"' ." ) ;
-            return Err::MEMBER_NOT_FOUND;
+        }
+        auto group_state_ptr = it->second;
+
+        // 拿到 shared_ptr 后可以尽早释放全局锁，减小锁粒度
+        global_lock.unlock();
+
+        if (member_id.empty()) {
+            member_id = uuid_gen_str();
         }
 
-        out("LeaveGroup: Member " + member_id + " leave group " + group_id);
-        return Err::NULL_ERROR;
+        // 确保 cache_metadata_ptr 已经初始化！
+        if (!cache_metadata_ptr) {
+             // Log Error: Cache not initialized
+             return resp; // 或者抛异常
+        }
+
+        auto res = group_state_ptr->update_subscription(member_id, client_full_list, *cache_metadata_ptr);
+
+        if (res.first != gen_id) {
+            resp.assign = std::move(res.second);
+            resp.errorcode = Err::UPDATE_GENERATION;
+        }
+        resp.generation_id = res.first;
+        return resp;
     }
-
-
 
 private:
 
@@ -718,334 +671,15 @@ private:
 
 
     void checkLiveness() {
-        std::vector<std::string> groups_to_rebalance;
-        std::vector<std::string> empty_groups_to_remove;
-
-        std::vector<std::string> current_group_ids;
-        {
-            std::shared_lock<std::shared_mutex> global_read_lock(group_states_mutex_);
-            if (group_states_.empty()) {
-                return;
-            }
-            for (const auto& pair : group_states_) {
-                current_group_ids.push_back(pair.first);
-            }
-        }
-
-        for (const std::string& group_id : current_group_ids) {
-            std::shared_lock<std::shared_mutex> global_read_lock_for_group_ref(group_states_mutex_);
-            auto it = group_states_.find(group_id);
-            if (it == group_states_.end()) {
-                global_read_lock_for_group_ref.unlock();
-                continue;
-            }
-            ConsumerGroupState& group_state = it->second;
-
-            std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
-            global_read_lock_for_group_ref.unlock();
-
-            if(group_state.state == ConsumerGroupState::EMPTY){
-                empty_groups_to_remove.push_back(group_id);
-                group_lock.unlock();
-                continue;
-            }
-
-
-            if (group_state.state == ConsumerGroupState::JOIN_COLLECTING ||
-                    group_state.state == ConsumerGroupState::AWAITING_SYNC) {
-                group_lock.unlock();
-                continue;
-            }
-
-            auto now = std::chrono::steady_clock::now();
-            bool rebalance_needed = false;
-            std::vector<std::string> members_to_remove; // Collect members to remove
-
-            // Iterate through members to find timed-out ones
-            for (const auto& member_pair : group_state.members) {
-                auto heartbeat_it = group_state.last_heartbeat.find(member_pair.first);
-                if (heartbeat_it != group_state.last_heartbeat.end() &&
-                        std::chrono::duration_cast<std::chrono::milliseconds>(now - heartbeat_it->second).count() >= session_timeout_ms_) {
-                    members_to_remove.push_back(member_pair.first);
-                    rebalance_needed = true;
-                }
-            }
-
-            for (const std::string& member_id : members_to_remove) {
-                timer.cancel_task( group_state.rebalance_timeout_taskid);
-                timer.cancel_task(group_state.join_collect_timeout_taskid);
-                group_state.members.erase(member_id);
-                group_state.last_heartbeat.erase(member_id);
-                group_state.map_subscribed_topics.erase(member_id);
-                cerr("CheckHeartbeat : Group '"+group_id+"' : Member '"+member_id+"' heartbeat timeout .");
-            }
-
-            if (rebalance_needed) {
-
-
-                if (group_state.members.empty()) {
-                    group_state.state = ConsumerGroupState::EMPTY;
-                    empty_groups_to_remove.push_back(group_id);
-                } else {
-                    groups_to_rebalance.push_back(group_id);
-                }
-            }
-            group_lock.unlock(); // 释放组锁
-        }
-
-
-        // Phase 2: Perform map modifications (erase empty groups)
-        if (!empty_groups_to_remove.empty()) {
-            std::unique_lock<std::shared_mutex> global_write_lock(group_states_mutex_);
-            for (const std::string& group_id : empty_groups_to_remove) {
-                group_states_.erase(group_id);
-                cerr("Checkliveness : Group '"+group_id+"' is empty now . Remove .");
-            }
-        }
-
-        // Phase 3: Trigger rebalances asynchronously
-        for (const auto& group_id : groups_to_rebalance) {
-            triggerRebalance(group_id); // 调用 triggerRebalance，它会处理调度
-        }
     }
 
 
-
-    Mybyte assign_prepare_action(ConsumerGroupState& group_state) {
-        group_state.leader_id=group_state.members.begin()->first;
-
-        MB mb;
-        mb.append(group_state.leader_id);
-
-
-        std::set<std::string > set_this_group_partitionnum_of_topic;
-
-        mb.append_size_t(group_state.map_subscribed_topics.size());
-
-        {
-            for(const auto& [member,subsribe_topics]:group_state.map_subscribed_topics){
-                mb.append(member,static_cast<size_t>(subsribe_topics.size()) );
-                for(const auto& topicname:subsribe_topics){
-                    mb.append(topicname);
-                    set_this_group_partitionnum_of_topic.emplace(topicname);
-                }
-            }
-
-        }
-
-        return mb.data;
-    }
-
-
-    void forcestop_rebalance(const std::string& group_id){
-        std::unique_lock<std::shared_mutex> global_lock(group_states_mutex_);
-        auto it = group_states_.find(group_id);
-        if (it == group_states_.end()) {
-            global_lock.unlock();
-            std::cerr << "Rebalance: Group " << group_id << " not found, possibly removed." << std::endl;
-
-            return;
-        }
-        ConsumerGroupState& group_state = it->second;
-
-        std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
-        global_lock.unlock();
-
-
-        forcestop_rebalance(group_state);
-
-
-    }
-
-    void forcestop_rebalance(ConsumerGroupState& group_state){
-        if(group_state.state!=Gstate::STABLE){
-            out("rebalance be forced to stop");
-        }
-
-        group_state.state=Gstate::STABLE;
-        group_state.rebalance_ing.store(0);
-
-        timer.commit_ms([this,&group_state]{
-            timer.cancel_task(group_state.join_collect_timeout_taskid);
-            timer.cancel_task(group_state.rebalance_timeout_taskid);
-        },10,10,1);
-
-    }
-
-    void Rebalance(const std::string& group_id) {
-
-        struct NotifyTask {
-                uint32_t correlation_id;
-                std::vector<unsigned char> data;
-                TcpSession session;
-            };
-            std::vector<NotifyTask> notifications;
-        std::unique_lock<std::shared_mutex> global_lock(group_states_mutex_);
-        auto it = group_states_.find(group_id);
-        if (it == group_states_.end()) {
-            global_lock.unlock();
-            std::cerr << "Rebalance: Group " << group_id << " not found, possibly removed." << std::endl;
-            return;
-        }
-        ConsumerGroupState& group_state = it->second;
-
-        std::unique_lock<std::mutex> group_lock(group_state.state_mutex); // 持有组锁
-        global_lock.unlock(); // 释放全局锁
-
-
-        if(group_state.state != ConsumerGroupState::JOIN_COLLECTING){
-            return ;
-        }
-
-
-        if(group_state.members.empty()){
-            group_state.state=Gstate::EMPTY;
-            forcestop_rebalance(group_state);
-            return ;
-        }
-
-
-
-        // 执行分区分配准备逻辑
-        auto memberinfs = assign_prepare_action(group_state);
-        group_state.state = ConsumerGroupState::AWAITING_SYNC;
-
-        cerr("Rebalance: Group " + group_id +" (gen " +std::to_string( group_state.generation_id) + ") moved to state 'AWAITING_SYNC' . Leader: " + group_state.leader_id);
-
-
-        notifications.reserve(group_state.members.size());
-        std::vector<std::pair<std::string, std::string>> members_to_notify;
-        for(const auto& member_pair : group_state.members){
-            MB mb;
-            mb.append(static_cast<uint16_t>(Err::NULL_ERROR),group_id,group_state.generation_id,member_pair.second.memberid);
-            if(member_pair.first == group_state.leader_id){
-                mb.append_uchar_vector(memberinfs);
-            }
-            else{
-                mb.append(Mybyte{});
-            }
-            notifications.push_back({
-
-                            member_pair.second.correlation_id_lastjoin,
-                            std::move(mb.data),
-                            member_pair.second.session
-                        });
-        }
-
-        group_lock.unlock();
-        for(auto task : notifications) {
-            task.session.send(Eve::SERVER_RESPONSE_JOIN_REQUEST_HANDLED,task.correlation_id,UINT16_MAX,task.data);
-
-            }
-
-
-
-    }
-
-    void loadConsumerinf(ConsumerGroupState& group_state, const ServerConsumerInfo& inf){
-        group_state.members.insert({inf.memberid,inf});
-        group_state.map_subscribed_topics[inf.memberid]=inf.subscribed_topics;
-        group_state.last_heartbeat[inf.memberid]=std::chrono::steady_clock::now();
-    }
-
-    // 触发重平衡
-    int triggerRebalance(const std::string& group_id,const ServerConsumerInfo& inf=ServerConsumerInfo()){
-
-        std::unique_lock<std::shared_mutex> global_lock(group_states_mutex_);
-        auto it = group_states_.find(group_id);
-        if (it == group_states_.end()) {
-            global_lock.unlock();
-            return -1;
-        }
-
-        ConsumerGroupState& group_state = it->second;
-
-        std::unique_lock<std::mutex> group_lock(group_state.state_mutex);
-        global_lock.unlock();
-
-
-         int generation_return=group_state.generation_id;
-        // 如果已经在重平衡任务调度过程中，则不再重复调度
-        std::weak_ptr<GroupCoordinator> weak_self = shared_from_this();
-        if (!group_state.rebalance_ing.load()) {
-            std::vector<std::string> expected_members;
-            expected_members.reserve(group_state.members.size());
-            for(auto pair:group_state.members){
-                expected_members.emplace_back(pair.second.memberid);
-            }
-            group_state.expected_members.reset(expected_members);
-            group_state.map_subscribed_topics.clear();
-            group_state.generation_id++;
-            group_state.leader_id.clear();
-            group_state.state = ConsumerGroupState::JOIN_COLLECTING;
-            group_state.rebalance_ing.store(1);
-            group_state.assignments.clear();
-
-            std::cerr << "TriggerRebalance: Group " << group_id << " entering PREPARING_REBALANCE (new gen: " << group_state.generation_id << ")" << std::endl;
-            generation_return=group_state.generation_id;
-
-            if(inf.generation_id!=-2){//离组时默认构造的inf，世代会是-2，仅仅是个标识，实际也用不到这个inf
-                loadConsumerinf(group_state,inf);
-                auto res= group_state.expected_members.callandcheck(inf.memberid);
-
-                if(res){
-                    if (auto self = weak_self.lock()) {
-                           group_lock.unlock();
-                   self->Rebalance(group_id);
-
-                    }
-
-                }
-                else{
-                    group_state.join_collect_timeout_taskid=timer.commit_ms(
-                                [weak_self, group_id]() {
-                        if (auto self = weak_self.lock()) {
-
-                            self->Rebalance(group_id);
-                        }
-                    },
-                    join_collect_timeout_ms_,
-                    join_collect_timeout_ms_,
-                    1
-                    );
-                }
-            }
-
-
-            group_state.rebalance_timeout_taskid=timer.commit_ms(
-                        [weak_self, group_id]() {
-                if (auto self = weak_self.lock()) {
-                    self->forcestop_rebalance(group_id);
-                }
-            },
-            rebalance_timeout_ms,
-            rebalance_timeout_ms,
-            1
-            );
-        }
-        else{
-            if(group_state.state==Gstate::JOIN_COLLECTING){
-                loadConsumerinf(group_state,inf);
-                auto res= group_state.expected_members.callandcheck(inf.memberid);
-
-                if(res){
-
-                    if (auto self = weak_self.lock()) {
-                 group_lock.unlock();
-                     self->Rebalance(group_id);
-                    }
-
-                }
-            }
-        }
-        return generation_return;
-    }
 
 private:
 
     std::shared_ptr<ConsumerOffset> consumer_offset_manager_;
 
-    std::map<std::string, ConsumerGroupState> group_states_; // group_id -> ConsumerGroupState
+    std::map<std::string,std::shared_ptr<ConsumerGroupState> > group_states_; // group_id -> ConsumerGroupState
     std::shared_mutex group_states_mutex_; // 保护 group_states_
 
     Timer timer;
@@ -1065,10 +699,10 @@ class MessageQueue : public std::enable_shared_from_this<MessageQueue> {
 
 public:
     explicit MessageQueue(const std::string& data_root_dir = "./data/")
-        : data_root_dir_(data_root_dir),
-          topics_metadata_filename_(data_root_dir_ + "/topics_metadata.conf"),cache_metadata(nullptr)
+        : data_root_dir_(data_root_dir),cache_metadata(nullptr)
 
     {
+        topics_metadata_filename_ = data_root_dir_ + "/topics_metadata.conf";
         std::filesystem::create_directories(data_root_dir_);
         init();
         load_topics_metadata(); // 这一步会尝试从文件加载并创建 consumer_offset_topic_ptr_
@@ -1109,11 +743,16 @@ public:
         std::string server_IP;
         size_t PORT;
         try {
-           server_IP= cm_communication.getstring("communication.propertity");
+           server_IP= cm_communication.getstring("IP");
         } catch (std::exception& e) {
-            cerr("IP not found");
+            throw ("IP not found");
         }
-        PORT= cm_communication.get_size_t("port");
+        try {
+            PORT= cm_communication.get_size_t("port");
+        } catch (std::exception& e) {
+            throw ("port not found");
+        }
+
         cache_metadata=std::make_shared<MetadataCache>(server_IP,PORT);
     }
 
@@ -1207,24 +846,7 @@ public:
        return partition_ptr->push(msg_view);
     }
 
-    std::pair<MesLoc,Err>  pull(size_t target_offset,const std::string& groupid,const std::string& topicname, size_t partition_id,size_t byte_need) {
-
-        auto statepair=get_SpecificState(groupid);
-        if(!statepair.second){
-            return {MesLoc{},Err::GROUP_NOT_FOUND};
-        }
-
-        if(statepair.first==ConsumerGroupState::GroupState::STABLE){
-
-        }
-        else if(statepair.first==ConsumerGroupState::GroupState::EMPTY){
-            return {MesLoc{},Err::EMPTY_GROUP};
-        }
-        else{
-            return {MesLoc{},Err::REBALANCE_IN_PROGRESS};
-        }
-
-
+    std::pair<MesLoc,Err>  pull(size_t target_offset,const std::string& topicname, size_t partition_id,size_t byte_need) {
 
         TopicPartition_to_Log_Map::const_accessor cac;
         if(!map_tp_to_log.find(cac,TopicPartition(topicname,partition_id))){
@@ -1282,31 +904,14 @@ public:
     }
 
 
-
-    std::pair<int,Err> joinGroup(const std::string& groupid, ServerConsumerInfo& inf){
-        for(const auto&it:inf.subscribed_topics){
-            create_topic(it);
-        }
-
-        return groupcoordinator_->joinGroup(groupid,inf);
-    }
-
-    Err leave_group(const std::string& groupid,const std::string& memberid){
-       return groupcoordinator_->leaveGroup(groupid,memberid);
+    HeartbeatResponce heartbeat(const std::string& group_id, const std::string& member_id,size_t gen_id) {
+        return groupcoordinator_->heartbeat(group_id, member_id,gen_id);
     }
 
 
-
-
-    HeartbeatResponce heartbeat(const std::string& group_id, const std::string& member_id) {
-        return groupcoordinator_->heartbeat(group_id, member_id);
+    HeartbeatResponce update_subscription(const std::string& group_id, std::string& member_id, size_t gen_id,const std::set<std::string>& client_full_list){
+       return groupcoordinator_->update_subscription(group_id,member_id,gen_id,client_full_list);
     }
-
-    std::pair< ConsumerGroupState::GroupState,bool> get_SpecificState(const std::string& groupid){
-        return  groupcoordinator_->get_SpecificState(groupid);
-
-    }
-
 
 
 private:
@@ -1330,7 +935,7 @@ private:
                 auto partition=mp.read_size_t();
                 auto offset=mp.read_size_t();
                 auto bytes_need=mp.read_size_t();
-                auto res= pull(offset,groupid,topicname,partition,bytes_need);
+                auto res= pull(offset,topicname,partition,bytes_need);
                 bool failed=1;
                 if(res.second==Err::NULL_ERROR){
                     SendFileTask file_resp(res.first, topicname, partition,correlation_id,ack_level);
@@ -1443,32 +1048,39 @@ private:
             }
              else if(type==MYMQ::EventType::CLIENT_REQUEST_HEARTBEAT){
 
-                auto groupid=mp.read_string();
-                auto is_join_group=mp.read_bool();
+                auto groupid=mp.read_string();               
                 auto memberid=mp.read_string();
                 auto generationid=mp.read_int();
+                bool is_join_group=memberid.empty();
+                std::string clientid;
+                if(is_join_group){
+                    clientid=mp.read_string();
+                }
                 auto need_update_topics=mp.read_bool();
-                std::unordered_set<std::string> topics;
+                std::set<std::string> topics;
 
 
                 if(need_update_topics){
-                    auto topicnum=mp.read_size_t();
-                    topics.reserve(topicnum);
-                    for(size_t i=0;i<topicnum;i++){
+                    auto topic_add_num=mp.read_size_t();
+                    for(size_t i=0;i<topic_add_num;i++){
                         topics.emplace(mp.read_string());
                     }
                 }
 
 
-                if(is_join_group){
-                    ServerConsumerInfo inf;
-                    auto joinres= joinGroup(groupid,inf);
+                HeartbeatResponce res;
+                if(need_update_topics){
+                   res= update_subscription(groupid,memberid,generationid,topics);
+                }
+                else{
+                   res= heartbeat(groupid,memberid,generationid);
                 }
 
-                auto res= heartbeat(groupid,memberid);
                 MB mb;
-                mb.append(groupid,res.generation_id,res.groupstate_digit);
-               session.send(Eve::SERVER_RESPONCE_HEARTBEAT,correlation_id,ack_level,mb.data);
+                mb.append(groupid,is_join_group,res.generation_id,memberid);
+                session.send(Eve::SERVER_RESPONCE_HEARTBEAT,correlation_id,ack_level,mb.data);
+
+
 
 
             }
@@ -1514,8 +1126,8 @@ private:
         }
     }
 
-    bool is_leader(const std::string& groupid,const std::string& memberid){
-        return groupcoordinator_->is_leader(groupid,memberid);
+    Err leave_group(const std::string& groupid,const std::string& memberid){
+        return groupcoordinator_->leave_group(groupid,memberid);
     }
 
     std::map<std::string, std::map<std::string, std::set<size_t>>> parse_assignments_message(const Mybyte& serialized_data) {
@@ -1561,10 +1173,10 @@ private:
     std::string data_root_dir_;
     std::string topics_metadata_filename_;
     TopicPartition_to_Log_Map map_tp_to_log;
-    std::shared_ptr< MetadataCache > cache_metadata;
+    std::shared_ptr< MetadataCache > cache_metadata=nullptr;
 
 
-    std::shared_ptr<GroupCoordinator> groupcoordinator_;
+    std::shared_ptr<GroupCoordinator> groupcoordinator_=nullptr;
 
 
     Server server_;

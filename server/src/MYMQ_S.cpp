@@ -7,59 +7,7 @@ MYMQ_S::MYMQ_S()
 
 }
 
-
-// 析构函数：必须在此定义，以允许 std::unique_ptr 销毁不完整类型
 MYMQ_S::~MYMQ_S() = default;
 
-// --- 所有公共API的转发实现 ---
-
-size_t MYMQ_S::get_partition_endoffset(const std::string& topicname, size_t partition)
-{
-    return pimpl->get_partition_endoffset(topicname, partition);
-}
-
-void MYMQ_S::load_topics_metadata()
-{
-    pimpl->load_topics_metadata();
-}
-
-void MYMQ_S::save_topics_metadata()
-{
-    pimpl->save_topics_metadata();
-}
-
-Err MYMQ_S::push(const Byte_view_pair& msg_view, const std::string& topicname, size_t partition)
-{
-    return pimpl->push(msg_view, topicname, partition);
-}
-
-std::pair<MesLoc, Err> MYMQ_S::pull(size_t target_offset, const std::string& groupid, const std::string& topicname, size_t partition, size_t byte_need)
-{
-    return pimpl->pull(target_offset, groupid, topicname, partition, byte_need);
-}
-
-bool MYMQ_S::create_topic(const std::string& topicname, size_t parti_num)
-{
-    return pimpl->create_topic(topicname, parti_num);
-}
-
-Err MYMQ_S::commit_sync(const std::string& topicname, size_t partition, uint32_t consumeroffset_parid_hash, const std::string& key, uint32_t offset_digit)
-{
-    return pimpl->commit_sync(topicname, partition, consumeroffset_parid_hash, key, offset_digit);
-}
-
-
-
-Err MYMQ_S::leave_group(const std::string& groupid, const std::string& memberid)
-{
-    return pimpl->leave_group(groupid, memberid);
-}
-
-
-
-HeartbeatResponce MYMQ_S::heartbeat(const std::string& group_id, const std::string& member_id)
-{
-    return pimpl->heartbeat(group_id, member_id);
-}
 
 

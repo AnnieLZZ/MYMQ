@@ -1,18 +1,20 @@
+#ifndef CONTROLLER_H
+#define CONTROLLER_H
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <shared_mutex>
 #include <optional>
-constexpr int LOCAL_BROKER_ID = 0;
+constexpr size_t LOCAL_BROKER_ID=0;
 // 简单的 Broker 信息（单机其实只需要存一份全局配置即可）
 struct BrokerNode {
-    int id;
+    size_t id;
     std::string host;
     int port;
 };
 
 struct PartitionMetadata {
-    int partition_id;
+    size_t partition_id;
     int leader_id; // 永远是 0
 };
 
@@ -21,7 +23,7 @@ private:
     mutable std::shared_mutex rw_lock_;
 
     // Topic -> (PartitionID -> Meta)
-    std::unordered_map<std::string, std::unordered_map<int, PartitionMetadata>> topics_map_;
+    std::unordered_map<std::string, std::unordered_map<size_t, PartitionMetadata>> topics_map_;
 
     // 单机模式下，我们只需要存自己的信息
     BrokerNode local_node_;
@@ -50,18 +52,6 @@ public:
         return true;
     }
 
-    bool getTopic_parti_num(const std::string& topic, size_t& parti_num) {
-        std::shared_lock lock(rw_lock_);
-
-        auto it = topics_map_.find(topic);
-        if (it == topics_map_.end()) {
-            return false; // Topic 不存在
-        }
-
-        parti_num=it->second.size();
-        return true;
-    }
-
     // 2. Client 准备发送消息，问：Partition X 的 Leader 在哪？
     // 单机版逻辑：只要 Topic 和 Partition 存在，Leader 就是我！
     std::optional<BrokerNode> getPartitionLeader(const std::string& topic, int partition_id) {
@@ -77,25 +67,35 @@ public:
         return local_node_;
     }
 
-    // --- 写操作 (管理类操作) ---
+    bool get_partition_count(const std::string& topic,size_t& count){
+        std::shared_lock lock(rw_lock_);
+        auto topic_it = topics_map_.find(topic);
+        if (topic_it == topics_map_.end()) return 0;
 
-    // 创建 Topic（通常在服务器启动加载配置，ec或者收到 CreateTopic 命令时调用）
+        count = topic_it->second.size();
+
+        return 1;
+    }
+
+    // --- 写操作 (管理类操作) ---
 
     bool createTopic(const std::string& topic, size_t partition_count) {
             std::unique_lock lock(rw_lock_);
 
-            // 1. 检查是否存在
+            // 1. 先检查是否存在
             if (topics_map_.find(topic) != topics_map_.end()) {
-                return false; // 已经有了，返回 0
+                return false; // 已存在，创建失败
             }
 
             auto& partitions = topics_map_[topic];
 
-            for (int i = 0; i < partition_count; ++i) {
+            // 3. 填充这个新 map
+            for (size_t i = 0; i < partition_count; ++i) {
                 partitions[i] = PartitionMetadata{i, LOCAL_BROKER_ID};
             }
 
-            return true; // 创建成功，返回 1
+            return true;
         }
-
 };
+
+#endif // CONTROLLER_H

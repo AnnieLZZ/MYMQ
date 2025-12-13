@@ -32,37 +32,6 @@ public:
     MYMQ_S& operator=(MYMQ_S&&) = delete;
 
 
-    size_t get_partition_endoffset(const std::string& topicname,size_t partition );
-    void load_topics_metadata() ;
-
-
-
-    void save_topics_metadata() ;
-    Err push(const std::pair<const unsigned char*, uint32_t>& msg_view ,const std::string& topicname,size_t partition) ;
-    std::pair<MesLoc,Err>  pull(size_t target_offset,const std::string& groupid,const std::string& topicname, size_t partition,size_t byte_need) ;
-    bool create_topic(const std::string& topicname,size_t parti_num =1);
-
-    Err commit_sync(const std::string& topicname, size_t partition ,uint32_t consumeroffset_parid_hash,const std::string& key,uint32_t offset_digit) ;
-
-
-
-
-
-    Err leave_group(const std::string& groupid,const std::string& memberid);
-
-    std::pair<std::map<std::string, std::set<size_t>>,Err> sync_group(
-            const std::string& group_id,
-            const std::string& member_id,
-            int generation_id,
-            const std::map<std::string, std::map<std::string, std::set<size_t>>>& leader_assignments = {}
-            ) ;
-
-
-    HeartbeatResponce heartbeat(const std::string& group_id, const std::string& member_id) ;
-
-
-
-
 private:
     std::unique_ptr<MessageQueue> pimpl;
 };

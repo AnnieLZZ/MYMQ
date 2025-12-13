@@ -1,3 +1,4 @@
+
 #ifndef MYMQ_INNERCODES_H
 #define MYMQ_INNERCODES_H
 
@@ -352,8 +353,14 @@ struct LeaderAssignmentData {
 
 
 struct HeartbeatResponce{
-    int generation_id;
-    uint16_t groupstate_digit;//mapto {0,1,2,3} enum GroupState { STABLE, JOIN_COLLECTING, AWAITING_SYNC,EMPTY};
+
+    size_t generation_id{0};
+    std::map<std::string, std::set<size_t>> assign;
+    MYMQ_Public::CommonErrorCode errorcode=MYMQ_Public::CommonErrorCode::NULL_ERROR;
+    HeartbeatResponce(size_t genid,std::map<std::string, std::set<size_t>> assign_=std::map<std::string, std::set<size_t>>{}):generation_id(genid),assign(assign_){};
+    HeartbeatResponce()=default;
+
+
 };
 
 
