@@ -1077,7 +1077,19 @@ private:
                 }
 
                 MB mb;
-                mb.append(groupid,is_join_group,res.generation_id,memberid);
+                mb.append(static_cast<uint16_t>(res.errorcode) ,groupid,memberid,res.generation_id);
+                if(res.errorcode==Err::UPDATE_GENERATION){
+                    mb.append_size_t(res.assign.size());
+                    for(const auto& [topic,partitions]:res.assign ){
+                        mb.append(topic);
+                        mb.append_size_t(partitions.size());
+                        for(const auto& par:partitions){
+                            mb.append_size_t(par);
+                        }
+
+                    }
+
+                }
                 session.send(Eve::SERVER_RESPONCE_HEARTBEAT,correlation_id,ack_level,mb.data);
 
 
