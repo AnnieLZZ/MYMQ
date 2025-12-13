@@ -114,6 +114,7 @@ ACK_NORESPONCE时不予设置回调，即发即忘，ACK_PROMISE_INDISK时保证
 三个错误码，合并为INVALID_TOPIC_PARTITION，并补齐错误码输出
 7 新增TP_Point来绑定一个tp的pollbuffer与endoffset的指针，并统一映射表
 8  get_position_consumed更名为get_local_consumed_position，同时接收一个size_t& 来获取pos，返回错误码标识是否成功获取
-9 heartbeat接受两个参数，标识此次心跳是否是新入组，以及，是否要同步topic列表到server
+9 heartbeat接受两个参数，标识此次心跳是否是新入组，以及，是否要同步topic列表到server，心跳包改为[groupid][memberid][generationid][topics_updated][(非必有字段)subsribed_topic_list]
 10 endoffset构造函数调整
 11 原来consumerinfo的本地字段移交到info_basic
+12 generation类型改为size_t，初始化为0

@@ -634,28 +634,26 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
         std::string memberid{""};
-        int gen_id=-1;
+        size_t gen_id=0;
         std::set<std::string> topics;
-        bool is_join=0;
+
 
 
             if(groupid.empty()){
                  std::shared_lock<std::shared_mutex>  slock(info_basic.mtx);
              groupid=info_basic.groupid;
-             memberid==info_basic.memberid;
+             memberid=info_basic.memberid;
              gen_id=info_basic.generation_id;
              if(topics_updated){
-                 topics=  info_basic.subscribed_topics;
+                 topics=info_basic.subscribed_topics;
              }
 
             }
-            else{
-                is_join=1;
-            }
+
 
 
         MessageBuilder mb;
-        mb.append(groupid,is_join,memberid,gen_id,topics_updated);
+        mb.append(groupid,memberid,gen_id,topics_updated);
         if(topics_updated){
             mb.append_size_t(topics.size());
             for(const auto& t:topics){
@@ -985,7 +983,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
             if(error == Err::UPDATE_GENERATION){
                 auto groupid = mp.read_string();
                 auto memberid = mp.read_string();
-                auto generationid = mp.read_int();
+                auto generationid = mp.read_size_t();
                 auto need_update_tps = mp.read_bool();
 
                 if(need_update_tps){

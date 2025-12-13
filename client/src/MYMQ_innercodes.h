@@ -450,7 +450,7 @@ struct Consumerbasicinfo
     std::string clientid="";
     std::set<std::string> subscribed_topics;
     std::string memberid="";
-    int generation_id=-1;
+    size_t generation_id=0;
     std::shared_mutex mtx;
 };
 
