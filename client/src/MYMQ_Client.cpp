@@ -636,10 +636,12 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         std::string memberid{""};
         size_t gen_id=0;
         std::set<std::string> topics;
+        std::string clientid;
+
+        bool is_join=0;
 
 
-
-            if(groupid.empty()){
+            if(groupid.empty()){//非入组
                  std::shared_lock<std::shared_mutex>  slock(info_basic.mtx);
              groupid=info_basic.groupid;
              memberid=info_basic.memberid;
@@ -649,11 +651,21 @@ MYMQ_clientuse::~MYMQ_clientuse(){
              }
 
             }
+            else{//入组
+                is_join=1;
+                 std::shared_lock<std::shared_mutex>  slock(info_basic.mtx);
+                clientid=info_basic.clientid;
+            }
 
 
 
         MessageBuilder mb;
-        mb.append(groupid,memberid,gen_id,topics_updated);
+        mb.append(groupid,memberid,gen_id);
+        if(is_join){
+            mb.append(clientid);
+        }
+        mb.append(topics_updated);
+
         if(topics_updated){
             mb.append_size_t(topics.size());
             for(const auto& t:topics){
