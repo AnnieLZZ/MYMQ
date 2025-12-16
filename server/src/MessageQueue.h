@@ -633,7 +633,7 @@ public:
              return resp; // 或者抛异常
         }
 
-        auto res = group_state_ptr->update_subscription(member_id, client_full_list, *cache_metadata_ptr);
+        auto res = group_state_ptr->update_subscription(member_id, gen_id,client_full_list, *cache_metadata_ptr);
 
         if (res.first != gen_id) {
             resp.assign = std::move(res.second);
