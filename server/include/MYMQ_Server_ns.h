@@ -237,21 +237,37 @@ private:
 };
 
 using AssignmentMap = std::map<std::string, std::set<size_t>>;
-struct ServerConsumerInfo{
+// ==========================================
+// 1. ServerConsumerInfo
+// ==========================================
+struct ServerConsumerInfo {
     std::set<std::string> subscribed_topics;
+    std::string memberid;
+    std::string clientid;
 
-        // 实际分配到的分区 (Topic -> Set of PartitionIDs)
-        // 这种结构方便做 diff，也方便快速查询 "我拥有Topic A的哪些分区？"
-        std::map<std::string, std::set<size_t>> assigned_partitions;
+    mutable std::mutex mtx;
 
-        std::string memberid;
-        size_t generation_id;
-        std::string clientid;
-        mutable std::mutex mtx; // 保护 assigned_partitions 和 generation_id
+    // 【1. 协议版本号】单调递增
+    size_t generation_id;
 
-    ServerConsumerInfo(std::set<std::string> topics,std::string memberid,std::string clientid_=MYMQ::clientid_DEFAULT)
-        :subscribed_topics(topics),memberid(memberid),generation_id(0),clientid(clientid_){}
-    ServerConsumerInfo():subscribed_topics(std::set<std::string>()),memberid(std::string()),generation_id(0),clientid(MYMQ::clientid_DEFAULT){}
+    // 【2. 最终下发状态 (Last Sent Snapshot)】
+    // 这是 Server 在上一轮心跳中发给 Client 的最终决定。
+    // 如果 client_gen_id == generation_id，说明 Client 已经持有这个 Map。
+    AssignmentMap assigned_partitions;
+
+    // 【3. 悲观锁视图 (Pessimistic Lock View)】
+    // 只有收到 Client 的 ACK (gen_id 匹配) 后，才会从这里移除分区。
+    // 检查 "is_partition_in_use" 时，必须查这里！
+    AssignmentMap current_holding;
+
+    // 【4. 期望状态 (Ideal State)】
+    // 由 Rebalance 算法计算得出，代表“如果世界完美，你应该拥有的分区”。
+    AssignmentMap target_assignment;
+
+    ServerConsumerInfo(std::set<std::string> topics, std::string memberid, std::string clientid_=MYMQ::clientid_DEFAULT)
+        : subscribed_topics(topics), memberid(memberid), clientid(clientid_), generation_id(0) {}
+
+    ServerConsumerInfo() : generation_id(0) {}
 };
 
 
@@ -278,7 +294,11 @@ public:
     void remove_member(const std::string& member_id) {
         for (int i = 0; i < virtual_node_count; ++i) {
             std::string v_node_key = member_id + "#" + std::to_string(i);
-            ring.erase(hash_func(v_node_key));
+            uint32_t h = hash_func(v_node_key);
+            auto it = ring.find(h);
+            if (it != ring.end() && it->second == member_id) { //防hash冲突
+                ring.erase(it);
+            }
         }
     }
 
@@ -336,145 +356,167 @@ private:
     std::string group_id;
     MemberMap members;
     ConsistentHashRing hash_ring;
-    mutable std::mutex group_mtx;
+    mutable std::mutex group_mtx; // 保护整个 Group 状态
 
 public:
     ConsumerGroupState(const std::string& id) : group_id(id) {}
 
+private:
+    // =================================================================
+    // Private Helpers: _locked 后缀表示调用前必须持有 group_mtx
+    // =================================================================
 
-    std::pair<size_t, AssignmentMap>
-        handle_heartbeat(const std::string& member_id, size_t client_gen_id) {
-
-            std::lock_guard<std::mutex> lock(group_mtx);
-
-            auto it = members.find(member_id);
-            if (it == members.end()) {
-                // 异常情况：该成员可能因为超时被踢出了，需要重新 Join
-                return {0, {}};
-            }
-
-            MemberPtr member = it->second;
-
-            // --- 核心 Check Diff ---
-            if (client_gen_id != member->generation_id) {
-                // 客户端版本落后了！说明在上次心跳间隔内，发生了重平衡（比如 B 加入了）
-                // Server 直接把已经算好的结果返回去
-                return {member->generation_id, member->assigned_partitions};
-            }
-            else {
-                // 版本一致，无事发生
-                // 返回空 Map，表示 "Keep Existing Assignment"
-                return {client_gen_id, {}};
+    // 检查全局锁：某个分区是否被任何成员（包括自己）的 current_holding 占用
+    bool is_partition_in_use_locked(const std::string& topic, size_t p_id) {
+        for (const auto& kv : members) {
+            auto m = kv.second;
+            auto it = m->current_holding.find(topic);
+            if (it != m->current_holding.end()) {
+                if (it->second.count(p_id)) return true;
             }
         }
-    // =================================================================
-    // 核心接口：更新订阅 + 立即获取结果
-    // 返回值: pair<GenerationID, AssignmentMap>
-    // =================================================================
+        return false;
+    }
+
+    // 核心重平衡算法：只更新 target_assignment
+    void perform_precise_rebalance_locked(MetadataCache& cache_ref) {
+        // 1. 清空所有人的 Target
+        for (auto& kv : members) {
+            kv.second->target_assignment.clear();
+        }
+
+        // 2. 收集所有订阅的 Topic
+        std::set<std::string> all_topics;
+        for (const auto& kv : members) {
+            all_topics.insert(kv.second->subscribed_topics.begin(),
+                              kv.second->subscribed_topics.end());
+        }
+
+        // 3. 遍历 Topic -> Partition，查 Hash Ring 分配 Target
+        for (const auto& topic : all_topics) {
+            size_t partition_count = 0;
+            if (!cache_ref.get_partition_count(topic, partition_count) || partition_count == 0)
+                continue;
+
+            for (size_t p_id = 0; p_id < partition_count; ++p_id) {
+                // *** 整合点：传入 members 以供 HashRing 检查订阅关系 ***
+                std::string owner_id = hash_ring.find_owner(topic, p_id, members);
+
+                if (!owner_id.empty()) {
+                    auto it = members.find(owner_id);
+                    if (it != members.end()) {
+                        it->second->target_assignment[topic].insert(p_id);
+                    }
+                }
+            }
+        }
+    }
+
+    // 核心状态机驱动：处理 ACK -> 对比 Target -> 生成 Next Assignment
     std::pair<size_t, AssignmentMap>
-    update_subscription(const std::string& member_id,
-                        const std::set<std::string>& client_full_list,
-                        MetadataCache& cache_ref) {
-
-        std::lock_guard<std::mutex> lock(group_mtx);
-
+    handle_heartbeat_logic_locked(const std::string& member_id, size_t client_gen_id) {
         auto it = members.find(member_id);
-        bool need_rebalance = false;
+        if (it == members.end()) return {0, {}};
 
-        // 1. 只有订阅列表真的变了，或者新成员加入，才标记需要重平衡
-        if (it == members.end()) {
-            auto new_member = std::make_shared<ServerConsumerInfo>(client_full_list,member_id);
+        MemberPtr member = it->second;
 
-            members[member_id] = new_member;
-            hash_ring.add_member(member_id);
-            need_rebalance = true;
-        } else {
-            if (it->second->subscribed_topics != client_full_list) {
-                it->second->subscribed_topics = client_full_list;
-                need_rebalance = true;
+        // --- Phase 1: 处理 ACK (释放锁) ---
+        if (client_gen_id == member->generation_id) {
+            member->current_holding = member->assigned_partitions;
+        }
+
+        // --- Phase 2: 计算 Next Step (Reconcile) ---
+        AssignmentMap next_assignment;
+        bool changes_needed = false;
+
+        for (const auto& [topic, partitions] : member->target_assignment) {
+            for (size_t pid : partitions) {
+
+                bool am_i_holding = false;
+                if (member->current_holding.count(topic) &&
+                    member->current_holding.at(topic).count(pid)) {
+                    am_i_holding = true;
+                }
+
+                if (am_i_holding) {
+                    // Case A: Keep
+                    next_assignment[topic].insert(pid);
+                } else {
+                    // Case B: Acquire
+                    if (!is_partition_in_use_locked(topic, pid)) {
+                        next_assignment[topic].insert(pid);
+                        // Pre-claim
+                        member->current_holding[topic].insert(pid);
+                        changes_needed = true;
+                    }
+                    // Case C: Wait (implicitly)
+                }
             }
         }
 
-        // 2. 如果需要重平衡，执行并更新受影响的人
-        if (need_rebalance) {
-            perform_precise_rebalance(cache_ref);
+        // 检查隐式 Revoke (Assigned 有，但 Next 没有)
+        if (next_assignment != member->assigned_partitions) {
+            changes_needed = true;
         }
 
-        // 3. 无论是否重平衡，都立即返回该成员当前的最新状态
-        // 客户端拿到这个直接覆盖本地，无需等待心跳
-        auto member = members[member_id];
+        // --- Phase 3: 推送变更 ---
+        if (changes_needed) {
+            member->generation_id++;
+            member->assigned_partitions = next_assignment;
+        }
+
         return {member->generation_id, member->assigned_partitions};
     }
 
-    // 成员离开
+public:
+    // =================================================================
+    // Public 接口
+    // =================================================================
+
+    std::pair<size_t, AssignmentMap>
+    handle_heartbeat(const std::string& member_id, size_t client_gen_id) {
+        std::lock_guard<std::mutex> lock(group_mtx);
+        return handle_heartbeat_logic_locked(member_id, client_gen_id);
+    }
+
+    // 更新订阅 / 触发 Rebalance / 加入组
+    std::pair<size_t, AssignmentMap>
+    update_subscription(const std::string& member_id, size_t gen_id,
+                        const std::set<std::string>& subs, MetadataCache& cache) {
+        std::lock_guard<std::mutex> lock(group_mtx);
+
+        auto it = members.find(member_id);
+        if (it == members.end()) {
+            auto new_ptr = std::make_shared<ServerConsumerInfo>(subs, member_id);
+            members[member_id] = new_ptr;
+            hash_ring.add_member(member_id);
+            std::cout << "[Info] Member Joined: " << member_id << std::endl;
+        } else {
+            if (it->second->subscribed_topics != subs) {
+                it->second->subscribed_topics = subs;
+                std::cout << "[Info] Member Updated Subs: " << member_id << std::endl;
+            }
+        }
+
+        perform_precise_rebalance_locked(cache);
+
+        // 关键：复用逻辑，但不需要再次加锁
+        return handle_heartbeat_logic_locked(member_id, gen_id);
+    }
+
     bool handle_leave(const std::string& member_id, MetadataCache& cache_ref) {
         std::lock_guard<std::mutex> lock(group_mtx);
         if (members.erase(member_id)) {
             hash_ring.remove_member(member_id);
             if (!members.empty()) {
-                perform_precise_rebalance(cache_ref);
-                return 1;
+                perform_precise_rebalance_locked(cache_ref);
             }
+            std::cout << "[Info] Member Left: " << member_id << std::endl;
+            return true;
         }
-        return 0;
-    }
-
-private:
-    // =================================================================
-    // 核心逻辑：精准重平衡 (Precise Rebalance)
-    // =================================================================
-    void perform_precise_rebalance(MetadataCache& cache_ref) {
-        // 1. 预计算阶段：建立一个临时的 Map 存放计算结果
-        //    key: member_id, value: 新的分配方案
-        std::map<std::string, AssignmentMap> proposals;
-
-        // 初始化：为每个存在的成员建立空条目
-        std::set<std::string> all_interested_topics;
-        for (const auto& kv : members) {
-            proposals[kv.first] = {}; // 先置空
-            all_interested_topics.insert(kv.second->subscribed_topics.begin(),
-                                         kv.second->subscribed_topics.end());
-        }
-
-        // 2. 计算阶段：遍历所有 Topic 分区，在环上找主人
-        for (const auto& topic : all_interested_topics) {
-            size_t partition_count=0 ;
-            bool succ= cache_ref.get_partition_count(topic,partition_count);
-            if (!succ || partition_count == 0) continue; // 获取失败直接跳过
-            for (int p_id = 0; p_id < partition_count; ++p_id) {
-                // 在环上找到归属的 MemberID
-                std::string owner_id = hash_ring.find_owner(topic, p_id, members);
-                if (!owner_id.empty()) {
-                    // 记录到临时方案中
-                    proposals[owner_id][topic].insert(p_id);
-                }
-            }
-        }
-
-        // 3. 应用阶段：Diff 比对
-        //    只修改真正发生变化的成员
-        for (auto& kv : members) {
-            const std::string& m_id = kv.first;
-            MemberPtr member = kv.second;
-
-            // 取出该成员的新计算结果
-            AssignmentMap& new_assignment = proposals[m_id];
-
-            // *** 关键 ***：C++ Map 的 operator== 会深度比较内容
-            if (member->assigned_partitions != new_assignment) {
-                // 只有真的变了，才更新状态 + 递增世代
-                member->assigned_partitions = std::move(new_assignment);
-                member->generation_id++;
-
-                // log: Member [m_id] assignment changed to Gen [id]
-            } else {
-                // 没变，什么都不做！GenID 保持不变！
-                // log: Member [m_id] assignment stable.
-            }
-        }
+        return false;
     }
 };
-
 
 }
 
