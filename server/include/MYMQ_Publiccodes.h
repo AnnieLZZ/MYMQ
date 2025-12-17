@@ -40,6 +40,7 @@ enum class CommonErrorCode : uint16_t {
     UNKNOWN_TOPICPARTITION=4019,
     CLIENT_NOT_IN_GROUP=4020,
     UPDATE_GENERATION=4021,
+    GENERATION_EXPIRED=4022,
 
 
 
@@ -137,6 +138,14 @@ struct TopicPartition
     bool operator==(const TopicPartition& other) const {
         return topic == other.topic && partition == other.partition;
     }
+    bool operator<(const TopicPartition& other) const {
+            // 先比较 topic
+            if (topic != other.topic) {
+                return topic < other.topic;
+            }
+            // 如果 topic 相同，则比较 partition
+            return partition < other.partition;
+        }
 };
 
 

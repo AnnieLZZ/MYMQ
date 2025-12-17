@@ -16,7 +16,7 @@
 #include <openssl/err.h>
 #include"tbb/concurrent_hash_map.h"
 #include "uuid/uuid.h"
-
+using Err=MYMQ_Public::CommonErrorCode;
 namespace MYMQ_Server {
 
 
@@ -351,34 +351,79 @@ class ConsumerGroupState {
 public:
     using MemberPtr = std::shared_ptr<ServerConsumerInfo>;
     using MemberMap = std::map<std::string, MemberPtr>;
+    using TopicPartition = MYMQ_Public::TopicPartition; // 使用全局定义
+    struct OffsetAndMetadata{
+        size_t offset=0;
+        size_t genid=0;
+    };
 
 private:
     std::string group_id;
     MemberMap members;
     ConsistentHashRing hash_ring;
-    mutable std::mutex group_mtx; // 保护整个 Group 状态
+    mutable std::mutex group_mtx;
+
+    // 【新增】反向索引：Topic -> Partition -> MemberID
+    // 用于 O(1) 查找某个分区当前被谁持有着（基于 current_holding）
+    std::map<std::string, std::map<size_t, std::string>> partition_owners_;
+    std::map<TopicPartition,OffsetAndMetadata> map_OffsetAndMetadata;
 
 public:
     ConsumerGroupState(const std::string& id) : group_id(id) {}
 
+    // 【新增】公共查询接口（调试/管理用）
+    std::string get_partition_owner(const std::string& topic, size_t partition) {
+        std::lock_guard<std::mutex> lock(group_mtx);
+        if (partition_owners_.count(topic) && partition_owners_[topic].count(partition)) {
+            return partition_owners_[topic][partition];
+        }
+        return "";
+    }
+
 private:
     // =================================================================
-    // Private Helpers: _locked 后缀表示调用前必须持有 group_mtx
+    // Private Helpers: 维护反向索引的工具函数
     // =================================================================
 
-    // 检查全局锁：某个分区是否被任何成员（包括自己）的 current_holding 占用
-    bool is_partition_in_use_locked(const std::string& topic, size_t p_id) {
-        for (const auto& kv : members) {
-            auto m = kv.second;
-            auto it = m->current_holding.find(topic);
-            if (it != m->current_holding.end()) {
-                if (it->second.count(p_id)) return true;
+    // 辅助：从反向表中移除某人持有的特定分区
+    void remove_ownership_index(const std::string& member_id, const std::string& topic, size_t pid) {
+        auto& p_map = partition_owners_[topic];
+        auto it = p_map.find(pid);
+        if (it != p_map.end() && it->second == member_id) {
+            p_map.erase(it);
+            // 如果该 Topic 下没有分区了，可以清理 Topic key
+            if (p_map.empty()) partition_owners_.erase(topic);
+        }
+    }
+
+    // 辅助：在反向表中注册归属权
+    void add_ownership_index(const std::string& member_id, const std::string& topic, size_t pid) {
+        partition_owners_[topic][pid] = member_id;
+    }
+
+    // 辅助：完全清理某人的所有反向索引 (用于 Leave 或 ACK 重置时)
+    void clear_member_from_index(const std::string& member_id, const AssignmentMap& holding_to_clear) {
+        for (const auto& [topic, parts] : holding_to_clear) {
+            for (size_t pid : parts) {
+                remove_ownership_index(member_id, topic, pid);
             }
         }
-        return false;
+    }
+
+    // =================================================================
+    // 逻辑核心区
+    // =================================================================
+
+    // 【修改】检查全局锁：直接查反向表，不再遍历 Members
+    // 复杂度：O(log P) vs 原来的 O(M * log P)
+    bool is_partition_in_use_locked(const std::string& topic, size_t p_id) {
+        auto t_it = partition_owners_.find(topic);
+        if (t_it == partition_owners_.end()) return false;
+        return t_it->second.count(p_id) > 0;
     }
 
     // 核心重平衡算法：只更新 target_assignment
+    // 【整合】使用旧版的完整逻辑
     void perform_precise_rebalance_locked(MetadataCache& cache_ref) {
         // 1. 清空所有人的 Target
         for (auto& kv : members) {
@@ -395,11 +440,12 @@ private:
         // 3. 遍历 Topic -> Partition，查 Hash Ring 分配 Target
         for (const auto& topic : all_topics) {
             size_t partition_count = 0;
+            // 从缓存获取分区数
             if (!cache_ref.get_partition_count(topic, partition_count) || partition_count == 0)
                 continue;
 
             for (size_t p_id = 0; p_id < partition_count; ++p_id) {
-                // *** 整合点：传入 members 以供 HashRing 检查订阅关系 ***
+                // HashRing 检查订阅关系并分配
                 std::string owner_id = hash_ring.find_owner(topic, p_id, members);
 
                 if (!owner_id.empty()) {
@@ -412,7 +458,7 @@ private:
         }
     }
 
-    // 核心状态机驱动：处理 ACK -> 对比 Target -> 生成 Next Assignment
+    // 【修改】核心状态机：在修改 current_holding 时同步更新 partition_owners_
     std::pair<size_t, AssignmentMap>
     handle_heartbeat_logic_locked(const std::string& member_id, size_t client_gen_id) {
         auto it = members.find(member_id);
@@ -422,7 +468,25 @@ private:
 
         // --- Phase 1: 处理 ACK (释放锁) ---
         if (client_gen_id == member->generation_id) {
-            member->current_holding = member->assigned_partitions;
+            // [Sync Point 1]
+            // 客户端确认了 assigned_partitions。这意味着 member->current_holding 将变为 assigned_partitions。
+            // 我们需要维护反向索引：
+
+            // 只有当 current_holding 确实发生变化时才操作，避免无意义的开销
+            if (member->current_holding != member->assigned_partitions) {
+                // 1. 从反向表中移除旧的 current_holding
+                clear_member_from_index(member_id, member->current_holding);
+
+                // 2. 更新 holding
+                member->current_holding = member->assigned_partitions;
+
+                // 3. 将新的 assigned_partitions 加入反向表
+                for (const auto& [topic, parts] : member->current_holding) {
+                    for (size_t pid : parts) {
+                        add_ownership_index(member_id, topic, pid);
+                    }
+                }
+            }
         }
 
         // --- Phase 2: 计算 Next Step (Reconcile) ---
@@ -443,10 +507,15 @@ private:
                     next_assignment[topic].insert(pid);
                 } else {
                     // Case B: Acquire
+                    // [Optimization] 这里调用的是优化后的 O(1) 检查
                     if (!is_partition_in_use_locked(topic, pid)) {
                         next_assignment[topic].insert(pid);
-                        // Pre-claim
+
+                        // [Sync Point 2] Pre-claim (预占)
+                        // 在写入 current_holding 的同时，写入反向索引
                         member->current_holding[topic].insert(pid);
+                        add_ownership_index(member_id, topic, pid);
+
                         changes_needed = true;
                     }
                     // Case C: Wait (implicitly)
@@ -484,39 +553,151 @@ public:
     update_subscription(const std::string& member_id, size_t gen_id,
                         const std::set<std::string>& subs, MetadataCache& cache) {
         std::lock_guard<std::mutex> lock(group_mtx);
-
         auto it = members.find(member_id);
         if (it == members.end()) {
-            auto new_ptr = std::make_shared<ServerConsumerInfo>(subs, member_id);
-            members[member_id] = new_ptr;
-            hash_ring.add_member(member_id);
-            std::cout << "[Info] Member Joined: " << member_id << std::endl;
+             auto new_ptr = std::make_shared<ServerConsumerInfo>(subs, member_id);
+             members[member_id] = new_ptr;
+             hash_ring.add_member(member_id);
+             std::cout << "[Info] Member Joined: " << member_id << std::endl;
         } else {
-            if (it->second->subscribed_topics != subs) {
-                it->second->subscribed_topics = subs;
-                std::cout << "[Info] Member Updated Subs: " << member_id << std::endl;
-            }
+             if (it->second->subscribed_topics != subs) {
+                 it->second->subscribed_topics = subs;
+                 std::cout << "[Info] Member Updated Subs: " << member_id << std::endl;
+             }
         }
 
+        // 重新计算所有人的 Target
         perform_precise_rebalance_locked(cache);
 
-        // 关键：复用逻辑，但不需要再次加锁
+        // 计算并返回当前成员的分配结果
         return handle_heartbeat_logic_locked(member_id, gen_id);
     }
 
+    // 【修改】处理成员离开：需要清理反向索引
     bool handle_leave(const std::string& member_id, MetadataCache& cache_ref) {
         std::lock_guard<std::mutex> lock(group_mtx);
-        if (members.erase(member_id)) {
+        auto it = members.find(member_id);
+        if (it != members.end()) {
+            // [Sync Point 3] Member Leaving
+            // 务必在删除 member 之前清理反向索引
+            clear_member_from_index(member_id, it->second->current_holding);
+
+            members.erase(it);
             hash_ring.remove_member(member_id);
+
             if (!members.empty()) {
                 perform_precise_rebalance_locked(cache_ref);
             }
-            std::cout << "[Info] Member Left: " << member_id << std::endl;
+            std::cout << "[Info] Member Left and Index Cleared: " << member_id << std::endl;
             return true;
         }
         return false;
     }
+
+
+
+    Err commit_offset(const std::string& member_id, size_t client_gen_id,
+                           const std::string& topic, size_t partition, size_t offset) {
+            std::lock_guard<std::mutex> lock(group_mtx);
+
+            // 1. 验证成员是否存在
+            auto it = members.find(member_id);
+            if (it == members.end()) {
+                return Err::MEMBER_NOT_FOUND; // 成员不在组内
+            }
+            MemberPtr member = it->second;
+
+            // 2. Fencing 验证 (关键): 检查 Generation ID
+            // 如果客户端的代数小于服务端记录的代数，说明发生了重平衡，该请求是过期的
+            if (client_gen_id != member->generation_id) {
+                std::cout << "[Warning] Commit rejected: Stale generation. Client: "
+                          << client_gen_id << " Server: " << member->generation_id << std::endl;
+                return Err::GENERATION_EXPIRED;
+            }
+
+            // 3. 所有权验证 (关键): 确保成员当前确实持有该分区
+            // 注意：必须查 current_holding (客户端已确认持有的)，而不是 assigned (服务端预想分配的)
+            bool is_holding = false;
+            if (member->current_holding.count(topic) &&
+                member->current_holding.at(topic).count(partition)) {
+                is_holding = true;
+            }
+
+            if (!is_holding) {
+                std::cout << "[Warning] Commit rejected: Member " << member_id
+                          << " does not own " << topic << "-" << partition << std::endl;
+                return Err::GENERATION_EXPIRED;
+            }
+
+            // 4. 写入 Offset 存储
+            // 假设 TopicPartition 结构体支持聚合初始化 {topic, partition}
+            TopicPartition tp{topic, partition};
+            map_OffsetAndMetadata[tp] = {offset, client_gen_id};
+
+            return Err::NULL_ERROR;
+        }
+
+
+        Err commit_offsets(const std::string& member_id, size_t client_gen_id,
+                            const std::map<std::string, std::map<size_t, size_t>>& offsets) {
+            std::lock_guard<std::mutex> lock(group_mtx);
+
+            auto it = members.find(member_id);
+            if (it == members.end()) return Err::MEMBER_NOT_FOUND;
+            MemberPtr member = it->second;
+
+            // Fencing 验证
+            if (client_gen_id != member->generation_id) return Err::GENERATION_EXPIRED;
+
+            bool all_success = true;
+
+            for (const auto& [topic, part_map] : offsets) {
+                // 检查是否持有该 Topic (快速失败检查)
+                if (member->current_holding.find(topic) == member->current_holding.end()) {
+                    all_success = false;
+                    continue; // 跳过整个 Topic
+                }
+
+                const auto& holding_parts = member->current_holding.at(topic);
+
+                for (const auto& [pid, offset] : part_map) {
+                    // 检查具体分区所有权
+                    if (holding_parts.count(pid)) {
+                        TopicPartition tp{topic, pid};
+                        map_OffsetAndMetadata[tp] = {offset, client_gen_id};
+                    } else {
+                        all_success = false; // 只要有一个非法，就标记（也可以选择在这里中断）
+                    }
+                }
+            }
+            if(!all_success){
+                return Err::GENERATION_EXPIRED;
+            }
+            return Err::NULL_ERROR;
+        }
+
+        bool get_committed_offset(const std::string& topic, size_t partition,size_t& offset_ref) {
+            std::lock_guard<std::mutex> lock(group_mtx);
+            TopicPartition tp{topic, partition};
+
+            auto it = map_OffsetAndMetadata.find(tp);
+            if (it != map_OffsetAndMetadata.end()) {
+               offset_ref= it->second.offset;
+                return 1;
+            }
+            return 0; // 表示该分区从未提交过 Offset
+        }
+
+
+
+
+
+
+
+
+
 };
+
 
 }
 

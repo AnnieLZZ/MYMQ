@@ -442,90 +442,47 @@ private:
 };
 
 
-class ConsumerOffset{
-public:
-    ConsumerOffset(Topic& consumer_offset_topic_ref)
-        : consumer_offset(consumer_offset_topic_ref){
+
+class ConsumerOffset {
+    // 直接用 vector 存储 Partition 的指针（或智能指针）
+    std::vector<std::shared_ptr<Partition>> partitions_;
+
+    public:
+    ConsumerOffset(const std::string& root_dir,size_t num_partitions=10){
+        if(num_partitions==0){
+            throw std::out_of_range("Invalid partition num for '__consumer_offset' .");
+        }
+        partitions_.resize(num_partitions);
+        for(size_t i = 0; i < num_partitions; ++i) {
+            partitions_[i] = std::make_shared<Partition>(root_dir,MYMQ::consumeroffset_name,i,1);
+        }
     }
 
 
+//    Err get_latest_offset(const std::string& groupid,const std::string& topicname, size_t partition ){
 
-    Err commit_sync(uint32_t consumeroffset_parid_hash,const std::string& key,size_t offset_digit){
-        auto parti_num= consumer_offset.get_parti_num();
-        if(parti_num==0){
-            return Err::TOPIC_EMPTY;
-        }
-        size_t par_id=consumeroffset_parid_hash%parti_num;
-        return commit_offset(key,offset_digit);
+//    }
+    size_t get_partition_num(){
+        return partitions_.size();
     }
 
-
-
-    //    void load_latest_offset_to_coordinator(){
-    //        auto num=consumer_offset.get_parti_num();
-    //        std::vector<std::unordered_map<Mybyte, MessageConstruct>> map_msgs;
-    //        map_msgs.resize(num);
-    //        int i=0;
-    //        for(auto &par:consumer_offset.get_partition_ref()){
-    //            par->get_latest_committed_offset(map_msgs.at(i));
-    //        }
-    //        std::queue<std::pair<Mybyte, MessageConstruct>> tmp_queue{};
-    //        for(int i=0;i<num;i++){
-    //            for(const auto& pair:map_msgs[i]){
-    //                tmp_queue.emplace(pair);
-    //            }
-    //        }
-    //        std::unordered_map<Mybyte,size_t> map_latest_offset_tmp;
-    //        map_latest_offset_tmp.reserve(tmp_queue.size());
-    //        while(!tmp_queue.empty()){
-    //            auto [key,val]=tmp_queue.front();
-    //                    map_latest_offset_tmp[key]=std::stoull(val.value);
-    //        }
-    //                    map_latest_offset=std::move(map_latest_offset_tmp);
-
-    //        }
-
-private:
-
-
-    Err commit_offset(const std::string& key,size_t offset_digit){
-        tbb::concurrent_hash_map<std::string, size_t>::accessor acc;
-        map_latest_offset.insert(acc,key);
-        acc->second=offset_digit;
-
-
-        return Err::NULL_ERROR;
+    std::shared_ptr<Partition> getPartition(int partitionId) {
+        if (partitionId < 0 || partitionId >= partitions_.size()) {
+            return nullptr;
+        }
+        return partitions_[partitionId]; // 纯数组索引访问
     }
 
-    Err get_latest_offset(const std::string& key,size_t& off,size_t par_id){
-        tbb::concurrent_hash_map<std::string, size_t>::const_accessor ca;
-        if(map_latest_offset.find(ca,key)){
-            off=ca->second;
-            return Err::NULL_ERROR;
-        }
+    std::shared_ptr<Partition> getPartition(const std::string& groupid) {
 
-        tbb::concurrent_hash_map<size_t,std::queue<Mybyte>> ::accessor a;
-
-        if(map_offset_queue.find(a,par_id)){
-//            a->second.emplace(MYMQ::MSG_serial::build_Record(key,std::to_string(off)));
-        }
-        else{
-            return Err::INTERNAL_ERROR;
-        }
-
-        return Err::UNKNOWN_OFFSET_KEY;
+       uint32_t idx= MurmurHash2::hash(groupid)%partitions_.size();
+        return partitions_[idx];
     }
-
-
-private:
-    Topic& consumer_offset;
-    Timer timer;
-    tbb::concurrent_hash_map<std::string,size_t> map_latest_offset;
-    tbb::concurrent_hash_map<size_t,std::queue<Mybyte>> map_offset_queue;
-
+    Err commit_sync(uint32_t groupid_hash_key,const Byte_view_pair& packed_offset_byte_view){
+        uint32_t idx= groupid_hash_key%partitions_.size();
+         return partitions_[idx]->push(packed_offset_byte_view);
+    }
 };
-
-
 
 
 class GroupCoordinator :public std::enable_shared_from_this<GroupCoordinator>{
@@ -547,6 +504,45 @@ public:
 
     }
 
+    Err commit_offset(const std::string& group_id,const std::string& member_id, size_t client_gen_id,
+                      const std::string& topic, size_t partition, size_t offset){
+
+        std::shared_lock<std::shared_mutex> global_lock(group_states_mutex_);
+        auto it = group_states_.find(group_id);
+        if (it == group_states_.end()) {
+            global_lock.unlock();
+            throw (Err::GROUP_NOT_FOUND);
+
+        }
+        auto  group_state_ptr = it->second;
+
+        global_lock.unlock();
+
+      auto res=  group_state_ptr->commit_offset(member_id,client_gen_id,topic,partition,offset);
+
+        return res;
+    }
+
+    Err get_endoffset(const std::string& group_id,const std::string& topic, size_t partition, size_t& offset){
+
+        std::shared_lock<std::shared_mutex> global_lock(group_states_mutex_);
+        auto it = group_states_.find(group_id);
+        if (it == group_states_.end()) {
+            global_lock.unlock();
+            throw (Err::GROUP_NOT_FOUND);
+
+        }
+        auto  group_state_ptr = it->second;
+
+        global_lock.unlock();
+
+      auto res=  group_state_ptr->get_committed_offset(topic,partition,offset);
+
+      if(!res){
+          return Err::UNKNOWN_OFFSET_KEY;
+      }
+        return Err::NULL_ERROR;
+    }
 
      Err leave_group(const std::string& group_id,const std::string& memberid){
 
@@ -705,20 +701,13 @@ public:
         topics_metadata_filename_ = data_root_dir_ + "/topics_metadata.conf";
         std::filesystem::create_directories(data_root_dir_);
         init();
-        load_topics_metadata(); // 这一步会尝试从文件加载并创建 consumer_offset_topic_ptr_
-
-        // 确保 consumer_offset_topic_ptr_ 已经初始化
-        if (!consumer_offset_topic_ptr_) {
-            // 如果元数据文件不存在，或者文件中没有 MYMQ::consumeroffset_name 的条目，则在此处创建
-            std::cerr << "Warning: Special topic '" << MYMQ::consumeroffset_name << "' not found in metadata. Creating with default partitions (10)." << std::endl;
-            consumer_offset_topic_ptr_ = std::make_unique<Topic>(MYMQ::consumeroffset_name, data_root_dir_, MYMQ::PARTITION_NUM_OF_CONSUMER_OFFSET_TOPIC);
-            // 由于是新创建的，需要立即保存到元数据文件
-            save_topics_metadata();
-        }
+        load_topics_metadata();
 
         // 现在 consumer_offset_topic_ptr_ 保证是有效的，可以用来构造 ConsumerOffset 管理器
-        consumer_offset_manager_ptr_ = std::make_shared<ConsumerOffset>(*consumer_offset_topic_ptr_);
+         std::cerr << "Warning: Special topic '" << MYMQ::consumeroffset_name << "' not found in metadata. Creating with default partitions (10)." << std::endl;
+        consumer_offset_manager_ptr_ = std::make_shared<ConsumerOffset>(data_root_dir,MYMQ::PARTITION_NUM_OF_CONSUMER_OFFSET_TOPIC);
 
+         save_topics_metadata();
         start_groupcoordinator(); // 此时 consumer_offset_manager_ptr_ 已经就绪
         start_server();
     }
@@ -788,8 +777,8 @@ public:
 
             // 2. 同步到 TopicMap (保持原逻辑)
             if (topicname == MYMQ::consumeroffset_name) {
-                if (!consumer_offset_topic_ptr_) {
-                    consumer_offset_topic_ptr_ = std::make_unique<Topic>(topicname, data_root_dir_, parti_num,1);
+                if (!consumer_offset_manager_ptr_) {
+                    consumer_offset_manager_ptr_ = std::make_shared<ConsumerOffset>(data_root_dir_, parti_num);
                 }
             } else {
                 for(size_t i=0;i<parti_num;i++){
@@ -812,8 +801,8 @@ public:
         }
 
         // 首先保存特殊的消费者偏移量 Topic 的元数据，如果它存在的话
-        if (consumer_offset_topic_ptr_) {
-            ofs_tmp << consumer_offset_topic_ptr_->get_topicname() << " " << consumer_offset_topic_ptr_->get_parti_num() << std::endl;
+        if (consumer_offset_manager_ptr_) {
+            ofs_tmp << MYMQ::consumeroffset_name<< " " << consumer_offset_manager_ptr_->get_partition_num() << std::endl;
         }
 
         std::unordered_map<std::string,size_t> tmp_metadata_map;
@@ -893,16 +882,15 @@ public:
     }
 
 
-    Err commit_sync(const std::string& topicname, size_t partition ,uint32_t consumeroffset_parid_hash,const std::string& key,uint32_t offset_digit) {
-        if(cache_metadata->getPartitionLeader(topicname,partition)=std::nullopt){
-            return Err::TOPIC_NOT_FOUND;
-        }
-        if (!consumer_offset_manager_ptr_) {
-            return Err::INTERNAL_ERROR; // 或者更具体的错误类型
-        }
-        return consumer_offset_manager_ptr_->commit_sync(consumeroffset_parid_hash,key,offset_digit);
+    Err  get_endoffset(const std::string& group_id,const std::string& topic, size_t partition, size_t& offset) {
+        return groupcoordinator_->get_endoffset(group_id,topic,partition,offset);
     }
 
+    Err commit_sync(const std::string& group_id,const std::string& member_id, size_t client_gen_id,
+                      const std::string& topic, size_t partition, size_t offset) {
+
+        return groupcoordinator_->commit_offset(group_id,member_id,client_gen_id,topic,partition,offset);
+    }
 
     HeartbeatResponce heartbeat(const std::string& group_id, const std::string& member_id,size_t gen_id) {
         return groupcoordinator_->heartbeat(group_id, member_id,gen_id);
@@ -1018,13 +1006,15 @@ private:
             else if(type==MYMQ::EventType::CLIENT_REQUEST_COMMIT_OFFSET){
 
                 auto groupid=mp.read_string();
+                auto memberid=mp.read_string();
+                auto generationid=mp.read_size_t();
                 auto topicname=mp.read_string();
                 auto partition=mp.read_size_t();
                 auto consumeroffset_parid_hash=mp.read_uint32();
                 auto key_gtp=mp.read_string();
                 auto offset_digit=mp.read_size_t();
 
-                auto error= commit_sync(topicname,partition,consumeroffset_parid_hash,key_gtp,offset_digit);
+                auto error= commit_sync(groupid,memberid,generationid,topicname,partition,offset_digit);
                 MB mb;
                 mb.reserve(sizeof (uint32_t)*2+groupid.size()+topicname.size()+sizeof (size_t)*2+sizeof (uint16_t));
                 mb.append(groupid,topicname,partition,static_cast<uint16_t>(error),offset_digit);
@@ -1050,7 +1040,8 @@ private:
 
                 auto groupid=mp.read_string();               
                 auto memberid=mp.read_string();
-                auto generationid=mp.read_int();
+                auto generationid=mp.read_size_t();
+                auto pull_start_location=static_cast<MYMQ::PullSet>( mp.read_uint16());
                 bool is_join_group=memberid.empty();
                 std::string clientid;
                 if(is_join_group){
@@ -1085,6 +1076,11 @@ private:
                         mb.append_size_t(partitions.size());
                         for(const auto& par:partitions){
                             mb.append_size_t(par);
+                            if(pull_start_location==MYMQ::PullSet::END_OFFSET){
+                                size_t off=SIZE_MAX;
+                                get_endoffset(groupid,topic,par,off);
+                                mb.append_size_t(off);
+                            }
                         }
 
                     }
@@ -1142,45 +1138,12 @@ private:
         return groupcoordinator_->leave_group(groupid,memberid);
     }
 
-    std::map<std::string, std::map<std::string, std::set<size_t>>> parse_assignments_message(const Mybyte& serialized_data) {
-        MessageParser parser(serialized_data.data(),serialized_data.size());
-        std::map<std::string, std::map<std::string, std::set<size_t>>> assignments;
 
-        // 1. 读取成员总数
-        size_t num_members = parser.read_size_t();
-
-        for (int i = 0; i < num_members; ++i) {
-            // 2. 读取 member_id
-            std::string member_id = parser.read_string();
-
-            std::map<std::string, std::set<size_t>> topic_assignments_for_member;
-            // 3. 读取当前 member 的 topic 数量
-            size_t num_topics = parser.read_size_t();
-
-            for (int j = 0; j < num_topics; ++j) {
-                // 4. 读取 topic_name
-                std::string topic_name = parser.read_string();
-
-                std::set<size_t> partitions_for_topic;
-                // 5. 读取当前 topic 该member分管的的 partition 数量
-                size_t num_partitions = parser.read_size_t();
-
-                for (int k = 0; k < num_partitions; ++k) {
-                    // 6. 读取 partition_id
-                    size_t partition_id = parser.read_size_t();
-                    partitions_for_topic.insert(partition_id);
-                }
-                topic_assignments_for_member[topic_name] = partitions_for_topic;
-            }
-            assignments[member_id] = topic_assignments_for_member;
-        }
-        return assignments;
-    }
 
 
 
 private:
-    std::unique_ptr<Topic> consumer_offset_topic_ptr_;
+
     std::shared_ptr<ConsumerOffset> consumer_offset_manager_ptr_;
     std::string data_root_dir_;
     std::string topics_metadata_filename_;
