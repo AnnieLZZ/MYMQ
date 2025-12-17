@@ -34,6 +34,15 @@
 6 组的成员状态改成用期望状态，悲观锁视图，实际状态三个assign表管理分区消费，保证消费唯一性
 7 update_subscription这个对外api需要传入心跳包的genid
 8 genid现在起到标识成员所在的epoch（纪元）的作用
+1 添加了错误码GENERATION_EXPIRED标识提交偏移量时世代已经过期
+2 现在offset交由group来管理
+3 为快速查询分区的所属权，建立了反向映射，并且补充了相关逻辑
+4 为TopicPartition 增加了'<'比较操作符
+5 新增在ConsumerGroupState里中增加了get_partition_owner函数用于调试，还有获取/提交offset的接口，上层接口相应更新
+6 现在会在assign发生变换是根据用户的配置填入这个分区最新的offset
+7 MQ初始化修改，现在Consumeroffset类功能暂时下线
+8 去掉了之前已经废弃的函数parse_assignments_message
+
 
 ---
 
