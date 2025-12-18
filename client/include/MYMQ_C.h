@@ -9,7 +9,7 @@
 #include <cstdint>
 #include<unordered_set>
 
-class MYMQ_clientuse;
+class MYMQ_Consumeruse;
 class MYMQ_Produceruse;
 
 
@@ -97,7 +97,7 @@ void  trigger_pull();
     void set_local_pull_bytes_once(size_t bytes);
 
 private:
-    std::unique_ptr<MYMQ_clientuse> pimpl;
+    std::unique_ptr<MYMQ_Consumeruse> pimpl;
 };
 
 

@@ -118,3 +118,6 @@ ACK_NORESPONCE时不予设置回调，即发即忘，ACK_PROMISE_INDISK时保证
 10 endoffset构造函数调整
 11 原来consumerinfo的本地字段移交到info_basic
 12 generation类型改为size_t，初始化为0
+1 更名 MYMQ_clientuse 变为MYMQ_Consumeruse
+2 同步错误码
+3 同步对应了服务端的heartbeat解析过程，以及commitoffset相关逻辑
