@@ -1083,6 +1083,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                     autocommit_stop();
                     autocommit_start();
                 }
+                trigger_poll_for_low_cap_pollbuffer();
 
             } // end if(UPDATE_GENERATION)
             else if(error == Err::NULL_ERROR){
