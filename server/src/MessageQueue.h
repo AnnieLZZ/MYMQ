@@ -183,15 +183,55 @@ public:
 
     }
 
+
+    void archive_segment(uint64_t segment_base_offset) {
+        // 1. 获取独占写锁 (Block all Readers and Writers)
+        std::unique_lock<std::shared_mutex> lock(mtx_file);
+
+        // 2. 查找目标 Segment 的迭代器
+        auto it = std::find_if(segments_.begin(), segments_.end(),
+            [segment_base_offset](const std::unique_ptr<LogSegment>& seg) {
+                return seg->base_offset() == segment_base_offset;
+            });
+
+        // 如果没找到，或者试图清理当前正在写的 Active Segment，直接返回
+        if (it == segments_.end()) {
+            std::cerr << "[PartitionStorage] Archive failed: Segment not found. Offset: " << segment_base_offset << std::endl;
+            return;
+        }
+
+        if (it->get() == curr_write_segment) {
+            std::cerr << "[PartitionStorage] Archive failed: Cannot clean active segment. Offset: " << segment_base_offset << std::endl;
+            return;
+        }
+
+        // 3. 转移所有权 (Move Ownership)
+        // 将 unique_ptr 从 vector 移动到局部变量 victim_segment。
+        // 此时 vector 中该位置不再拥有对象，随后我们立即 erase。
+        std::unique_ptr<LogSegment> victim_segment = std::move(*it);
+
+        // 4. 从列表中移除 (Erase)
+        segments_.erase(it);
+
+        // 此时 segments_ 已经不包含该段，新的 Reader 无法通过 find_segment 找到它。
+        // 旧的 Reader 因为被 unique_lock 阻塞，所以也不会正在访问它。
+
+        // 5. 执行清理操作 (Flush, Close, Unmap, Rename)
+        // 这一步必须在 victim_segment 析构之前完成
+        victim_segment->mark_as_clean_in_lock();
+
+        // 6. 函数结束，lock 析构自动解锁，victim_segment 析构自动释放内存
+        std::cout << "[PartitionStorage] Segment archived: " << segment_base_offset << std::endl;
+    }
+
+
     size_t get_endoffset(){
         return end_offset.load();
     }
 
-    size_t get_first_baseoffset(){
+    uint64_t get_earilestoffset()  {
         std::shared_lock<std::shared_mutex> lock(mtx_file);
-        if(segments_.empty()){
-            return static_cast<uint64_t>(-1);
-        }
+
         return segments_.front()->base_offset();
     }
 
@@ -345,7 +385,7 @@ public:
 
 
     size_t getEarliestOffset()  {
-        return msg_stor->get_first_baseoffset();
+        return msg_stor->get_earilestoffset();
     }
 
 
@@ -353,92 +393,12 @@ public:
         return msg_stor->get_endoffset();
     }
 
-    void get_latest_committed_offset(std::unordered_map<std::string, Record>& map){
-        //            map= msg_stor->log_compact();
-    }
+
 private:
     std::string file_name_;
     std::string owner_topic_;
     std::string partition_data_dir_;
     std::shared_ptr<PartitionStorage> msg_stor;
-};
-
-
-class Topic{
-public:
-    explicit  Topic(const std::string& topicname, const std::string& data_root_dir, int parti_num=1,bool is_belong_consumer_offset=0)
-        : topicname_(topicname), num_partitions_(parti_num), data_root_dir_(data_root_dir) {
-        // 确保 topic 目录存在
-        std::filesystem::create_directories(data_root_dir_ + "/" + topicname_);
-        partitions_.reserve(num_partitions_);
-        for(int i=0; i < num_partitions_; ++i){
-            // 将 data_root_dir 和 topicname 传递给 Partition
-            partitions_.emplace_back(std::make_unique<Partition>(data_root_dir_, topicname_, i,is_belong_consumer_offset));
-        }
-    }
-
-    std::string get_topicname(){
-        return topicname_;
-    }
-
-
-    size_t get_parti_num() const {
-        return partitions_.size();
-    }
-
-
-    Err push(const Byte_view_pair& msg_view, int partition_idx) {
-        return  partitions_.at(partition_idx)->push(msg_view);
-    }
-
-    MesLoc pull(size_t target_offset, int partition_idx,size_t byte_need) {
-
-
-        try {
-            auto res= partitions_.at(partition_idx)->pull(target_offset,byte_need);
-            return res;
-
-        } catch (const std::out_of_range& e) {
-            cerr("Invalid partition ID.");
-        }
-
-        return MesLoc{};
-
-    }
-
-
-
-    void clear_partition(int partition_id) {
-        partitions_.at(partition_id)->clear();
-        //throw std::out_of_range("Invalid partition ID for clear_partition.");
-
-    }
-
-    // 获取指定分区中最早可用的消息偏移量
-    size_t getEarliestOffset(int partition_id) const {
-        return partitions_.at(partition_id)->getEarliestOffset();
-    }
-
-    // 获取指定分区中最新可用的消息偏移量 (即下一个消息的写入位置)
-    size_t get_endoffset(int partition_id) const {
-        return  partitions_.at(partition_id)->get_endoffset();
-
-    }
-
-    void get_latest_committed_offset(int partition_id,std::unordered_map<std::string, Record>& map) const {
-        partitions_.at(partition_id)->get_latest_committed_offset(map);
-    }
-
-    std::vector<std::unique_ptr<Partition>>& get_partition_ref(){
-        return partitions_;
-    }
-
-
-private:
-    std::string topicname_;
-    std::vector<std::unique_ptr<Partition>> partitions_;
-    int num_partitions_;
-    std::string data_root_dir_;
 };
 
 
@@ -459,14 +419,11 @@ class ConsumerOffset {
     }
 
 
-//    Err get_latest_offset(const std::string& groupid,const std::string& topicname, size_t partition ){
-
-//    }
     size_t get_partition_num(){
         return partitions_.size();
     }
 
-    std::shared_ptr<Partition> getPartition(int partitionId) {
+    std::shared_ptr<Partition> getPartition(size_t partitionId) {
         if (partitionId < 0 || partitionId >= partitions_.size()) {
             return nullptr;
         }
@@ -1080,6 +1037,10 @@ private:
                                 size_t off=SIZE_MAX;
                                 get_endoffset(groupid,topic,par,off);
                                 mb.append_size_t(off);
+                            }
+                            else if(pull_start_location==MYMQ::PullSet::EARLIEST_OFFSET){
+                                mb.append_size_t(0);//暂时做一个占位，功能未实现
+
                             }
                         }
 
