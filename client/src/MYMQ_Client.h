@@ -120,7 +120,7 @@ private:
 
 
 
-class MYMQ_clientuse{
+class MYMQ_Consumeruse{
 
     struct Workitem {
         size_t index;
@@ -133,10 +133,10 @@ class MYMQ_clientuse{
     };
 
 public:
-    MYMQ_clientuse(const std::string& clientid=std::string(),uint8_t ack_level=UINT8_MAX);
-    MYMQ_clientuse(const MYMQ_clientuse&)=delete;
-    MYMQ_clientuse& operator= (const MYMQ_clientuse&)=delete;
-    ~MYMQ_clientuse();
+    MYMQ_Consumeruse(const std::string& clientid=std::string(),uint8_t ack_level=UINT8_MAX);
+    MYMQ_Consumeruse(const MYMQ_Consumeruse&)=delete;
+    MYMQ_Consumeruse& operator= (const MYMQ_Consumeruse&)=delete;
+    ~MYMQ_Consumeruse();
 
 
 

@@ -32,7 +32,7 @@ void MYMQ_Producer::create_topic(std::string topicname, size_t parti_num) {
 
 
 MYMQ_Consumer::MYMQ_Consumer(const std::string& clientid, uint8_t ack_level)
-    : pimpl(std::make_unique<MYMQ_clientuse>(clientid, ack_level))
+    : pimpl(std::make_unique<MYMQ_Consumeruse>(clientid, ack_level))
 {
 
 }

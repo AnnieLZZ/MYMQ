@@ -1,5 +1,5 @@
 #include"MYMQ_Client.h"
-MYMQ_clientuse::MYMQ_clientuse(const std::string& clientid,uint8_t ack_level):path_(MYMQ::run_directory_DEFAULT),cmc_(MYMQ::run_directory_DEFAULT,MYMQ::REQUEST_TIMEOUT_MS_DEFAULT),tbb_dctx_pool([]() {
+MYMQ_Consumeruse::MYMQ_Consumeruse(const std::string& clientid,uint8_t ack_level):path_(MYMQ::run_directory_DEFAULT),cmc_(MYMQ::run_directory_DEFAULT,MYMQ::REQUEST_TIMEOUT_MS_DEFAULT),tbb_dctx_pool([]() {
         // 初始化函数：当新线程第一次访问时调用
         return ZSTD_createDCtx();
     }){
@@ -8,7 +8,7 @@ MYMQ_clientuse::MYMQ_clientuse(const std::string& clientid,uint8_t ack_level):pa
     init(clientid,ack_level);
      cmc_.init();
 }
-MYMQ_clientuse::~MYMQ_clientuse(){
+MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
      out_group_reset();
     cv_commit_ready.notify_all();
@@ -21,13 +21,13 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 }
 
 
-    void MYMQ_clientuse::heartbeat_start(){
+    void MYMQ_Consumeruse::heartbeat_start(){
         heartbeat_taskid= timer.commit_ms([this]{
             heartbeat();
         },heartbeat_interval_ms,heartbeat_interval_ms);
     }
 
-    void MYMQ_clientuse::heartbeat_stop(){
+    void MYMQ_Consumeruse::heartbeat_stop(){
         timer.commit_ms([this]{
             timer.cancel_task(heartbeat_taskid);
         },10,10,1);
@@ -36,18 +36,18 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    void MYMQ_clientuse::autocommit_start(){
+    void MYMQ_Consumeruse::autocommit_start(){
         autocommit_taskid= timer.commit_ms([this]{
             timer_commit_async();
         },autocommit_perior_ms,autocommit_perior_ms);
     }
-    void MYMQ_clientuse::autocommit_stop(){
+    void MYMQ_Consumeruse::autocommit_stop(){
         timer.commit_ms([this]{
             timer.cancel_task(autocommit_taskid);
         },10,10,1);
     }
 
-    Err_Client MYMQ_clientuse::seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume){
+    Err_Client MYMQ_Consumeruse::seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume){
 
 
         TP_PointMap::const_accessor cac;
@@ -62,7 +62,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    void MYMQ_clientuse:: set_local_pull_bytes_once(size_t bytes){
+    void MYMQ_Consumeruse:: set_local_pull_bytes_once(size_t bytes){
 
         local_pull_bytes_once.store(bytes);
     }
@@ -71,7 +71,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     // ----------------------------------------------------------------------
     // 2. 完整的 Consumer (解析)
     // ----------------------------------------------------------------------
-    void MYMQ_clientuse::call_parse_impl(
+    void MYMQ_Consumeruse::call_parse_impl(
         const std::vector<unsigned char>& raw_big_chunk,
         std::vector<MYMQ_Public::ConsumerRecord>& out_records,
         const MYMQ::MYMQ_Client::TopicPartition& tp,
@@ -240,7 +240,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    Err_Client MYMQ_clientuse::get_local_consumed_position(const MYMQ_Public::TopicPartition& tp,size_t& pos){
+    Err_Client MYMQ_Consumeruse::get_local_consumed_position(const MYMQ_Public::TopicPartition& tp,size_t& pos){
         TP_PointMap::const_accessor cac;
         if(!map_final_assign.find(cac,tp)){
             return Err_Client::INVALID_TOPIC_PARTITION;
@@ -250,7 +250,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         return Err_Client::NULL_ERROR;
     }
 
-    Err_Client MYMQ_clientuse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_ms) {
+    Err_Client MYMQ_Consumeruse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_ms) {
         if (!record_batch.empty()) return Err_Client::INVALID_OPRATION;
 
         // --- 1. 数据收集阶段 (Accumulate Phase) ---
@@ -373,7 +373,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     }
 
     // 建议单位使用微秒 (us) 以获得更高精度，如果需要毫秒改为 milliseconds 即可
-    Err_Client MYMQ_clientuse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
+    Err_Client MYMQ_Consumeruse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
                                     size_t poll_wait_timeout_ms,
                                     int64_t& out_latency_us) {
 
@@ -518,7 +518,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    void MYMQ_clientuse::create_topic(const std::string& topicname,size_t parti_num){
+    void MYMQ_Consumeruse::create_topic(const std::string& topicname,size_t parti_num){
         MessageBuilder mb;
         mb.append_string(topicname);
         mb.append_size_t(parti_num);
@@ -527,7 +527,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         send(Eve::CLIENT_REQUEST_CREATE_TOPIC,req);
 
     }
-    void MYMQ_clientuse::set_pull_bytes(size_t bytes){
+    void MYMQ_Consumeruse::set_pull_bytes(size_t bytes){
         if(bytes>1&&bytes<=MYMQ::pull_bytes_max){
             pull_bytes_once_of_request.store(bytes);
         }
@@ -537,16 +537,16 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
     }
 
-    void MYMQ_clientuse::subscribe_topic(const std::string& topicname){
+    void MYMQ_Consumeruse::subscribe_topic(const std::string& topicname){
         std::unique_lock<std::shared_mutex> ulock(info_basic.mtx);
         info_basic.subscribed_topics.insert(topicname);
     }
 
-    void MYMQ_clientuse::unsubscribe_topic(const std::string& topicname){
+    void MYMQ_Consumeruse::unsubscribe_topic(const std::string& topicname){
          std::unique_lock<std::shared_mutex> ulock(info_basic.mtx);
         info_basic.subscribed_topics.erase(topicname);
     }
-    Err_Client MYMQ_clientuse::commit_sync(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume) {
+    Err_Client MYMQ_Consumeruse::commit_sync(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume) {
         if(is_auto_commit){
             return Err_Client::AUTOCOMMIT_ENABLE;
         }
@@ -581,7 +581,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    Err_Client MYMQ_clientuse::commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb) {
+    Err_Client MYMQ_Consumeruse::commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb) {
         if(is_auto_commit){
             return Err_Client::AUTOCOMMIT_ENABLE;
         }
@@ -595,7 +595,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    Err_Client MYMQ_clientuse::join_group(const std::string& groupid){
+    Err_Client MYMQ_Consumeruse::join_group(const std::string& groupid){
 
 
         if(groupid.empty()&&groupid.length()>30){
@@ -608,7 +608,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
     }
 
-    Err_Client MYMQ_clientuse::leave_group(){
+    Err_Client MYMQ_Consumeruse::leave_group(){
         if(!is_ingroup.load()){
             return Err_Client::NOT_IN_GROUP;
         }
@@ -629,7 +629,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     }
 
 
-    void MYMQ_clientuse::heartbeat(bool topics_updated,std::string groupid) {
+    void MYMQ_Consumeruse::heartbeat(bool topics_updated,std::string groupid) {
 
 
 
@@ -660,7 +660,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
         MessageBuilder mb;
-        mb.append(groupid,memberid,gen_id);
+            mb.append(groupid,memberid,gen_id,static_cast<uint16_t>( pull_start_location));
         if(is_join){
             mb.append(clientid);
         }
@@ -679,7 +679,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    std::unordered_set<MYMQ_Public::TopicPartition> MYMQ_clientuse::get_assigned_partition(){
+    std::unordered_set<MYMQ_Public::TopicPartition> MYMQ_Consumeruse::get_assigned_partition(){
         std::unordered_set<MYMQ_Public::TopicPartition> res{};
         if(!is_ingroup.load()){
             return res;
@@ -691,7 +691,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
     }
 
 
-    void MYMQ_clientuse::init(const std::string& clientid,uint8_t ack_level){
+    void MYMQ_Consumeruse::init(const std::string& clientid,uint8_t ack_level){
 
         {
 
@@ -764,7 +764,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    void MYMQ_clientuse::timer_commit_async(){
+    void MYMQ_Consumeruse::timer_commit_async(){
         if(!is_ingroup.load()){
             return ;
         }
@@ -777,7 +777,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
     // 将第三个参数的类型从 std::deque 改为 std::vector
-    bool MYMQ_clientuse::send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_)
+    bool MYMQ_Consumeruse::send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_)
     {
         // 1. 检查飞行请求数 (保持不变)
         size_t curr_fly = SIZE_MAX;
@@ -844,7 +844,10 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         return succ;
     }
 
-    Err_Client MYMQ_clientuse::commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb){
+    Err_Client MYMQ_Consumeruse::commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb){
+        if(!is_ingroup.load()){
+            return Err_Client::NOT_IN_GROUP;
+        }
 
         TP_PointMap::const_accessor cac;
         auto it=map_final_assign.find(cac,tp);
@@ -857,27 +860,31 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         cac.release();
           out("[Commit offset] Current offset : "+std::to_string(now_off));
         if(now_off>next_offset_to_consume){
-            cerr("Warning : Attempt to commit a older offset : "+std::to_string(next_offset_to_consume));
+            cerr("Warning : Attempt to commit an offset older than local record: "+std::to_string(next_offset_to_consume));
         }
 
 
 
         std::string groupid;
+        size_t genid;
+        std::string memberid;
         {
             std::shared_lock<std::shared_mutex> slock(info_basic.mtx);
             groupid =info_basic.groupid  ;
+            genid=info_basic.generation_id;
+            memberid=info_basic.memberid;
         }
 
-        std::string key_off;
+        std::string key_gtp;
         {
             MB mb;
             mb.append(groupid,tp.topic,tp.partition);
-            key_off=mb.dump();
+            key_gtp=mb.dump();
         }
-        auto parid_hash=MurmurHash2::hash(key_off);
+        auto parid_hash=MurmurHash2::hash(groupid);
 
         MB mb;
-        mb.append(groupid,tp.topic,tp.partition,parid_hash,key_off,next_offset_to_consume);
+        mb.append(groupid,memberid,genid, tp.topic,tp.partition,parid_hash,key_gtp,next_offset_to_consume);
 
         bool has_callback = (bool)cb;
         if(has_callback){
@@ -895,7 +902,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         return MYMQ_Public::ClientErrorCode::NULL_ERROR;
     }
 
-    MYMQ_Public::ResultVariant MYMQ_clientuse::handle_response(Eve event_type,const Mybyte& msg_body){
+    MYMQ_Public::ResultVariant MYMQ_Consumeruse::handle_response(Eve event_type,const Mybyte& msg_body){
 
         MessageParser mp(msg_body.data(),msg_body.size());
         if(event_type==MYMQ::EventType::SERVER_RESPONSE_PUSH_ACK){
@@ -992,62 +999,69 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         else if(event_type == Eve::SERVER_RESPONCE_HEARTBEAT){
             auto error = static_cast<Err>(mp.read_uint16());
 
+            auto groupid = mp.read_string();
+            auto memberid = mp.read_string();
+            auto generationid = mp.read_size_t();
+
             if(error == Err::UPDATE_GENERATION){
-                auto groupid = mp.read_string();
-                auto memberid = mp.read_string();
-                auto generationid = mp.read_size_t();
-                auto need_update_tps = mp.read_bool();
 
-                if(need_update_tps){
-                    // 1. 【解析阶段】先把服务器分配的新方案读到一个临时 std::map 中
-                    auto tp_num = mp.read_size_t();
-                    std::unordered_map<TopicPartition, size_t> new_assignment_map;
-                    new_assignment_map.reserve(tp_num);
+                // 1. 【解析阶段】按照新的层级结构 (Topic -> List<Partition>) 读取分配方案
+                // 服务器端逻辑：mb.append_size_t(res.assign.size());
+                auto topic_count = mp.read_size_t();
 
-                    for(size_t i = 0; i < tp_num; i++){
-                        auto topic = mp.read_string();
+                std::unordered_map<TopicPartition, size_t> new_assignment_map;
+                // 预估容量，虽然无法精确知道分区总数，但可以减少部分扩容开销
+                new_assignment_map.reserve(topic_count * 4);
+
+                for(size_t i = 0; i < topic_count; i++){
+                    // 服务器端逻辑：mb.append(topic);
+                    auto topic = mp.read_string();
+                    // 服务器端逻辑：mb.append_size_t(partitions.size());
+                    auto partition_count = mp.read_size_t();
+
+                    for(size_t j = 0; j < partition_count; j++){
+                        // 服务器端逻辑：mb.append_size_t(par);
                         auto partition = mp.read_size_t();
-                        auto endoffset = mp.read_size_t();
+
+                        size_t endoffset = mp.read_size_t();
+
+                        if(endoffset==SIZE_MAX) {
+                            continue;
+                        }
+
                         TopicPartition tp(topic, partition);
                         new_assignment_map[tp] = endoffset;
                     }
+                }
 
-                    // 2. 【清理阶段】找出旧 Map 中有，但新方案中没有的分区 -> 移除 (Revoke)
-                    std::vector<TopicPartition> to_remove;
-                    // TBB 迭代器遍历是安全的，但为了逻辑清晰，我们先收集 Key 再删除
-                    for(auto it = map_final_assign.begin(); it != map_final_assign.end(); ++it){
-                        if(new_assignment_map.find(it->first) == new_assignment_map.end()){
-                            to_remove.push_back(it->first);
-                        }
+                // 2. 【清理阶段】找出旧 Map 中有，但新方案中没有的分区 -> 移除 (Revoke)
+                // (这部分逻辑保持不变，因为 new_assignment_map 已经构造好了)
+                std::vector<TopicPartition> to_remove;
+                for(auto it = map_final_assign.begin(); it != map_final_assign.end(); ++it){
+                    if(new_assignment_map.find(it->first) == new_assignment_map.end()){
+                        to_remove.push_back(it->first);
                     }
+                }
 
-                    // 执行删除
-                    for(const auto& tp : to_remove){
-                        // 这里可以加一行日志：out("Rebalance: Revoked partition " + tp.topic + "-" + std::to_string(tp.partition));
-                        map_final_assign.erase(tp);
+                // 执行删除
+                for(const auto& tp : to_remove){
+                    // Log: Revoked partition
+                    map_final_assign.erase(tp);
+                }
+
+                // 3. 【新增阶段】遍历新方案，执行插入或保留
+                // (这部分逻辑保持不变)
+                for(const auto& [tp, server_offset] : new_assignment_map){
+                    TP_PointMap::accessor ac;
+                    if(map_final_assign.insert(ac, tp)){
+                        // Case A: 新分区 -> 初始化
+                        ac->second.endoffset_ptr = std::make_shared<MYMQ::MYMQ_Client::endoffset_point>(server_offset, tp);
+                        ac->second.pollqueue_ptr = std::make_shared<MYMQ::MYMQ_Client::PollBuffer>(20000000, 1000000000);
                     }
-
-                    // 3. 【新增阶段】遍历新方案，执行插入或保留
-                    for(const auto& [tp, server_offset] : new_assignment_map){
-                        TP_PointMap::accessor ac;
-                        // insert 返回 true 表示 Key 不存在（新插入了）；返回 false 表示 Key 已存在
-                        if(map_final_assign.insert(ac, tp)){
-                            // Case A: 这是一个全新的分区 -> 初始化 PollBuffer 和 Offset
-                            ac->second.endoffset_ptr = std::make_shared<MYMQ::MYMQ_Client::endoffset_point>(server_offset, tp);
-                            ac->second.pollqueue_ptr = std::make_shared<MYMQ::MYMQ_Client::PollBuffer>(20000000, 1000000000);
-                            // 日志：out("Rebalance: Assigned new partition " + tp.topic);
-                        }
-                        else {
-                            // Case B: 这个分区本来就在本地 -> 这是一个“保留”的分区
-                            // 关键点：我们什么都不做！保留原有的 PollBuffer 和本地 Offset。
-                            // 这样内存里还没消费的数据就不会丢失了。
-
-                            // 只有一种特殊情况需要覆盖：如果服务器强制要求重置 Offset (例如 offset out of range)
-                            // 可以在这里加逻辑，但在普通的 Rebalance 中，保留本地状态是正确的。
-                        }
-                        // accessor 析构，释放行锁
+                    else {
+                        // Case B: 已存在 -> 这是一个“保留”的分区，不做任何操作，保留本地状态
                     }
-                } // end if(need_update_tps)
+                }
 
                 // 4. 更新元数据 (Group Info)
                 {
@@ -1057,23 +1071,22 @@ MYMQ_clientuse::~MYMQ_clientuse(){
                     info_basic.memberid = memberid;
                 }
 
-                if(need_update_tps){
-                    cerr("[Heartbeat] Generation updated to " + std::to_string(generationid) + ". Partitions Rebalanced.");
+                cerr("[Heartbeat] Generation updated to " + std::to_string(generationid) + ". Partitions Rebalanced.");
 
-                    is_ingroup.store(1);
+                is_ingroup.store(1);
 
-                    // 重启定时任务
-                    heartbeat_stop();
-                    heartbeat_start();
+                // 重启定时任务
+                heartbeat_stop();
+                heartbeat_start();
 
-                    if(is_auto_commit){
-                        autocommit_stop();
-                        autocommit_start();
-                    }
+                if(is_auto_commit){
+                    autocommit_stop();
+                    autocommit_start();
                 }
+
             } // end if(UPDATE_GENERATION)
             else if(error == Err::NULL_ERROR){
-                // 心跳正常，无事发生
+                // 心跳正常
             }
             else{
                 cerr("[Heartbeat] Error : " + MYMQ_Public::to_string(error));
@@ -1094,6 +1107,8 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
             auto groupid=mp.read_string();
+            auto memberid=mp.read_string();
+            auto generation=mp.read_size_t();
             auto topicname=mp.read_string();
             auto partition=mp.read_size_t();
             auto errorcode=static_cast<Err>(mp.read_uint16()) ;
@@ -1101,16 +1116,18 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
             if(!get_is_ingroup()){
                 cerr("Get commit respose but now not in group");
-                return MYMQ_Public::CommonErrorCode::COMMIT_OFFSET_TIMEOUT;
+                return Err::GENERATION_EXPIRED;
             }
 
 
+
             std::shared_lock<std::shared_mutex> slock(info_basic.mtx);
-            auto groupid_local=info_basic.groupid;
+            bool expired= (errorcode==Err::GENERATION_EXPIRED||! (groupid==info_basic.groupid&&memberid==info_basic.memberid&&generation==info_basic.generation_id));//世代很重要，必须强逻辑检查
             slock.unlock();
-            if(groupid_local!=groupid){
-                cerr("[Commit offset] Warning : Get commit respose but not in Group '"+groupid_local+"'");
-                return MYMQ_Public::CommonErrorCode::COMMIT_OFFSET_TIMEOUT;
+            if(expired){
+                out("[Commit offset] Get commit respose but it has already expired.");
+                heartbeat();
+                return Err::GENERATION_EXPIRED;
             }
             if(errorcode==Err::NULL_ERROR){
                 {
@@ -1148,7 +1165,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
         return MYMQ_Public::CommonErrorCode::NULL_ERROR;
     }
 
-    void MYMQ_clientuse::out_group_reset(){
+    void MYMQ_Consumeruse::out_group_reset(){
         is_ingroup.store(0);
         {
             std::string tmp{};
@@ -1166,7 +1183,7 @@ MYMQ_clientuse::~MYMQ_clientuse(){
 
 
 
-    void MYMQ_clientuse::trigger_poll_for_low_cap_pollbuffer(){
+    void MYMQ_Consumeruse::trigger_poll_for_low_cap_pollbuffer(){
         if(!is_ingroup.load()){
             return ;
         }
