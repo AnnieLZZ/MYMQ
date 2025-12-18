@@ -63,17 +63,22 @@ public:
 
 
     void replace_mmapfile_content(Mmapfile& m_source, Mmapfile& m_receiver) {
-        m_source.flush_sync();
-        m_receiver.reset();
-        if (std::rename(m_source.get_filename().c_str(), m_receiver.get_filename().c_str()) != 0) {
-            throw std::runtime_error("Failed to rename file from '" + m_source.get_filename() +
-                                     "' to '" + m_receiver.get_filename() + "': " + std::strerror(errno));
-        }
+        // 1. 获取目标路径 (旧的索引文件路径)
+        std::string target_path = m_receiver.get_filename();
 
-        m_receiver.take_ownership_of_internal(std::move(m_source));
+        // 2. 关闭接收者
+        // 这一步在 Linux 上虽然不是强制的（因为 inode 机制允许重命名打开的文件），
+        // 但为了逻辑清晰，我们应该先释放 m_receiver 对旧文件的句柄。
+        m_receiver.close();
+
+        // 3. 让源对象执行重命名
+        // 这一步既改了磁盘上的名字，也改了 m_source 内部的 filename_
+        m_source.rename_file(target_path);
+
+        // 4. 移动资源
+        // 此时 m_source 的 filename_ 已经是 target_path 了，直接 move 过去即可
+        m_receiver = std::move(m_source);
     }
-
-
 
     bool recover_index() {
         // --- 1. 准备阶段 ---
@@ -367,6 +372,42 @@ log_bytes_since_last_flush.store(0);
         bytes_last_index_entry_.store(0);
     }
 
+
+    void mark_as_clean_in_lock() {
+        // 1. 强行落盘，确保数据完整
+        flush_log();
+        flush_index();
+
+        // 2. 关闭 Log 文件描述符
+        if (log_file_fd != -1) {
+            ::close(log_file_fd);
+            log_file_fd = -1;
+        }
+
+        // 3. 关闭 Index 的 mmap 映射
+        // 这一步至关重要，否则 rename 后原来的 mmap 仍然指向旧 inode，
+        // 且如果这时有野指针访问会造成严重后果。
+        index_file_.close();
+
+        // 4. 准备文件名
+        std::string clean_log_name = log_filename + ".clean";
+        std::string clean_index_name = index_path + ".clean";
+
+        // 5. 执行重命名 (Log)
+        if (std::rename(log_filename.c_str(), clean_log_name.c_str()) != 0) {
+            std::cerr << "[LogSegment] Failed to rename log: " << log_filename
+                      << " to " << clean_log_name << " error: " << strerror(errno) << std::endl;
+            // 即使失败，最好也不要抛出异常中断流程，只是记录错误
+        }
+
+        // 6. 执行重命名 (Index)
+        if (std::rename(index_path.c_str(), clean_index_name.c_str()) != 0) {
+            std::cerr << "[LogSegment] Failed to rename index: " << index_path
+                      << " to " << clean_index_name << " error: " << strerror(errno) << std::endl;
+        }
+    }
+
+
     MesLoc find(uint64_t target_offset, size_t byte_need) {
         // 【关键修改 1】不再加锁！
         MesLoc loc{}; // 默认 found=0
@@ -573,7 +614,7 @@ log_bytes_since_last_flush.store(0);
             bytes_last_index_entry_ = 0;
             actual_physical_file_size = 0; // 【重要】重置物理大小计数
 
-            index_file_.reset();
+            index_file_.close();
     }
 
 private:
