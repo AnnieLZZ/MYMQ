@@ -42,6 +42,15 @@
 6 现在会在assign发生变换是根据用户的配置填入这个分区最新的offset
 7 MQ初始化修改，现在Consumeroffset类功能暂时下线
 8 去掉了之前已经废弃的函数parse_assignments_message
+1 mmap部分方法改写：a.reset改名close，并且不会再清空filename。b.allocate方法现在会先进行防御性检查，不会操作已失效的对象，当容量满和mmap指针失效时只会抛出out_of_range
+c.禁用copy语义，实现移动语义
+d.新增swap函数和rename_file辅助移动语义，也可以主动调用，代替take_ownership_of_internal的作用
+2 去除了Topic类，现在Topic完全是逻辑上的概念
+3 有关get_first_baseoffset的函数统一更名为get_earilestoffset
+4 replace_mmapfile_content利用移动语义和mmapfile的方法简化重写
+5 Logsegment新增mark_as_clean_in_lock方法，辅助未来定时清理过期段的行为，该方法功能是:讲自己这个段强制刷盘，关闭日志段文件描述符，关闭日志段的mmap，将管理的两个文件尾部rename增加".clean"
+6 PartitionStorage新增archive_segment，通过指定日志段的baseoffset来将其无效化（无法再被读取）
+7 当客户端配置为earliestoffset时，暂时只返回0，后续会补足该逻辑
 
 
 ---
