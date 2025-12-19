@@ -384,7 +384,7 @@ public:
     }
 
 
-    size_t getEarliestOffset()  {
+    size_t get_earliestoffset()  {
         return msg_stor->get_earilestoffset();
     }
 
@@ -650,6 +650,7 @@ private:
 
 class MessageQueue : public std::enable_shared_from_this<MessageQueue> {
 
+
 public:
     explicit MessageQueue(const std::string& data_root_dir = "./data/")
         : data_root_dir_(data_root_dir),cache_metadata(nullptr)
@@ -703,17 +704,7 @@ public:
     }
 
 
-    size_t get_partition_endoffset(const std::string& topicname,size_t partition ){
 
-        TopicPartition_to_Log_Map::const_accessor cac;
-        if(! map_tp_to_log .find(cac,TopicPartition(topicname,partition))){
-           return SIZE_MAX;
-        }
-        auto partition_ptr=cac->second;
-        cac.release();
-
-        return  partition_ptr->get_endoffset();
-    }
     void load_topics_metadata() {
         std::ifstream ifs(topics_metadata_filename_);
         if (!ifs.is_open()) {
@@ -839,7 +830,7 @@ public:
     }
 
 
-    Err  get_endoffset(const std::string& group_id,const std::string& topic, size_t partition, size_t& offset) {
+    Err  get_endoffset_of_group_metadatacache(const std::string& group_id,const std::string& topic, size_t partition, size_t& offset) {
         return groupcoordinator_->get_endoffset(group_id,topic,partition,offset);
     }
 
@@ -858,6 +849,29 @@ public:
        return groupcoordinator_->update_subscription(group_id,member_id,gen_id,client_full_list);
     }
 
+
+    size_t get_partition_earliestoffset(const std::string& topicname,size_t partition){
+
+        TopicPartition_to_Log_Map::const_accessor cac;
+        if(! map_tp_to_log .find(cac,TopicPartition(topicname,partition))){
+           return SIZE_MAX;
+        }
+        auto partition_ptr=cac->second;
+        cac.release();
+
+        return  partition_ptr->get_earliestoffset();
+    }
+    size_t get_partition_endoffset(const std::string& topicname,size_t partition ){
+
+        TopicPartition_to_Log_Map::const_accessor cac;
+        if(! map_tp_to_log .find(cac,TopicPartition(topicname,partition))){
+           return SIZE_MAX;
+        }
+        auto partition_ptr=cac->second;
+        cac.release();
+
+        return  partition_ptr->get_endoffset();
+    }
 
 private:
 
@@ -1033,15 +1047,18 @@ private:
                         mb.append_size_t(partitions.size());
                         for(const auto& par:partitions){
                             mb.append_size_t(par);
+                            size_t off=SIZE_MAX;
                             if(pull_start_location==MYMQ::PullSet::END_OFFSET){
-                                size_t off=SIZE_MAX;
-                                get_endoffset(groupid,topic,par,off);
-                                mb.append_size_t(off);
+
+                               auto err= get_endoffset_of_group_metadatacache(groupid,topic,par,off);//off=SIZE_MAX代表没有记录
+                               if(err==Err::UNKNOWN_OFFSET_KEY){
+                                   off=get_partition_endoffset(topic,par);//off=SIZE_MAX代表没有这个分区
+                                 }
                             }
                             else if(pull_start_location==MYMQ::PullSet::EARLIEST_OFFSET){
-                                mb.append_size_t(0);//暂时做一个占位，功能未实现
-
+                                off= get_partition_earliestoffset(topic,par);//off=SIZE_MAX代表没有这个分区
                             }
+                             mb.append_size_t(off);
                         }
 
                     }

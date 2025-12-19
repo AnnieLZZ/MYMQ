@@ -51,7 +51,9 @@ d.新增swap函数和rename_file辅助移动语义，也可以主动调用，代
 5 Logsegment新增mark_as_clean_in_lock方法，辅助未来定时清理过期段的行为，该方法功能是:讲自己这个段强制刷盘，关闭日志段文件描述符，关闭日志段的mmap，将管理的两个文件尾部rename增加".clean"
 6 PartitionStorage新增archive_segment，通过指定日志段的baseoffset来将其无效化（无法再被读取）
 7 当客户端配置为earliestoffset时，暂时只返回0，后续会补足该逻辑
-
+1 Partition::getEarliestOffset更名为Partition::get_earliestoffset
+2 现在当组成员分配到分区时，允许配置消费位置:从endoffset或者从earliestoffset开始消费，endoffset会有两个可信来源，服务器会优先在组状态内寻找组内的最新提交偏移，如果没有才会去查log层的实际endoffset，而earliestoffset只会从log层获取
+3 用get_endoffset_of_group_metadatacache和get_partition_endoffset以区分两个可信来源，以及新增接口get_partition_earliestoffset
 
 ---
 
