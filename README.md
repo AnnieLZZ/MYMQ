@@ -22,7 +22,7 @@
 
 ---
 
-## 🚀 架构设计 (Architecture Features)
+## 🚀 架构设计 (Architecture Features) Version4.0.0
 
 ### 1. I/O 与存储优化 (I/O & Storage)
 * **Zero-Copy with kTLS:** 结合 `sendfile` 实现零拷贝传输；引入 **OpenSSL kTLS** 将加密卸载至内核态，解决了传统 SSL 在用户态加密导致无法利用 sendfile 的痛点，显著减少内核/用户态上下文切换。（这也是为什么不使用boost.asio的原因，boost.asio强制将加密抬到用户态）
@@ -67,7 +67,7 @@
 
 
 ### 4. 分布式协同 (Distributed Coordination)
-* **Incremental Cooperative Rebalancing:** 实现了 Kafka 协议的“增量协作式重平衡”。相比传统的 Eager Rebalancing，该机制允许消费者在重平衡期间保留部分分区所有权，消除了“Stop-the-world”带来的消费停顿。
+* **Incremental Cooperative Rebalancing:** 实现了 Kafka 协议的“增量协作式重平衡”。相比传统的 Eager Rebalancing，该允许消费者在重平衡期间保留部分分区所有权，消除了“Stop-the-world”带来的消费停顿。
 * **Group Coordinator:** 内置组协调器，管理消费者组状态、分区分配策略、心跳检测及 Offset 提交。
 
 ### 5. 安全与可靠性 (Security & Reliability)
