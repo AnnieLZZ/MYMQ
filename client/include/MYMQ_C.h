@@ -1,15 +1,49 @@
 #ifndef MYMQ_C_H
 #define MYMQ_C_H
 
-#include "MYMQ_PublicCodes.h" // Public types (ConsumerRecord, ErrorCodes)
+#include "MYMQ_PublicCodes.h"
 #include <string>
 #include <queue>
-#include <utility> // For std::pair
-#include <memory>  // For std::unique_ptr
-#include <cstdint> // For uint8_t
+#include <utility>
+#include <memory>
+#include <cstdint>
 #include<unordered_set>
 
 class MYMQ_clientuse;
+class MYMQ_Produceruse;
+
+
+class MYMQ_Producer {
+        using ClientErrorCode = MYMQ_Public::ClientErrorCode;
+public:
+
+    MYMQ_Producer(const std::string& clientid = std::string(), uint8_t ack_level = 255); // 255 = UINT8_MAX
+
+    ~MYMQ_Producer();
+
+    MYMQ_Producer(const MYMQ_Producer&) = delete;
+    MYMQ_Producer& operator=(const MYMQ_Producer&) = delete;
+
+    MYMQ_Producer(MYMQ_Producer&&) = delete;
+    MYMQ_Producer& operator=(MYMQ_Producer&&) = delete;
+
+
+
+    ClientErrorCode push(const MYMQ_Public::TopicPartition& tp,
+                    const std::string& key,
+                    const std::string& value,
+                    MYMQ_Public::PushResponceCallback cb=MYMQ_Public::PushResponceCallback());
+
+    void create_topic(const std::string& topicname, size_t parti_num = 1);
+
+private:
+    // 2. 唯一的成员变量：指向实现的指针
+    std::unique_ptr<MYMQ_Produceruse> pimpl;
+};
+
+
+
+
 
 class MYMQ_Client {
 public:
@@ -33,11 +67,15 @@ public:
     // --- Public API (Mirrored from MYMQ_clientuse) ---
 
 
-
+void  trigger_pull();
 
     ClientErrorCode push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value
                          ,MYMQ_Public::PushResponceCallback cb=MYMQ_Public::PushResponceCallback());
-    ClientErrorCode pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch);
+    ClientErrorCode pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_ms=5000);
+    ClientErrorCode pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
+                    size_t poll_wait_timeout_ms,
+                    int64_t& out_latency_us);
+
 
     ClientErrorCode seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume);
     ClientErrorCode commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb=MYMQ_Public::CommitAsyncResponceCallback());
@@ -57,8 +95,12 @@ public:
 
     bool get_is_ingroup();
 
+    void set_local_pull_bytes_once(size_t bytes);
+
 private:
     std::unique_ptr<MYMQ_clientuse> pimpl;
 };
+
+
 
 #endif // MYMQ_C_H

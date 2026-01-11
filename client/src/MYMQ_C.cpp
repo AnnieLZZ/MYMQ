@@ -1,6 +1,36 @@
 #include "MYMQ_C.h"
 #include "MYMQ_CLIENT.H"
 
+
+
+
+
+MYMQ_Producer::MYMQ_Producer(const std::string& clientid, uint8_t ack_level)
+    : pimpl(std::make_unique<MYMQ_Produceruse>(clientid, ack_level)) {
+}
+
+
+MYMQ_Producer::~MYMQ_Producer() = default;
+
+Err_Client MYMQ_Producer::push(const MYMQ_Public::TopicPartition& tp,
+                               const std::string& key,
+                               const std::string& value,
+                               MYMQ_Public::PushResponceCallback cb) {
+    return pimpl->push(tp, key, value, cb);
+}
+
+void MYMQ_Producer::create_topic(const std::string& topicname, size_t parti_num) {
+    pimpl->create_topic(topicname, parti_num);
+}
+
+
+
+
+
+
+
+
+
 MYMQ_Client::MYMQ_Client(const std::string& clientid, uint8_t ack_level)
     : pimpl(std::make_unique<MYMQ_clientuse>(clientid, ack_level))
 {
@@ -13,7 +43,10 @@ MYMQ_Client::MYMQ_Client(MYMQ_Client&&) noexcept = default;
 MYMQ_Client& MYMQ_Client::operator=(MYMQ_Client&&) noexcept = default;
 
 
+void  MYMQ_Client::set_local_pull_bytes_once(size_t bytes){
 
+    return pimpl->set_local_pull_bytes_once(bytes);
+}
 
 MYMQ_Client::ClientErrorCode MYMQ_Client::commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
                                                        ,MYMQ_Public::CommitAsyncResponceCallback cb) {
@@ -29,8 +62,18 @@ MYMQ_Client::ClientErrorCode MYMQ_Client::push(const MYMQ_Public::TopicPartition
     return pimpl->push(tp, key, value,cb);
 }
 
-MYMQ_Client::ClientErrorCode MYMQ_Client::pull(const MYMQ_Public::TopicPartition& tp,std::vector< MYMQ_Public::ConsumerRecord>& record_batch) {
-    return pimpl->pull(tp,record_batch);
+MYMQ_Client::ClientErrorCode MYMQ_Client::pull(std::vector< MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_ms) {
+    return pimpl->pull(record_batch,poll_wait_timeout_ms);
+}
+
+MYMQ_Client::ClientErrorCode MYMQ_Client::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
+                     size_t poll_wait_timeout_ms,
+                                  int64_t& out_latency_us){
+    return pimpl->pull(record_batch,poll_wait_timeout_ms,out_latency_us);
+}
+
+void MYMQ_Client::trigger_pull(){
+    return pimpl->trigger_poll_for_low_cap_pollbuffer();
 }
 
 void MYMQ_Client::create_topic(const std::string& topicname, size_t parti_num) {

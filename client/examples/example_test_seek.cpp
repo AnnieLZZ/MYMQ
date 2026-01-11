@@ -87,7 +87,7 @@ int main(){
         std::vector<MYMQ_Public::ConsumerRecord> res;
         out("\n[" + step_name + "] Pulling data...");
 
-        auto err = mc.pull(tp, res);
+        auto err = mc.pull( res);
 
         if (err != Err_Client::NULL_ERROR && res.empty()) {
             cerr(">> FAILED: Pull returned error or empty. Code: " + std::to_string(static_cast<int>(err)));
@@ -137,7 +137,7 @@ int main(){
     // 为了测试 seek，我们先随便拉一下，消耗一些 offset
     out("\n--- Case 1: Initial Normal Pull ---");
     std::vector<MYMQ_Public::ConsumerRecord> dummy_res;
-    mc.pull(tp, dummy_res);
+    mc.pull( dummy_res);
     if (!dummy_res.empty()) {
         out("Consumed initial batch from " + std::to_string(dummy_res.front().getOffset()) +
             " to " + std::to_string(dummy_res.back().getOffset()));
@@ -164,7 +164,7 @@ int main(){
         mc.seek(tp, target_mid);
 
         std::vector<MYMQ_Public::ConsumerRecord> res_mid;
-        mc.pull(tp, res_mid);
+        mc.pull( res_mid);
 
         if (!res_mid.empty()) {
             std::string expected_key = "key_" + std::to_string(target_mid);

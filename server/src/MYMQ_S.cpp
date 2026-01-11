@@ -28,9 +28,9 @@ void MYMQ_S::save_topics_metadata()
     pimpl->save_topics_metadata();
 }
 
-Err MYMQ_S::push(Mybyte& msg, const std::string& topicname, size_t partition)
+Err MYMQ_S::push(const Byte_view_pair& msg_view, const std::string& topicname, size_t partition)
 {
-    return pimpl->push(msg, topicname, partition);
+    return pimpl->push(msg_view, topicname, partition);
 }
 
 std::pair<MesLoc, Err> MYMQ_S::pull(size_t target_offset, const std::string& groupid, const std::string& topicname, size_t partition, size_t byte_need)
