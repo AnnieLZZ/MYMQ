@@ -3,8 +3,8 @@
 
 #include "Timer.h"
 #include "CONFIG_MANAGER.h"
-#include "MYMQ_innercodes.h"
-#include"MYMQ_Publiccodes.h"
+// #include "MYMQ_innercodes.h" // Removed MYMQ dependency
+// #include "MYMQ_Publiccodes.h" // Removed MYMQ dependency
 #include "Printqueue.h"
 #include "tbb/concurrent_hash_map.h"
 #include <arpa/inet.h>
@@ -18,120 +18,172 @@
 #include <netinet/in.h>
 #include <sys/sendfile.h>
 #include <variant>
+#include <deque>
+#include <mutex>
+#include <shared_mutex>
 #include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include"SharedThreadPool.h"
-#include"MYMQ_Server_ns.h"
+#include "SharedThreadPool.h"
+// #include "MYMQ_Server_ns.h" // Removed MYMQ dependency
 
-using Mybyte = std::vector<unsigned char>;
-using Eve= MYMQ::EventType;
-using MesLoc=MYMQ_Server::MessageLocation;
-using Err=MYMQ_Public::CommonErrorCode;
-using ClientState=MYMQ_Server::ClientState;
-using TcpSession=MYMQ_Server::TcpSession;
-using SendFileTask=MYMQ_Server::SendFileTask;
+// Generic Networking Types
+namespace Net {
 
+    struct FileSendTask {
+        int in_fd;           // File descriptor
+        off_t offset;        // Start offset in file
+        size_t length;       // Length to send
+        size_t sent_so_far;  // Internal tracking
 
-// 辅助函数（保持不变）
+        // Header to send before the file content
+        std::vector<unsigned char> header_data;
+        size_t header_send_offset = 0;
 
+        // Metadata for callbacks/logging (Generic user data could be added here if needed)
+        // For now, we keep it simple. If the user needs to track correlation_id, 
+        // they can capture it in the completion callback (future feature).
+        
+        FileSendTask(int fd, off_t off, size_t len, std::vector<unsigned char> hdr)
+            : in_fd(fd), offset(off), length(len), sent_so_far(0), header_data(std::move(hdr)) {}
+    };
 
-void out(const std::string& str, bool perior = 0){
-//    Printqueue::instance().out(str,0,perior);
+    class ClientState {
+    public:
+        enum State {
+            READING_HEADER,
+            READING_BODY
+        };
+
+        // State Management
+        State current_state = READING_HEADER;
+
+        // Buffers
+        std::vector<unsigned char> header_buffer;
+        size_t bytes_read_in_header = 0;
+
+        std::vector<unsigned char> body_buffer;
+        size_t bytes_read_in_body = 0;
+
+        // Protocol Fields (Generic)
+        uint32_t expected_body_length = 0;
+        
+        // These were MYMQ specific, but are common enough for a length-prefixed protocol.
+        // We can keep them generic or parse them in the callback.
+        // To be fully decoupled, the Server should only care about LENGTH.
+        // But for convenience, we store the parsed header fields here if the protocol is fixed.
+        // Let's assume the Server supports a pluggable Header Parser, 
+        // OR we just expose the raw header buffer to the callback.
+        // For this refactor, we will expose raw header to callback.
+
+        std::atomic<bool> is_closing{false};
+        int fd = -1;
+
+        std::string clientid = "UNKNOWN"; // Generic ID
+
+        SSL* ssl = nullptr;
+        bool is_handshake_complete = false;
+        bool enable_sendfile = false;
+
+        bool epoll_out_registered = false; 
+
+        // Send Queue
+        using SendItem = std::variant<std::vector<unsigned char>, FileSendTask>;
+
+        std::deque<SendItem> send_queue;
+        size_t current_vec_send_offset = 0; 
+        bool is_writing = false;
+        std::mutex send_queue_mtx; 
+
+        ClientState(size_t header_size) : header_buffer(header_size) {}
+        ClientState() = default;
+
+        bool is_closed(){ return is_closing.load(); }
+        int get_fd(){ return fd; }
+
+        void enqueue_message(std::variant<std::vector<unsigned char>, FileSendTask> payload) {
+            std::unique_lock<std::mutex> statelock(this->send_queue_mtx);
+            send_queue.emplace_back(std::move(payload));
+            if (!send_queue.empty()) is_writing = true;
+        }
+    };
+
+    class TcpSession {
+    public:
+        TcpSession(std::shared_ptr<ClientState> state) : state_(state) {
+            if(state) clientid = state->clientid;
+        }
+
+        void send(std::vector<unsigned char> msg) {
+            auto state = state_.lock();
+            if (!state || state->is_closed()) return;
+            state->enqueue_message(std::move(msg));
+        }
+
+        void send_file(FileSendTask task) {
+            auto state = state_.lock();
+            if (!state || state->is_closed()) return;
+            state->enqueue_message(std::move(task));
+        }
+
+        int fd() const {
+            auto state = state_.lock();
+            return state ? state->get_fd() : -1;
+        }
+
+        bool is_connected() const {
+            auto state = state_.lock();
+            return state && !state->is_closed();
+        }
+        std::string get_clientid(){
+            return clientid;
+        }
+
+    private:
+        std::weak_ptr<ClientState> state_;
+        std::string clientid;
+    };
 }
 
-void cerr(const std::string& str, bool perior = 0){
-//    Printqueue::instance().out(str,1,perior);
-}
+using Net::ClientState;
+using Net::TcpSession;
+using Net::FileSendTask;
 
-
-std::string now_ms_time_gen_str() {
-    std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
-    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-
-    std::tm p_tm_storage; // 使用本地 tm 结构体
-    std::tm* p_tm = nullptr;
-
-#ifdef _WIN32
-    // 在 Windows 上使用 localtime_s
-    if (localtime_s(&p_tm_storage, &now_c) == 0) {
-        p_tm = &p_tm_storage;
-    }
-#else
-    // 在 POSIX 系统上使用 localtime_r
-    if (localtime_r(&now_c, &p_tm_storage) != nullptr) {
-        p_tm = &p_tm_storage;
-    }
-#endif
-
-    if (p_tm == nullptr) {
-        // 处理错误，例如返回一个默认字符串
-        return "[Time Error]";
-    }
-
-    std::stringstream ss_full;
-    ss_full << std::put_time(p_tm, "%Y-%m-%d %H:%M:%S");
-
-    auto duration_since_epoch = now.time_since_epoch();
-    auto seconds_part = std::chrono::duration_cast<std::chrono::seconds>(duration_since_epoch);
-    auto fractional_seconds = duration_since_epoch - seconds_part;
-    auto milliseconds_part = std::chrono::duration_cast<std::chrono::milliseconds>(fractional_seconds);
-
-    ss_full << "." << std::setfill('0') << std::setw(3) << milliseconds_part.count();
-    return ss_full.str();
-}
-
-
-
-
-
+// Helper for time string (keep as is)
+std::string now_ms_time_gen_str(); // (Forward declaration, impl below or separate)
 
 using ClientStateMap = tbb::concurrent_hash_map<int, std::shared_ptr<ClientState>>;
 
-class Server{
+class Server {
 public:
-    // ClientState 结构体用于管理每个客户端的读取状态
-
-  enum class IOStatus {
-        OK_WAITING,      // 数据读完了/未就绪，等待下次 Epoll (对应之前的 return true)
-        OK_COMPLETED,    // 成功处理完一条完整消息，【必须立即尝试读取下一条】
-        ERROR_DEAD       // 发生致命错误，断开连接 (对应之前的 return false)
+    enum class IOStatus {
+        OK_WAITING,      
+        OK_COMPLETED,    
+        ERROR_DEAD       
     };
 
+    // Callback now gives access to Header and Body
+    // User is responsible for parsing the Header to get Type/ID/Ack
+    using ClientMessageCallback = std::function<void(
+        TcpSession& session,
+        const std::vector<unsigned char>& header, // Raw Header
+        std::vector<unsigned char>&& body         // Moved Body
+    )>;
 
-
-
-
-    Server() {
+    Server(size_t header_size = 12) : HEADER_SIZE(header_size) { // Default 12 for MYMQ compatibility
         init_sys();
     }
 
     ~Server() {
-
-        if (server_fd != -1) {
-            close(server_fd);
-            cerr( "Server socket closed." );
-
-        }
-        if (epfd_ != -1) {
-            close(epfd_);
-            cerr("Epoll instance closed.");
-
-        }
+        if (server_fd != -1) { close(server_fd); }
+        if (epfd_ != -1) { close(epfd_); }
     }
-    using ClientMessageCallback = std::function<void(
-        TcpSession& session,         // 核心变化：传入 Session 对象
-        uint16_t event_type,
-        uint32_t correlation_id,
-        uint16_t ack_level,
-        Mybyte msg_body
-    )>;
 
-    // 设置回调函数的方法
     void set_client_message_callback(ClientMessageCallback cb) {
         std::unique_lock<std::shared_mutex> ulock(mtx_callback);
         client_msg_callback_ = cb;
     }
+
 
 
 
@@ -143,7 +195,7 @@ public:
             cerr("IP not found");
         }
         PORT= cm.getint("port");
-        HEADER_SIZE=MYMQ::HEADER_SIZE;
+        // HEADER_SIZE is set in constructor
         msg_body_limit=cm.getull("msgbodylimit_len");
         check_connect_liveness_ms=cm.getint("livenesscheck_ms");
 
@@ -314,7 +366,7 @@ public:
                         SSL_set_fd(ssl, new_socket);
 
                         struct epoll_event client_event;
-                        client_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                        client_event.events = EPOLLIN | EPOLLET; // Removed EPOLLONESHOT for optimization
                         client_event.data.fd = new_socket;
 
                         // [安全检查 2] 如果加入 epoll 失败，要释放 SSL 内存
@@ -425,6 +477,13 @@ public:
                                                 if (status == IOStatus::ERROR_DEAD) {
                                                     client_alive = false;
                                                 }
+                                                
+                                                // [性能优化] 处理完业务逻辑后，如果有数据待发送，尝试立即发送
+                                                // 避免依赖下一次 epoll_wait 的 EPOLLOUT 触发，减少系统调用和上下文切换
+                                                if (client_alive && !client->send_queue.empty()) {
+                                                     // 直接复用 handle_write_event 逻辑
+                                                     client_alive = handle_write_event(fd, *client);
+                                                }
                                             }
                                         }
 
@@ -434,33 +493,41 @@ public:
                                             client_alive = handle_write_event(fd, *client);
                                         }
 
-                                        // --- 标签: 检查是否需要重置 EPOLLONESHOT ---
+                                        // --- 标签: 检查是否需要更新 EPOLL 状态 ---
                                         CHECK_REARM:
 
-                                        // D. 重置 EPOLLONESHOT
-                                        // 此时没有 Map 锁，可以安全调用 epoll_ctl
-                                        if (client_alive && need_rearm_epoll) {
-                                            struct epoll_event ev;
-                                            // 基础事件：读 + 边缘 + 单次
-                                            uint32_t events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-
-                                            // 检查是否需要写
-                                            // 即使这里不加锁也大致安全，因为原子性或者 state 内部有锁
-                                            // 为了严谨，可以锁一下 client->send_queue_mtx 来检查 is_writing
+                                        if (client_alive) {
+                                            bool should_be_writing = false;
                                             {
                                                 std::lock_guard<std::mutex> lock(client->send_queue_mtx);
-                                                if (client->is_writing) {
-                                                    events |= EPOLLOUT;
+                                                should_be_writing = client->is_writing;
+                                            }
+
+                                            // Optimization: Only call epoll_ctl if the state actually changes
+                                            if (should_be_writing && !client->epoll_out_registered) {
+                                                // Need to ADD EPOLLOUT
+                                                struct epoll_event ev;
+                                                ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
+                                                ev.data.fd = fd;
+                                                if (epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == 0) {
+                                                    client->epoll_out_registered = true;
+                                                } else {
+                                                    // Handle error (e.g. client disconnected)
+                                                    client_alive = false;
+                                                }
+                                            } 
+                                            else if (!should_be_writing && client->epoll_out_registered) {
+                                                // Need to REMOVE EPOLLOUT
+                                                struct epoll_event ev;
+                                                ev.events = EPOLLIN | EPOLLET;
+                                                ev.data.fd = fd;
+                                                if (epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == 0) {
+                                                    client->epoll_out_registered = false;
+                                                } else {
+                                                     client_alive = false;
                                                 }
                                             }
-
-                                            ev.events = events;
-                                            ev.data.fd = fd;
-
-                                            if (epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == -1) {
-                                                // 如果重置失败（比如 fd 刚好被关了），当作连接死亡处理
-                                                client_alive = false;
-                                            }
+                                            // Else: No change needed, save the syscall!
                                         }
 
                                         // =======================================================
@@ -617,8 +684,8 @@ public:
                                         // --- 开始构建最终包头 ---
                                         MessageBuilder mb_final;
 
-                                        // 1. 计算 Metadata 块的大小 (Vector 自带一个 uint32 长度前缀)
-                                        uint32_t meta_block_size = sizeof(uint32_t) + static_cast<uint32_t>(pull_inf_additional.size());
+                                        // 1. 计算 Metadata 块的大小 (直接写入，不带 Vector 长度前缀)
+                                        uint32_t meta_block_size = static_cast<uint32_t>(pull_inf_additional.size());
 
                                         // 2. 计算 Task Payload 块的大小 (我们需手动加一个 uint32 长度前缀来表示 Payload 长度)
                                         uint32_t payload_block_size = sizeof(uint32_t) + static_cast<uint32_t>(task.length);
@@ -644,8 +711,8 @@ public:
                                         // 这里写入算好的 Body 总长度
                                         mb_final.append_uint32(body_wrapper_size);
 
-                                            // [Level 2] Metadata (append_uchar_vector 会自动加上 meta 长度前缀)
-                                            mb_final.append_uchar_vector(pull_inf_additional);
+                                            // [Level 2] Metadata (直接写入 raw bytes)
+                                            mb_final.data.insert(mb_final.data.end(), pull_inf_additional.begin(), pull_inf_additional.end());
 
                                             // [Level 2] Task Payload (手动写入长度前缀，实际数据紧随其后)
                                             mb_final.append_uint32(static_cast<uint32_t>(task.length));

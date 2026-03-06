@@ -552,6 +552,10 @@ public:
 
     }
 
+    void set_revocation_handler(std::function<void(const std::string&, size_t)> handler) {
+        revocation_handler_ = handler;
+    }
+
     HeartbeatResponce update_subscription(const std::string& group_id, std::string& member_id, size_t gen_id, const std::set<std::string>& client_full_list) {
         HeartbeatResponce resp;
 
@@ -563,6 +567,10 @@ public:
             if (gen_id == 0) {
                 // 自动创建
                 auto new_group = std::make_shared<ConsumerGroupState>(group_id);
+                // 【新增】注入撤销回调
+                if (revocation_handler_) {
+                    new_group->set_revocation_callback(revocation_handler_);
+                }
                 group_states_.emplace(group_id, new_group);
                 it = group_states_.find(group_id);
             } else {
@@ -643,7 +651,8 @@ private:
     int rebalance_timeout_ms=MYMQ::rebalance_timeout_ms; // 重平衡超时时长
     bool init_ed{0};
 
-   std::shared_ptr<MetadataCache>  cache_metadata_ptr;
+    std::shared_ptr<MetadataCache>  cache_metadata_ptr;
+    std::function<void(const std::string&, size_t)> revocation_handler_;
 
 };
 
@@ -780,7 +789,12 @@ public:
         }
         auto partition_ptr=cac->second;
         cac.release();
-       return partition_ptr->push(msg_view);
+       auto res = partition_ptr->push(msg_view);
+       if(res == Err::NULL_ERROR) {
+           // 【新增】如果有挂起的 Pull 请求，尝试唤醒
+           try_complete_purgatory(topicname, partition);
+       }
+       return res;
     }
 
     std::pair<MesLoc,Err>  pull(size_t target_offset,const std::string& topicname, size_t partition_id,size_t byte_need) {
@@ -878,13 +892,157 @@ private:
 
 
 
+    // Long Polling 相关结构
+    struct PendingPullRequest {
+        TcpSession session;
+        uint32_t correlation_id;
+        uint16_t ack_level;
+        std::string topic;
+        size_t partition;
+        size_t offset;
+        size_t bytes_need;
+        std::chrono::steady_clock::time_point expiration;
+    };
+
+    std::mutex pending_fetches_mutex_;
+    std::map<TopicPartition, std::list<PendingPullRequest>> pending_fetches_;
+
+    // 尝试完成挂起的请求 (当有新消息写入时调用)
+    void try_complete_purgatory(const std::string& topic, size_t partition) {
+        std::lock_guard<std::mutex> lock(pending_fetches_mutex_);
+        TopicPartition tp(topic, partition);
+        auto it = pending_fetches_.find(tp);
+        if (it == pending_fetches_.end()) return;
+
+        auto& list = it->second;
+        for (auto list_it = list.begin(); list_it != list.end(); ) {
+            // 尝试再次拉取
+            auto res = pull(list_it->offset, list_it->topic, list_it->partition, list_it->bytes_need);
+            
+            if (res.second == Err::NULL_ERROR) {
+                // 成功拉取到数据 -> 发送响应并移除请求
+                SendFileTask file_resp(res.first, topic, partition, list_it->correlation_id, list_it->ack_level);
+                list_it->session.send(Eve::SERVER_RESPONSE_PULL_DATA, list_it->correlation_id, list_it->ack_level, std::move(file_resp));
+                list_it = list.erase(list_it);
+            } else {
+                // 仍然没有数据 -> 检查超时
+                if (std::chrono::steady_clock::now() > list_it->expiration) {
+                    // 超时 -> 发送空响应 (或错误码)
+                    // 这里我们发送 NO_RECORD 错误，让客户端知道超时了
+                     send_error_response(list_it->session, list_it->correlation_id, list_it->ack_level, 
+                                        list_it->topic, list_it->partition, Err::NO_RECORD, list_it->offset);
+                    list_it = list.erase(list_it);
+                } else {
+                    ++list_it;
+                }
+            }
+        }
+        if (list.empty()) pending_fetches_.erase(it);
+    }
+
+    // 分区所有权撤销时触发 (Rebalance)
+    void on_partition_revocation(const std::string& topic, size_t partition) {
+        std::lock_guard<std::mutex> lock(pending_fetches_mutex_);
+        TopicPartition tp(topic, partition);
+        auto it = pending_fetches_.find(tp);
+        if (it != pending_fetches_.end()) {
+            for (auto& req : it->second) {
+                // 强制返回错误，通知客户端 Rebalance 正在进行
+                send_error_response(req.session, req.correlation_id, req.ack_level, 
+                                    req.topic, req.partition, Err::REBALANCE_IN_PROGRESS, req.offset);
+            }
+            pending_fetches_.erase(it);
+        }
+    }
+
+    // 定期检查超时 (Timer 驱动)
+    void check_purgatory_expiration() {
+        std::lock_guard<std::mutex> lock(pending_fetches_mutex_);
+        auto now = std::chrono::steady_clock::now();
+
+        for (auto it = pending_fetches_.begin(); it != pending_fetches_.end(); ) {
+            auto& list = it->second;
+            for (auto list_it = list.begin(); list_it != list.end(); ) {
+                if (now > list_it->expiration) {
+                    send_error_response(list_it->session, list_it->correlation_id, list_it->ack_level, 
+                                        list_it->topic, list_it->partition, Err::NO_RECORD, list_it->offset);
+                    list_it = list.erase(list_it);
+                } else {
+                    ++list_it;
+                }
+            }
+            if (list.empty()) {
+                it = pending_fetches_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Helper to send standard packet
+    void send_packet(TcpSession& session, Eve type, uint32_t correlation_id, uint16_t ack_level, std::vector<unsigned char> body) {
+        MessageBuilder mb;
+        uint32_t total_length = MYMQ::HEADER_SIZE + sizeof(uint32_t) + body.size();
+        mb.reserve(total_length);
+        mb.append_uint32(total_length);
+        mb.append_uint16(static_cast<uint16_t>(type));
+        mb.append_uint32(correlation_id);
+        mb.append_uint16(ack_level);
+        mb.append_uchar_vector(body);
+        session.send(std::move(mb.data));
+    }
+
+    // Helper to send file packet (Zero-Copy)
+    void send_file_packet(TcpSession& session, Eve type, uint32_t correlation_id, uint16_t ack_level, MesLoc loc) {
+        MessageBuilder mb;
+        // Header: TotalLen(4) | Event(2) | Cid(4) | Ack(2) | BodySize(4)
+        // TotalLen = 12 + 4 + loc.length
+        uint32_t total_length = MYMQ::HEADER_SIZE + sizeof(uint32_t) + loc.length;
+        
+        mb.reserve(16);
+        mb.append_uint32(total_length);
+        mb.append_uint16(static_cast<uint16_t>(type));
+        mb.append_uint32(correlation_id);
+        mb.append_uint16(ack_level);
+        mb.append_uint32(static_cast<uint32_t>(loc.length)); // Body Size prefix for the file content
+        
+        FileSendTask task(loc.file_descriptor, loc.offset_in_file, loc.length, std::move(mb.data));
+        session.send_file(std::move(task));
+    }
+
+    // 辅助发送错误响应
+    void send_error_response(TcpSession& session, uint32_t correlation_id, uint16_t ack_level, 
+                             const std::string& topic, size_t partition, Err error_code, size_t offset) {
+        MessageBuilder mb_meta;
+        mb_meta.append_string(topic);
+        mb_meta.append_size_t(partition);
+        mb_meta.append_uint16(static_cast<uint16_t>(error_code));
+        mb_meta.append_size_t(offset);
+
+        MessageBuilder mb_body;
+        mb_body.append_uchar_vector(mb_meta.data);
+        std::vector<unsigned char> empty_payload;
+        mb_body.append_uchar_vector(empty_payload);
+
+        send_packet(session, Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, std::move(mb_body.data));
+    }
+
+
     void start_server(){
 
         server_.set_client_message_callback(
-                    [this](TcpSession session, uint16_t event_type_short,uint32_t correlation_id,uint16_t ack_level ,Mybyte msg_body) {
+                    [this](TcpSession session, const std::vector<unsigned char>& header, std::vector<unsigned char>&& msg_body) {
+            
+            if (header.size() < 12) return;
+            MessageParser mp_header(header.data(), header.size());
+            mp_header.skip(4); // Skip TotalLen
+            uint16_t event_type_short = mp_header.read_uint16();
+            uint32_t correlation_id = mp_header.read_uint32();
+            uint16_t ack_level = mp_header.read_uint16();
+
             MYMQ::EventType type = static_cast<MYMQ::EventType>(event_type_short);
 
-            cerr("["+std::to_string(correlation_id)+"]["+session.get_clientid()+"]"+ MYMQ::to_string(static_cast<Eve>(event_type_short))+" called.");
+            cerr("["+std::to_string(correlation_id)+"]["+session.get_clientid()+"]"+ MYMQ::to_string(type)+" called.");
             MessageParser mp(msg_body.data(),msg_body.size());
             mp.skip(4);
             if(type==MYMQ::EventType::CLIENT_REQUEST_PULL){
@@ -897,12 +1055,32 @@ private:
                 auto res= pull(offset,topicname,partition,bytes_need);
                 bool failed=1;
                 if(res.second==Err::NULL_ERROR){
-                    SendFileTask file_resp(res.first, topicname, partition,correlation_id,ack_level);
-                    session.send(Eve::SERVER_RESPONSE_PULL_DATA , correlation_id, ack_level, std::move(file_resp));
-
+                    send_file_packet(session, Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, res.first);
                     failed=0;
 
                 }
+                // --- Long Polling Logic ---
+                else if (res.second == Err::NO_RECORD) {
+                    std::lock_guard<std::mutex> lock(pending_fetches_mutex_);
+                    TopicPartition tp(topicname, partition);
+                    
+                    PendingPullRequest req{
+                        session,
+                        correlation_id,
+                        ack_level,
+                        topicname,
+                        partition,
+                        offset,
+                        bytes_need,
+                        std::chrono::steady_clock::now() + std::chrono::milliseconds(500)
+                    };
+                    
+                    pending_fetches_[tp].push_back(req);
+                    
+                    failed = 0; // Handled async
+                }
+                // ---------------------------
+
                 if (failed) {
                     cerr(MYMQ_Public::to_string(static_cast<Err>(res.second)));
 
@@ -1085,6 +1263,10 @@ private:
 
 
 
+        timer_.commit_ms([this]{
+            check_purgatory_expiration();
+        }, 200, 200);
+
         server_thread_ = server_.start_in_thread();
         out("Server has started and is listening for connections." );
     }
@@ -1097,6 +1279,11 @@ private:
             throw std::runtime_error("ConsumerOffset manager not initialized before starting GroupCoordinator.");
         }
         groupcoordinator_ = std::make_shared<GroupCoordinator>(consumer_offset_manager_ptr_, cache_metadata);
+
+        // 【新增】注入撤销回调
+        groupcoordinator_->set_revocation_handler([this](const std::string& topic, size_t partition){
+            this->on_partition_revocation(topic, partition);
+        });
 
         timer_.commit_ms([this]{
             start_group_checkliveness();

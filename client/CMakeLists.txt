@@ -15,12 +15,14 @@ configure_file(
 set(SRC_FILES
     src/MYMQ_C.cpp
     src/MYMQ_Client.cpp
+    src/ClientProtocol.cpp
 )
 
 set(TP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty")
 set(INTERNAL_HEADERS
     src/MYMQ_Client.h
     src/MYMQ_innercodes.h
+    src/ClientProtocol.h
 )
 
 add_library(mymq_lib STATIC

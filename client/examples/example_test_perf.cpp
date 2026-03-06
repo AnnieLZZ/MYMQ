@@ -66,7 +66,7 @@ int main() {
     MYMQ_Consumer mc("perf_consumer", 0);
     mc.subscribe_topic(TOPIC_NAME);
     mc.join_group(GROUP_ID);
-    mc.set_local_pull_bytes_once(1048576000);
+    mc.set_pull_fetch_min_bytes(1048576000);
 
     // 等待连接建立
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -95,7 +95,7 @@ int main() {
             val
             );
 
-        if (err != MYMQ_Public::ClientErrorCode::NULL_ERROR) {
+        if (err != MYMQ_Public::ClientErrorCode::Success) {
             std::cerr << "Push error at " << i << ": " << MYMQ_Public::to_string(err) << std::endl;
         } else {
             push_count++;

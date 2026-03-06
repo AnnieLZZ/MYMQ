@@ -1,5 +1,7 @@
 #include "MYMQ_C.h"
-#include "MYMQ_CLIENT.H"
+#include "MYMQ_Client.h"
+
+using namespace MYMQ::Client;
 
 
 
@@ -43,9 +45,13 @@ MYMQ_Consumer::MYMQ_Consumer(MYMQ_Consumer&&) noexcept = default;
 MYMQ_Consumer& MYMQ_Consumer::operator=(MYMQ_Consumer&&) noexcept = default;
 
 
-void  MYMQ_Consumer::set_local_pull_bytes_once(size_t bytes){
+void  MYMQ_Consumer::set_pull_max_record_num_local(size_t num){
 
-    return pimpl->set_local_pull_bytes_once(bytes);
+    return pimpl->set_pull_max_record_num_local(num);
+}
+
+void MYMQ_Consumer::set_pull_fetch_min_bytes(size_t bytes) {
+    pimpl->set_pull_fetch_min_bytes(bytes);
 }
 
 MYMQ_Consumer::ClientErrorCode MYMQ_Consumer::commit_async(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume
@@ -79,9 +85,7 @@ MYMQ_Consumer::ClientErrorCode MYMQ_Consumer::get_position_consumed(const MYMQ_P
     return pimpl->get_local_consumed_position(tp,pos);
 }
 
-void MYMQ_Consumer::set_pull_bytes(size_t bytes) {
-    pimpl->set_pull_bytes(bytes);
-}
+
 
 void MYMQ_Consumer::subscribe_topic(const std::string& topicname) {
     pimpl->subscribe_topic(topicname);

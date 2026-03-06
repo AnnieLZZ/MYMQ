@@ -17,7 +17,7 @@ namespace MYMQ_Public {
 
 // 注意：只包含您希望用户看到的错误码。
 enum class CommonErrorCode : uint16_t {
-    NULL_ERROR=4000,
+    Success=4000,
     // MQ 错误
     GROUP_NOT_FOUND=4001,
     MEMBER_NOT_FOUND=4002,
@@ -47,13 +47,14 @@ enum class CommonErrorCode : uint16_t {
     // Logsegment 错误
     FULL_SEGMENT=5000,
     FAILED_ALLOCATE=5001,
-    IO_ERROR=5002
+    IO_ERROR=5002,
+    UNKNOWN_SERVER_ERROR=5003 // 新增错误码
 };
 
 // ServerErrorCode 的 to_string 函数
 inline std::string to_string(CommonErrorCode code) {
     switch (code) {
-    case CommonErrorCode::NULL_ERROR: return "NULL_ERROR";
+    case CommonErrorCode::Success: return "Success";
     case CommonErrorCode::GROUP_NOT_FOUND: return "GROUP_NOT_FOUND";
     case CommonErrorCode::MEMBER_NOT_FOUND: return "MEMBER_NOT_FOUND";
     case CommonErrorCode::ILLEGAL_GENERATION: return "ILLEGAL_GENERATION";
@@ -86,7 +87,7 @@ inline std::string to_string(CommonErrorCode code) {
 
 enum class ClientErrorCode :uint16_t{
     NOT_IN_GROUP=1000,
-    NULL_ERROR=1003,
+    Success=1003,
     PULL_TIMEOUT=1004,
     PULL_OTHER_IN_PULL=1005,
     COMMIT_SYNC_TIMEOUT=1006,
@@ -109,7 +110,7 @@ enum class ClientErrorCode :uint16_t{
 inline std::string to_string(ClientErrorCode code) {
     switch (code) {
     case ClientErrorCode::NOT_IN_GROUP: return "NOT_IN_GROUP";
-    case ClientErrorCode::NULL_ERROR: return "NULL_ERROR";
+    case ClientErrorCode::Success: return "Success";
     case ClientErrorCode::PULL_TIMEOUT: return "PULL_TIMEOUT";
     case ClientErrorCode::PULL_OTHER_IN_PULL: return "PULL_OTHER_IN_PULL";
     case ClientErrorCode::COMMIT_SYNC_TIMEOUT: return "COMMIT_SYNC_TIMEOUT";
@@ -153,6 +154,11 @@ struct CommitAsyncResponce {
     TopicPartition tp;
     size_t committed_offset;
     CommonErrorCode error;
+    
+    CommitAsyncResponce() = default;
+    CommitAsyncResponce(std::string gid, TopicPartition t, size_t off, CommonErrorCode err)
+        : groupid(std::move(gid)), tp(std::move(t)), committed_offset(off), error(err) {}
+        
     CommitAsyncResponce(const CommitAsyncResponce& resp):groupid(resp.groupid),tp(resp.tp),committed_offset(resp.committed_offset),error(resp.error) {}
 };
 

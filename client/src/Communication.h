@@ -37,7 +37,7 @@
 using Mybyte = std::vector<unsigned char>;
 using MP = MessageParser;
 using Eve=MYMQ::EventType;
-using ClientState=MYMQ::MYMQ_Client::ClientState;
+using ClientState=MYMQ::Client::ClientState;
 using PendingMessage=MYMQ::PendingMessage;
 using ResponseCallback=MYMQ::ResponseCallback;
 
@@ -63,6 +63,9 @@ inline std::string now_ms_time_gen_str() {
     return ss_full.str();
 }
 
+
+namespace MYMQ {
+namespace Network {
 
 class Communication_client {
 public:
@@ -789,5 +792,8 @@ private:
 
 
 };
+
+} // namespace Network
+} // namespace MYMQ
 
 #endif // COMMUNICATION_H

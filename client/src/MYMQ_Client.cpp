@@ -1,5 +1,80 @@
-#include"MYMQ_Client.h"
-MYMQ_Consumeruse::MYMQ_Consumeruse(const std::string& clientid,uint8_t ack_level):path_(MYMQ::run_directory_DEFAULT),cmc_(MYMQ::run_directory_DEFAULT,MYMQ::REQUEST_TIMEOUT_MS_DEFAULT),tbb_dctx_pool([]() {
+#include "MYMQ_Client.h"
+#include "ClientProtocol.h"
+#include "Serialize.h"
+
+namespace MYMQ {
+namespace Client {
+
+using namespace MYMQ_Public;
+
+    bool ClientBase::send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::Client::SparseCallback> cbs_)
+    {
+        // 1. 检查飞行请求数 (保持不变)
+        size_t curr_fly = SIZE_MAX;
+        cmc_.get_curr_flying_request_num(curr_fly);
+        if (curr_fly >= max_in_flight_requests_num) {
+            return 0;
+        }
+
+        // 2. 发送消息并挂载回调
+        auto succ = cmc_.send_msg(static_cast<short>(event_type), msg_body,
+                                  [this, saved_cbs = std::move(cbs_)] // 捕获稀疏列表
+                                  (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
+                                  {
+                                      // 解析响应
+                                      auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
+
+                                      // 3. 遍历稀疏回调列表
+                                      // saved_cbs 中只包含需要回调的消息，非需要回调的已被跳过
+                                      for (auto& sparse_item : saved_cbs) {
+
+                                          uint32_t msg_idx = sparse_item.relative_index; // [关键] 获取该消息在 Batch 中的相对位置
+                                          auto& current_cb = sparse_item.cb;             // 获取对应的回调函数 variant
+
+                                          std::visit([&](auto&& specific_cb) {
+                                              using CBType = std::decay_t<decltype(specific_cb)>;
+
+                                              // --- Push 响应处理 (需要用到 msg_idx 计算 offset) ---
+                                              if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>)
+                                              {
+                                                  if (auto* data = std::get_if<MYMQ_Public::PushResponce>(&resp)) {
+                                                      MYMQ_Public::PushResponce individual_resp = *data;
+
+                                                      // [核心修改]: Offset = Batch基准Offset + 消息相对索引
+                                                      individual_resp.offset = data->offset + msg_idx;
+
+                                                      specific_cb(individual_resp);
+                                                  }
+                                              }
+                                              // --- Commit 响应处理 (不需要索引，直接透传) ---
+                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>)
+                                              {
+                                                  if (auto* data = std::get_if<MYMQ_Public::CommitAsyncResponce>(&resp)) {
+                                                      specific_cb(*data);
+                                                  }
+                                              }
+                                              // --- Noop/Error 处理 (不需要索引，直接透传) ---
+                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>)
+                                              {
+                                                  if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
+                                                      specific_cb(*err);
+                                                  } else {
+                                                      specific_cb(MYMQ_Public::CommonErrorCode::Success);
+                                                  }
+                                              }
+                                              else
+                                              {
+                                                  static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
+                                              }
+
+                                          }, current_cb);
+                                      }
+                                  }
+                                  );
+        return succ;
+    }
+
+MYMQ_Consumeruse::MYMQ_Consumeruse(const std::string& clientid,uint8_t ack_level):ClientBase(MYMQ::run_directory_DEFAULT),path_(MYMQ::run_directory_DEFAULT),tbb_dctx_pool([]() {
         // 初始化函数：当新线程第一次访问时调用
         return ZSTD_createDCtx();
     }){
@@ -57,14 +132,18 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         auto pollqueue_ptr=cac->second.pollqueue_ptr;
         pollqueue_ptr->clear_for_seek(offset_next_to_consume);
         out("[Seek offset] Current offset : "+std::to_string(offset_next_to_consume));
-       return Err_Client::NULL_ERROR;
+       return Err_Client::Success;
     }
 
 
 
-    void MYMQ_Consumeruse:: set_local_pull_bytes_once(size_t bytes){
+    void MYMQ_Consumeruse:: set_pull_max_record_num_local(size_t num){
 
-        local_pull_bytes_once.store(bytes);
+        if(num==0){
+            num=1;
+            cerr("[SET MAX RECORD NUM]Warning : max record num must be 1 at least");
+        }
+        pull_max_record_num_local.store(num);
     }
 
 
@@ -74,165 +153,24 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
     void MYMQ_Consumeruse::call_parse_impl(
         const std::vector<unsigned char>& raw_big_chunk,
         std::vector<MYMQ_Public::ConsumerRecord>& out_records,
-        const MYMQ::MYMQ_Client::TopicPartition& tp,
+        const MYMQ::Client::TopicPartition& tp,
         Err_Client& out_error
         ) {
-        out_error = Err_Client::NULL_ERROR;
+        out_error = Err_Client::Success;
 
-        // 如果数据极小，连一个 Header 都凑不齐，直接返回
         if (raw_big_chunk.empty()) return;
 
-        // Batch 头部由 BaseOffset(8) + BatchLength(4) 组成
-        // Payload 最小长度为 InnerBase(8) + Count(8) + ZstdLen(4) = 20 bytes
-        const size_t MIN_PAYLOAD_SIZE = 20;
-
-        size_t total_records_to_reserve = 0;
-        const size_t chunk_size = raw_big_chunk.size();
-        const unsigned char* chunk_data = raw_big_chunk.data();
-
-        // =========================================================
-        // Phase 1: Pre-scan (为了能够一口气 reserve)
-        // =========================================================
-        try {
-            MessageParser scan_mp(chunk_data, chunk_size);
-
-            while (!scan_mp.eof()) {
-                // 1. 读取 Batch Header
-                // 如果剩余数据不足以读取 Header (12 bytes)，MP 会抛出异常，跳出循环
-                if (scan_mp.remaining() < 12) break;
-
-                scan_mp.skip(8); // 跳过 BaseOffset (8 bytes)
-                uint32_t batch_len = scan_mp.read_uint32(); // BatchLength
-
-                if (batch_len == 0) continue;
-
-                // 2. 检查 Payload 完整性
-                // 此时 scan_mp.offset 指向 Payload 起始位置
-                // 我们只需要读取里面的 Count 字段，不需要解压
-                if (scan_mp.remaining() < batch_len) {
-                    // 数据被截断，停止预扫描
-                    break;
-                }
-
-                // 如果 Payload 甚至不足以存放 Meta 信息，跳过该 Batch
-                if (batch_len < MIN_PAYLOAD_SIZE) {
-                    scan_mp.skip(batch_len);
-                    continue;
-                }
-
-                // 3. 读取 Meta (InnerBase + Count)
-                scan_mp.skip(8); // 跳过 InnerBase
-                uint64_t count = scan_mp.read_uint64();
-                total_records_to_reserve += count;
-
-                // 4. 跳过剩余的 Payload (ZstdLen + ZstdData)
-                // 也就是跳过 (batch_len - 16) 字节
-                scan_mp.skip(batch_len - 16);
-            }
-        } catch (const std::exception& e) {
-            // Pre-scan 阶段的异常可以忽略（或者是数据截断），
-            // 我们只利用已经扫到的数量进行 reserve，真正的错误由 Phase 2 捕捉
-        }
-
-
-        if (total_records_to_reserve > 0) {
-            out_records.reserve(out_records.size() + total_records_to_reserve);
-        }
-
-        // =========================================================
-        // Phase 2: Actual Parsing
-        // =========================================================
         ZSTD_DCtx* dctx = tbb_dctx_pool.local();
+        
+        // 记录当前记录数，以便后续填充 Topic/Partition
+        size_t start_idx = out_records.size();
 
-        try {
-            MessageParser mp(chunk_data, chunk_size);
+        // 调用协议层解析
+        auto ret = ClientProtocol::parse_record_batch(raw_big_chunk, dctx, out_records, tp);
 
-            while (!mp.eof()) {
-                // --- A. 读取 Batch Header ---
-                if (mp.remaining() < 12) break;
-
-                // BaseOffset (虽然这里没用到，但协议里有)
-                uint64_t batch_base_offset = mp.read_uint64();
-                // BatchLength
-                uint32_t batch_len = mp.read_uint32();
-
-                if (batch_len == 0) continue;
-
-                // --- B. 获取 Payload 视图 ---
-                // 这里我们手动构造一个指向 Payload 的视图/子解析器，或者直接校验
-                if (mp.remaining() < batch_len) {
-                    out_error = Err_Client::UNKNOWN_ERROR; // Data Truncated
-                    return;
-                }
-
-                // 如果 batch_len < 20，属于异常数据，直接跳过整个 Payload
-                if (batch_len < MIN_PAYLOAD_SIZE) {
-                    mp.skip(batch_len);
-                    continue;
-                }
-
-                // 标记 Payload 起始点，方便后续计算跳过
-
-                // 1. Inner Base
-                uint64_t inner_base = mp.read_uint64();
-                // 2. Count
-                uint64_t record_num = mp.read_uint64();
-
-                // 3. ZSTD Block (Length + Data)
-                // read_bytes_view 读取一个 uint32_t 长度，然后返回后续数据的指针和长度
-                // 这正好对应 Batch 结构里的 [ZstdLen][ZstdData...]
-                auto [comp_ptr, comp_len] = mp.read_bytes_view();
-
-                // 此时 mp 已经越过了 ZstdData，指向了下一个 Batch 的开头 (如果计算正确的话)
-                // 校验一下：我们读了 8+8=16 字节，read_bytes_view 读了 4+comp_len 字节
-                // 所以总共消耗了 20 + comp_len。应该等于 batch_len。
-                // 如果协议允许 padding，这里可能需要 skip 剩余字节，但通常 read_bytes_view 就是结尾。
-                // 为了严谨（防止 BatchLength 比实际内容大），计算实际消耗并修正：
-                size_t consumed_payload = 16 + 4 + comp_len;
-                if (batch_len > consumed_payload) {
-                    mp.skip(batch_len - consumed_payload);
-                }
-
-                // --- C. 解压 ---
-
-                auto records_nozstd_vec = MYMQ::ZSTD::zstd_decompress_using_view(dctx, comp_ptr, comp_len);
-
-                if (records_nozstd_vec.empty() && record_num > 0) continue;
-
-                auto shared_buffer = std::make_shared<std::vector<unsigned char>>(std::move(records_nozstd_vec));
-                MessageParser inner_mp(shared_buffer->data(), shared_buffer->size());
-
-                for (size_t i = 0; i < record_num; ++i) {
-                    if (inner_mp.eof()) break;
-
-                    // read_bytes_view 返回的是指向 shared_buffer 内部的指针
-                    auto [rec_body_ptr, rec_body_len] = inner_mp.read_bytes_view();
-
-                    MessageParser rec_parser(rec_body_ptr, rec_body_len);
-
-                    try {
-                        std::string_view key_view = rec_parser.read_string_view();
-                        std::string_view val_view = rec_parser.read_string_view();
-                        int64_t timestamp = rec_parser.read_int64();
-
-                        out_records.emplace_back(
-                            tp.topic,
-                            tp.partition,
-                            key_view,       // 传入 view
-                            val_view,       // 传入 view
-                            timestamp,
-                            inner_base + i,
-                            shared_buffer   // 传入 shared_ptr，引用计数 +1
-                            );
-                    } catch (const std::exception&) {
-                        continue;
-                    }
-                }
-            }
-
-        } catch (const std::exception& e) {
-            std::cerr << "Error parsing record batch: " << e.what() << std::endl;
-            out_error = Err_Client::UNKNOWN_ERROR;
+        if (ret != MYMQ_Public::CommonErrorCode::Success) {
+            out_error = Err_Client::UNKNOWN_ERROR; // 简单映射错误
+            return;
         }
     }
 
@@ -247,110 +185,136 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         }
 
         pos= cac->second.endoffset_ptr->off.load(std::memory_order_relaxed);
-        return Err_Client::NULL_ERROR;
+        return Err_Client::Success;
     }
 
-    Err_Client MYMQ_Consumeruse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,size_t poll_wait_timeout_ms) {
+    Err_Client MYMQ_Consumeruse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch, size_t poll_wait_timeout_ms) {
+        // max_record_nums 即原 local_pull_bytes_once 的新语义，建议通过参数传入或作为成员变量
+
         if (!record_batch.empty()) return Err_Client::INVALID_OPRATION;
 
         // --- 1. 数据收集阶段 (Accumulate Phase) ---
-        size_t total_payload_bytes = 0;
+        size_t accumulated_record_count = 0; // 新增：累计收集的记录条数
 
         // 计算绝对截止时间
         auto start_time = std::chrono::steady_clock::now();
         auto deadline = start_time + std::chrono::milliseconds(poll_wait_timeout_ms);
 
         size_t active_item_count = 0;
+
         while (true) {
             bool gained_new_data_this_round = false;
 
             for (auto& [tp, tp_point] : map_final_assign) {
-                std::vector<unsigned char> raw_chunk;
 
-                if (tp_point.pollqueue_ptr->try_pop(raw_chunk)) {
-                    size_t chunk_size = raw_chunk.size();
+                // 变更点 4: 适配 try_pop 返回 pair<size_t, vector>
+                // first: 记录条数, second: 二进制数据块
+                std::pair<size_t, std::vector<unsigned char>> popped_data;
 
-                    if (active_item_count < m_todo_cache.size()) {
-                        auto& item = m_todo_cache[active_item_count];
+                if (tp_point.pollqueue_ptr->try_pop(popped_data)) {
+                    size_t batch_rec_num = popped_data.first;
+                    std::vector<unsigned char>& raw_chunk = popped_data.second;
 
-                        item.index = active_item_count;
-                        item.tp = tp;
-                        item.raw_big_chunk = std::move(raw_chunk);
-                        item.err = Err_Client::NULL_ERROR;
+                    // 只有 vector 非空才处理（防御性编程）
+                    if (!raw_chunk.empty()) {
+                        if (active_item_count < m_todo_cache.size()) {
+                            auto& item = m_todo_cache[active_item_count];
+                            item.index = active_item_count;
+                            item.tp = tp;
+                            item.raw_big_chunk = std::move(raw_chunk); // 移动语义
+                            item.err = Err_Client::Success;
+                            item.parsed_records.clear();
+                        }
+                        else {
+                            m_todo_cache.emplace_back(active_item_count, tp, std::move(raw_chunk));
+                        }
 
-                        item.parsed_records.clear();
-                    }
-                    else {
-                        m_todo_cache.emplace_back(active_item_count,tp, std::move(raw_chunk));
-                    }
+                        // 指针后移
+                        active_item_count++;
 
-                    // 指针后移，指向下一个可用槽位
-                    active_item_count++;
+                        // 变更点 1: 累加条数而不是字节
+                        accumulated_record_count += batch_rec_num;
+                        gained_new_data_this_round = true;
 
-                    // --- 【核心修改结束】 ---
-
-                    total_payload_bytes += chunk_size;
-                    gained_new_data_this_round = true;
-
-                    if (total_payload_bytes >= local_pull_bytes_once) {
-                        goto PROCESS_PHASE;
+                        // 变更点 3 (部分): 软限制检查
+                        // 只要达到或超过最大条数，立即停止收集，进入解析
+                        if (accumulated_record_count >= pull_max_record_num_local) {
+                            goto PROCESS_PHASE;
+                        }
                     }
                 }
             }
-            // B. 检查超时
-            if (std::chrono::steady_clock::now() >= deadline) {
-                break;
+
+            // --- 循环控制核心逻辑 ---
+
+            // 情况 A: 这一轮循环拿到了数据，但还未达到 max_record_nums
+            if (gained_new_data_this_round) {
+                // 变更点 3: "掏空缓冲区" 策略
+                // 不休眠，立即 continue 进行下一轮轮询，试图获取更多数据直到缓冲区变空
+                continue;
             }
 
-            // C. 等待逻辑
-            // 只有当“这一整轮轮询”都没有拿到任何数据时，才进入休眠等待
-            // 如果拿到了一些数据但不够 local_pull_bytes，会立即进入下一轮轮询，不休眠，加快收集速度
-            if (!gained_new_data_this_round) {
-                std::unique_lock<std::mutex> ulock(mtx_poll_ready);
-
-
-                bool signaled = cv_poll_ready.wait_until(ulock, deadline, [this] {
-                    return poll_ready.load();
-                });
-
-                if (signaled) {
-                    poll_ready.store(false);
-
-                } else {
-
-                    break;
+            // 情况 B: 这一轮循环完全没有拿到任何新数据 (所有队列都空了)
+            else {
+                // 变更点 3: 只要手头有数据，立刻返回，不等待
+                if (accumulated_record_count > 0) {
+                    goto PROCESS_PHASE;
                 }
 
+                // 变更点 2: 只有在 "手中无数据" 且 "队列为空" 时，才检查超时或进入等待
+
+                // B.1 检查超时
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    break; // 超时，跳出循环去处理（如果是空的则会在最后返回 EMPTY）
+                }
+
+                // B.2 等待逻辑 (Wait)
+                {
+                    std::unique_lock<std::mutex> ulock(mtx_poll_ready);
+                    // 此时肯定没有数据，安心等待唤醒或超时
+                    bool signaled = cv_poll_ready.wait_until(ulock, deadline, [this] {
+                        return poll_ready.load();
+                    });
+
+                    if (signaled) {
+                        poll_ready.store(false);
+                        // 唤醒后 loop 继续，重新去 try_pop
+                    } else {
+                        break; // 等待超时
+                    }
+                }
             }
         }
 
     PROCESS_PHASE:
 
         if (m_todo_cache.empty()) {
+            // 如果这里为空，说明是纯超时且未拿到任何数据
             return Err_Client::PULL_TIMEOUT;
         }
 
         // --- 2. 并行解析 (Parallel Parse) ---
+        // 代码保持不变，解析逻辑通常不依赖于前面的计数方式
         tbb::parallel_for_each(m_todo_cache.begin(), m_todo_cache.begin() + active_item_count,
                                [this](Workitem& item) {
-                                   // 这里的 parsed_records 已经有很大的 capacity 了，push_back 不会触发 malloc
                                    this->call_parse_impl(item.raw_big_chunk, item.parsed_records, item.tp, item.err);
                                });
 
-        // 标记是否发生了部分错误（可选，用于返回警告而非错误）
         bool has_partial_error = false;
+
+        // 预分配内存优化 (可选)
+        // if (accumulated_record_count > 0) record_batch.reserve(record_batch.size() + accumulated_record_count);
 
         for (size_t i = 0; i < active_item_count; ++i) {
             auto& item = m_todo_cache[i];
-            // 策略：如果出错，仅记录日志并跳过，不影响其他分区的正常数据
-            if (item.err != Err_Client::NULL_ERROR) {
-                has_partial_error = true;
 
+            if (item.err != Err_Client::Success) {
+                has_partial_error = true;
                 continue;
             }
 
-            // 合并有效数据
             if (!item.parsed_records.empty()) {
+                // 这里的 insert 逻辑保持不变
                 size_t needed = record_batch.size() + item.parsed_records.size();
                 if (record_batch.capacity() < needed) {
                     record_batch.reserve(needed);
@@ -364,28 +328,32 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             }
         }
 
+        // 清理缓存中的大对象，防止占用内存（视具体 Workitem 实现而定，如果是 swap 进去的则需要清理）
+        // 通常建议在这里重置 active_item_count 为 0，或者在该方法入口处重置，
+        // 但原代码逻辑似乎是复用 vector capacity，所以这里不需要析构，只需下一次覆盖即可。
 
         if (record_batch.empty() && has_partial_error) {
             return Err_Client::PARTIAL_PARASE_FAILED;
         }
 
-        return record_batch.empty() ? Err_Client::EMPTY_RECORD : Err_Client::NULL_ERROR;
+        return record_batch.empty() ? Err_Client::EMPTY_RECORD : Err_Client::Success;
     }
 
     // 建议单位使用微秒 (us) 以获得更高精度，如果需要毫秒改为 milliseconds 即可
     Err_Client MYMQ_Consumeruse::pull(std::vector<MYMQ_Public::ConsumerRecord>& record_batch,
-                                    size_t poll_wait_timeout_ms,
-                                    int64_t& out_latency_us) {
+                                      size_t poll_wait_timeout_ms,
+                                      int64_t& out_latency_us) {
 
         // --- 0. 初始化计时器 ---
         auto start_time = std::chrono::steady_clock::now();
-        // 用于累计纯等待（Sleep）的时间
+        // 用于累计纯等待（Sleep/Wait）的时间
         std::chrono::microseconds total_wait_duration(0);
 
-        // 定义计算纯净耗时的 Lambda：总时间 - 睡大觉的时间 = 真正干活的时间
+        // 定义计算纯净耗时的 Lambda
         auto update_pure_latency = [&]() {
             auto now = std::chrono::steady_clock::now();
             auto total_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - start_time);
+            // 纯净耗时 = 总自然流逝时间 - 睡大觉的时间
             out_latency_us = (total_elapsed - total_wait_duration).count();
         };
 
@@ -395,73 +363,93 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         }
 
         // --- 1. 数据收集阶段 (Accumulate Phase) ---
-        size_t total_payload_bytes = 0;
+        size_t accumulated_record_count = 0; // [同步更新] 使用条数计数
 
         auto deadline = start_time + std::chrono::milliseconds(poll_wait_timeout_ms);
 
         size_t active_item_count = 0;
+
         while (true) {
             bool gained_new_data_this_round = false;
 
             for (auto& [tp, tp_point] : map_final_assign) {
-                std::vector<unsigned char> raw_chunk;
 
-                // try_pop 是内存操作，属于有效工作时间，会自动计入
-                if (tp_point.pollqueue_ptr->try_pop(raw_chunk)) {
-                    size_t chunk_size = raw_chunk.size();
+                // [同步更新] 适配 try_pop 返回 pair
+                std::pair<size_t, std::vector<unsigned char>> popped_data;
 
-                    // 缓存复用逻辑
-                    if (active_item_count < m_todo_cache.size()) {
-                        auto& item = m_todo_cache[active_item_count];
+                // try_pop 是内存/锁操作，属于有效工作时间
+                if (tp_point.pollqueue_ptr->try_pop(popped_data)) {
+                    size_t batch_rec_num = popped_data.first;
+                    std::vector<unsigned char>& raw_chunk = popped_data.second;
 
-                        item.index = active_item_count;
-                        item.tp = tp;
-                        item.raw_big_chunk = std::move(raw_chunk);
-                        item.err = Err_Client::NULL_ERROR;
+                    if (!raw_chunk.empty()) {
+                        // 缓存复用逻辑
+                        if (active_item_count < m_todo_cache.size()) {
+                            auto& item = m_todo_cache[active_item_count];
+                            item.index = active_item_count;
+                            item.tp = tp;
+                            item.raw_big_chunk = std::move(raw_chunk);
+                            item.err = Err_Client::Success;
+                            item.parsed_records.clear();
+                        }
+                        else {
+                            m_todo_cache.emplace_back(active_item_count, tp, std::move(raw_chunk));
+                        }
 
-                        item.parsed_records.clear();
-                    }
-                    else {
-                        m_todo_cache.emplace_back(active_item_count, tp, std::move(raw_chunk));
-                    }
+                        active_item_count++;
 
-                    // 指针后移，指向下一个可用槽位
-                    active_item_count++;
+                        // [同步更新] 累加条数
+                        accumulated_record_count += batch_rec_num;
+                        gained_new_data_this_round = true;
 
-                    total_payload_bytes += chunk_size;
-                    gained_new_data_this_round = true;
-
-                    if (total_payload_bytes >= local_pull_bytes_once) {
-                        goto PROCESS_PHASE;
+                        // [同步更新] 软限制检查
+                        if (accumulated_record_count >= pull_max_record_num_local) {
+                            goto PROCESS_PHASE;
+                        }
                     }
                 }
             }
 
-            // B. 检查超时
-            if (std::chrono::steady_clock::now() >= deadline) {
-                break;
+            // --- 循环控制核心逻辑 ---
+
+            // 情况 A: 这一轮循环拿到了数据 -> "掏空缓冲区" 策略
+            if (gained_new_data_this_round) {
+                // 不休眠，不计算等待时间，立即进行下一轮
+                continue;
             }
+            // 情况 B: 这一轮循环完全没有拿到任何新数据
+            else {
+                // [同步更新] 只要手头有数据，立刻返回处理，不等待
+                if (accumulated_record_count > 0) {
+                    goto PROCESS_PHASE;
+                }
 
-            // C. 等待逻辑 (核心修改点)
-            if (!gained_new_data_this_round) {
-                std::unique_lock<std::mutex> ulock(mtx_poll_ready);
-
-                // === [开始] 记录等待时间 ===
-                auto wait_start = std::chrono::steady_clock::now();
-
-                bool signaled = cv_poll_ready.wait_until(ulock, deadline, [this] {
-                    return poll_ready.load();
-                });
-
-                auto wait_end = std::chrono::steady_clock::now();
-                // 累加这段“无用”时间
-                total_wait_duration += std::chrono::duration_cast<std::chrono::microseconds>(wait_end - wait_start);
-                // === [结束] 记录等待时间 ===
-
-                if (signaled) {
-                    poll_ready.store(false);
-                } else {
+                // B.1 检查超时
+                if (std::chrono::steady_clock::now() >= deadline) {
                     break;
+                }
+
+                // B.2 等待逻辑 (Wait) -> 只有这里需要计入 wait_duration
+                {
+                    std::unique_lock<std::mutex> ulock(mtx_poll_ready);
+
+                    // === [计时] 开始等待 ===
+                    auto wait_start = std::chrono::steady_clock::now();
+
+                    bool signaled = cv_poll_ready.wait_until(ulock, deadline, [this] {
+                        return poll_ready.load();
+                    });
+
+                    auto wait_end = std::chrono::steady_clock::now();
+                    // === [计时] 结束等待，累加无效时间 ===
+                    total_wait_duration += std::chrono::duration_cast<std::chrono::microseconds>(wait_end - wait_start);
+
+                    if (signaled) {
+                        poll_ready.store(false);
+                        // 唤醒后 loop 继续
+                    } else {
+                        break; // 等待超时
+                    }
                 }
             }
         }
@@ -469,7 +457,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
     PROCESS_PHASE:
 
         if (m_todo_cache.empty()) {
-            update_pure_latency(); // 计算耗时
+            update_pure_latency(); // 计算最终耗时
             return Err_Client::PULL_TIMEOUT;
         }
 
@@ -480,13 +468,12 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                                    this->call_parse_impl(item.raw_big_chunk, item.parsed_records, item.tp, item.err);
                                });
 
-        // 标记是否发生了部分错误
         bool has_partial_error = false;
 
         for (size_t i = 0; i < active_item_count; ++i) {
             auto& item = m_todo_cache[i];
 
-            if (item.err != Err_Client::NULL_ERROR) {
+            if (item.err != Err_Client::Success) {
                 has_partial_error = true;
                 continue;
             }
@@ -497,7 +484,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                     record_batch.reserve(needed);
                 }
 
-                // 结果聚合，内存拷贝，属于有效工作时间
+                // 内存拷贝，属于有效工作时间
                 record_batch.insert(
                     record_batch.end(),
                     std::make_move_iterator(item.parsed_records.begin()),
@@ -513,23 +500,15 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             return Err_Client::PARTIAL_PARASE_FAILED;
         }
 
-        return record_batch.empty() ? Err_Client::EMPTY_RECORD : Err_Client::NULL_ERROR;
+        return record_batch.empty() ? Err_Client::EMPTY_RECORD : Err_Client::Success;
     }
-
-
-
     void MYMQ_Consumeruse::create_topic(const std::string& topicname,size_t parti_num){
-        MessageBuilder mb;
-        mb.append_string(topicname);
-        mb.append_size_t(parti_num);
-        auto req=mb.data;
-
-        send(Eve::CLIENT_REQUEST_CREATE_TOPIC,req);
-
+        auto req = ClientProtocol::build_create_topic_packet(topicname, parti_num);
+        send(Eve::CLIENT_REQUEST_CREATE_TOPIC, req);
     }
-    void MYMQ_Consumeruse::set_pull_bytes(size_t bytes){
+    void MYMQ_Consumeruse::set_pull_fetch_min_bytes(size_t bytes){
         if(bytes>1&&bytes<=MYMQ::pull_bytes_max){
-            pull_bytes_once_of_request.store(bytes);
+            pull_fetch_min_bytes.store(bytes);
         }
         else{
             cerr("Set pull bytes : OUT OF LIMITATION");
@@ -554,7 +533,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             return Err_Client::NOT_IN_GROUP;
         }
         auto res= commit_inter(tp,next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback());
-        if(res!=Err_Client::NULL_ERROR){
+        if(res!=Err_Client::Success){
             return res;
         }
         out("[Commit offset] Offset '"+std::to_string( next_offset_to_consume)+"' waitting committment over .");
@@ -575,7 +554,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             return Err_Client::COMMIT_SYNC_TIMEOUT;
         }
 
-        return Err_Client::NULL_ERROR;
+        return Err_Client::Success;
 
     }
 
@@ -604,7 +583,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
         heartbeat(1,groupid);
 
-        return Err_Client::NULL_ERROR;
+        return Err_Client::Success;
 
     }
 
@@ -621,10 +600,9 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             memberid=info_basic.memberid;
         }
 
-        MB mb;
-        mb.append(groupid,memberid);
-        send(Eve::CLIENT_REQUEST_LEAVE_GROUP,mb.data);
-        return Err_Client::NULL_ERROR;
+        auto req = ClientProtocol::build_leave_group_packet(groupid, memberid);
+        send(Eve::CLIENT_REQUEST_LEAVE_GROUP, req);
+        return Err_Client::Success;
 
     }
 
@@ -646,35 +624,20 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
              groupid=info_basic.groupid;
              memberid=info_basic.memberid;
              gen_id=info_basic.generation_id;
-             if(topics_updated){
-                 topics=info_basic.subscribed_topics;
-             }
-
             }
             else{//入组
                 is_join=1;
                  std::shared_lock<std::shared_mutex>  slock(info_basic.mtx);
                 clientid=info_basic.clientid;
             }
-
-
-
-        MessageBuilder mb;
-            mb.append(groupid,memberid,gen_id,static_cast<uint16_t>( pull_start_location));
-        if(is_join){
-            mb.append(clientid);
-        }
-        mb.append(topics_updated);
-
-        if(topics_updated){
-            mb.append_size_t(topics.size());
-            for(const auto& t:topics){
-                mb.append(t);
-            }
-
+            if(topics_updated){
+            topics=info_basic.subscribed_topics;
         }
 
-        send(MYMQ::EventType::CLIENT_REQUEST_HEARTBEAT,mb.data);
+        auto req = ClientProtocol::build_heartbeat_packet(
+            groupid, memberid, gen_id, static_cast<uint16_t>(pull_start_location), is_join, clientid, topics_updated, topics
+        );
+        send(MYMQ::EventType::CLIENT_REQUEST_HEARTBEAT, req);
     }
 
 
@@ -703,12 +666,14 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
 
             auto zstd_level_tmp= cm_sys.getint("zstd_level");
-            if(!inrange(zstd_level_tmp,1,22)){
+            if(zstd_level_tmp > 1){
+                 zstd_level=1;
+                 cerr("ZSTD level capped at 1 to reduce CPU overhead (Configured: " + std::to_string(zstd_level_tmp) + ")");
+            } else if(!inrange(zstd_level_tmp,1,22)){
                 zstd_level=MYMQ::zstd_level_DEFAULT;
+            } else {
+                zstd_level=zstd_level_tmp;
             }
-
-
-            zstd_level=zstd_level_tmp;
             dctx=ZSTD_createDCtx();
             heartbeat_interval_ms=MYMQ::HEARTBEAT_MS_CLIENT;
             auto tmp_clientid=clientid;
@@ -750,13 +715,11 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             join_collect_timeout_ms=MYMQ::join_collect_timeout_ms;
             memberid_wait_timeout_s=MYMQ::memberid_ready_timeout_s;
             commit_wait_timeout_s=MYMQ::commit_ready_timeout_s;
-            pull_bytes_once_of_request=cm_business.get_size_t("pull_bytes_once_of_request");
+            pull_fetch_min_bytes=cm_business.get_size_t("pull_fetch_min_bytes");
             batch_size=cm_business.get_size_t("batch_size");
             autopush_perior_ms=cm_business.get_size_t ("autopush_perior_ms");
             autocommit_perior_ms=cm_business.get_size_t ("autocommit_perior_ms");
-            local_pull_bytes_once=cm_business.get_size_t("local_pull_bytes_once");
-
-
+            pull_max_record_num_local=cm_business.get_size_t("pull_max_record_num_local");
 
         }
 
@@ -776,73 +739,6 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
     }
 
 
-    // 将第三个参数的类型从 std::deque 改为 std::vector
-    bool MYMQ_Consumeruse::send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_)
-    {
-        // 1. 检查飞行请求数 (保持不变)
-        size_t curr_fly = SIZE_MAX;
-        cmc_.get_curr_flying_request_num(curr_fly);
-        if (curr_fly >= max_in_flight_requests_num) {
-            return 0;
-        }
-
-        // 2. 发送消息并挂载回调
-        auto succ = cmc_.send_msg(static_cast<short>(event_type), msg_body,
-                                  [this, saved_cbs = std::move(cbs_)] // 捕获稀疏列表
-                                  (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
-                                  {
-                                      // 解析响应
-                                      auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
-
-                                      // 3. 遍历稀疏回调列表
-                                      // saved_cbs 中只包含需要回调的消息，非需要回调的已被跳过
-                                      for (auto& sparse_item : saved_cbs) {
-
-                                          uint32_t msg_idx = sparse_item.relative_index; // [关键] 获取该消息在 Batch 中的相对位置
-                                          auto& current_cb = sparse_item.cb;             // 获取对应的回调函数 variant
-
-                                          std::visit([&](auto&& specific_cb) {
-                                              using CBType = std::decay_t<decltype(specific_cb)>;
-
-                                              // --- Push 响应处理 (需要用到 msg_idx 计算 offset) ---
-                                              if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>)
-                                              {
-                                                  if (auto* data = std::get_if<MYMQ_Public::PushResponce>(&resp)) {
-                                                      MYMQ_Public::PushResponce individual_resp = *data;
-
-                                                      // [核心修改]: Offset = Batch基准Offset + 消息相对索引
-                                                      individual_resp.offset = data->offset + msg_idx;
-
-                                                      specific_cb(individual_resp);
-                                                  }
-                                              }
-                                              // --- Commit 响应处理 (不需要索引，直接透传) ---
-                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>)
-                                              {
-                                                  if (auto* data = std::get_if<MYMQ_Public::CommitAsyncResponce>(&resp)) {
-                                                      specific_cb(*data);
-                                                  }
-                                              }
-                                              // --- Noop/Error 处理 (不需要索引，直接透传) ---
-                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>)
-                                              {
-                                                  if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
-                                                      specific_cb(*err);
-                                                  } else {
-                                                      specific_cb(MYMQ_Public::CommonErrorCode::NULL_ERROR);
-                                                  }
-                                              }
-                                              else
-                                              {
-                                                  static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
-                                              }
-
-                                          }, current_cb);
-                                      }
-                                  }
-                                  );
-        return succ;
-    }
 
     Err_Client MYMQ_Consumeruse::commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb){
         if(!is_ingroup.load()){
@@ -875,295 +771,198 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             memberid=info_basic.memberid;
         }
 
-        std::string key_gtp;
-        {
-            MB mb;
-            mb.append(groupid,tp.topic,tp.partition);
-            key_gtp=mb.dump();
-        }
-        auto parid_hash=MurmurHash2::hash(groupid);
-
-        MB mb;
-        mb.append(groupid,memberid,genid, tp.topic,tp.partition,parid_hash,key_gtp,next_offset_to_consume);
+        auto req = ClientProtocol::build_commit_offset_packet(
+            groupid, memberid, genid, tp.topic, tp.partition, next_offset_to_consume
+        );
 
         bool has_callback = (bool)cb;
         if(has_callback){
-            std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_;
+            std::vector<MYMQ::Client::SparseCallback> cbs_;
             cbs_.reserve(1);
             cbs_.push_back({static_cast<uint32_t>(0), std::move(cb)});
-            send(Eve::CLIENT_REQUEST_COMMIT_OFFSET,mb.data,std::move(cbs_));
+            send(Eve::CLIENT_REQUEST_COMMIT_OFFSET, req, std::move(cbs_));
 
         }
         else{
-            send(Eve::CLIENT_REQUEST_COMMIT_OFFSET,mb.data);
+            send(Eve::CLIENT_REQUEST_COMMIT_OFFSET, req);
         }
 
 
-        return MYMQ_Public::ClientErrorCode::NULL_ERROR;
+        return MYMQ_Public::ClientErrorCode::Success;
     }
 
     MYMQ_Public::ResultVariant MYMQ_Consumeruse::handle_response(Eve event_type,const Mybyte& msg_body){
+        auto protocol_resp = ClientProtocol::parse_response(event_type, msg_body);
 
-        MessageParser mp(msg_body.data(),msg_body.size());
-        if(event_type==MYMQ::EventType::SERVER_RESPONSE_PUSH_ACK){
-            auto topicname=mp.read_string();
-            auto partition=mp.read_size_t();
-            auto error=static_cast<Err>(mp.read_uint16());
-            size_t base=SIZE_MAX;
-            if(error==Err::NULL_ERROR){
-                base=mp.read_size_t();
+        return std::visit([this](auto&& arg) -> MYMQ_Public::ResultVariant {
+            using T = std::decay_t<decltype(arg)>;
+
+            if constexpr (std::is_same_v<T, MYMQ_Public::PushResponce>) {
+                return arg;
             }
-
-            return  MYMQ_Public::PushResponce(std::move(topicname),partition,error,base);
-        }
-       else if(event_type==Eve::SERVER_RESPONCE_LEAVE_GROUP){
-            auto error=static_cast<Err>( mp.read_uint16());
-            auto groupid=mp.read_string();
-            if(error==Err::NULL_ERROR){
-                out_group_reset();
-                out("Leave Group : Leaved Group '"+groupid+"'");
+            else if constexpr (std::is_same_v<T, MYMQ_Public::CommitAsyncResponce>) {
+                return arg;
             }
-            else{
-                cerr("Leave Group : Leaving Group '"+groupid+"' : "+MYMQ_Public::to_string(error)) ;
-            }
-
-        }
-        else if(event_type == Eve::SERVER_RESPONSE_PULL_DATA) {
-
-            // 1. 读取响应头元数据 (这部分数据很小，保持原有逻辑)
-            auto pull_inf_additional_view = mp.read_bytes_view();
-            MessageParser mp_pull_inf_additional(pull_inf_additional_view.first,pull_inf_additional_view.second);
-            auto topicname_ = mp_pull_inf_additional.read_string();
-            auto partition_ = mp_pull_inf_additional.read_size_t();
-            auto error = static_cast<Err>(mp_pull_inf_additional.read_uint16());
-             auto offset_next_to_consume = mp_pull_inf_additional.read_size_t();
-            out("[PULL] Messages batch from (TOPIC '" + topicname_ + "' PARTITION '" + std::to_string(partition_) + ") responce reached. ");
-            out(std::string{} + "[PULL] Result : " + " State : " + MYMQ_Public::to_string(error));
-
-            bool is_no_record=(error==Err::NO_RECORD);
-            if(is_no_record){
-            }
-            if(error != Err::NULL_ERROR) {
-                return error;
-            }
-
-
-             auto message_collection= mp.read_uchar_vector();
-            bool need_poll=0;
-            // 2. 找到对应的队列
-            TP_PointMap::accessor cac;
-            if(map_final_assign.find(cac, TopicPartition(topicname_, partition_))){
-                auto pollqueue_ptr=cac->second.pollqueue_ptr;
-                cac.release();
-                auto& pollqueue = *pollqueue_ptr;
-
-                pollqueue.local_consume_offset=offset_next_to_consume;
-                // 3. 将整个大包直接推入队列
-                pollqueue.push(message_collection);
-
-
-                // 4. 【关键】Notify 的位置在这里！
-                // 只要推入了数据，就设置标志位并唤醒等待的 pull 线程
-                {
-                    std::lock_guard<std::mutex> lock(mtx_poll_ready);
-                    poll_ready.store(true);
+            else if constexpr (std::is_same_v<T, MYMQ_Public::CommonErrorCode>) {
+                if (arg == MYMQ_Public::CommonErrorCode::REQUEST_TIMEOUT) {
+                     return arg;
                 }
-                cv_poll_ready.notify_one(); // 唤醒 pull 函数中的 wait
-                need_poll =pollqueue.need_poll();
+                return arg;
             }
+            else if constexpr (std::is_same_v<T, PullResponseData>) {
+                auto& resp = arg;
+                out("[PULL] Messages batch from (TOPIC '" + resp.topic + "' PARTITION '" + std::to_string(resp.partition) + ") responce reached. ");
+                out(std::string{} + "[PULL] Result : " + " State : " + MYMQ_Public::to_string(resp.error));
 
-
-
-                if( need_poll&&!is_no_record){
-
-                    if(!is_ingroup.load()){
-
-                        return Err::CLIENT_NOT_IN_GROUP;
-                    }
-
-
-                    size_t bytes= pull_bytes_once_of_request.load();
-                    MB mb;
-                    mb.append(topicname_,partition_,offset_next_to_consume,bytes);
-                    send(Eve:: CLIENT_REQUEST_PULL,mb.data);
-
-
-
+                if (resp.error != MYMQ_Public::CommonErrorCode::Success) {
+                    return resp.error;
                 }
 
+                bool need_poll = true;
+                if (resp.error == MYMQ_Public::CommonErrorCode::Success) {
+                    TP_PointMap::accessor cac;
+                    if (map_final_assign.find(cac, TopicPartition(resp.topic, resp.partition))) {
+                        auto pollqueue_ptr = cac->second.pollqueue_ptr;
+                        cac.release();
 
+                        pollqueue_ptr->local_consume_offset = resp.next_offset;
+                        pollqueue_ptr->push(resp.message_batch, resp.record_num);
 
-
-
-        }
-        else if(event_type == Eve::SERVER_RESPONCE_HEARTBEAT){
-            auto error = static_cast<Err>(mp.read_uint16());
-
-            auto groupid = mp.read_string();
-            auto memberid = mp.read_string();
-            auto generationid = mp.read_size_t();
-
-            if(error == Err::UPDATE_GENERATION){
-
-                // 1. 【解析阶段】按照新的层级结构 (Topic -> List<Partition>) 读取分配方案
-                // 服务器端逻辑：mb.append_size_t(res.assign.size());
-                auto topic_count = mp.read_size_t();
-
-                std::unordered_map<TopicPartition, size_t> new_assignment_map;
-                // 预估容量，虽然无法精确知道分区总数，但可以减少部分扩容开销
-                new_assignment_map.reserve(topic_count * 4);
-
-                for(size_t i = 0; i < topic_count; i++){
-                    // 服务器端逻辑：mb.append(topic);
-                    auto topic = mp.read_string();
-                    // 服务器端逻辑：mb.append_size_t(partitions.size());
-                    auto partition_count = mp.read_size_t();
-
-                    for(size_t j = 0; j < partition_count; j++){
-                        // 服务器端逻辑：mb.append_size_t(par);
-                        auto partition = mp.read_size_t();
-
-                        size_t endoffset = mp.read_size_t();
-
-                        if(endoffset==SIZE_MAX) {
-                            continue;
+                        {
+                            std::lock_guard<std::mutex> lock(mtx_poll_ready);
+                            poll_ready.store(true);
                         }
+                        cv_poll_ready.notify_one();
+                        need_poll = pollqueue_ptr->need_poll();
+                    }
 
-                        TopicPartition tp(topic, partition);
-                        new_assignment_map[tp] = endoffset;
+                    if (need_poll) {
+                         if (!is_ingroup.load()) {
+                            return MYMQ_Public::CommonErrorCode::CLIENT_NOT_IN_GROUP;
+                        }
+                        size_t bytes = pull_fetch_min_bytes.load();
+
+                        std::string group_id;
+                        {
+                            std::shared_lock<std::shared_mutex> slock(info_basic.mtx);
+                            group_id = info_basic.groupid;
+                        }
+                        
+                        auto req = ClientProtocol::build_pull_packet(group_id, resp.topic, resp.partition, resp.next_offset, bytes);
+                        send(Eve::CLIENT_REQUEST_PULL, req);
                     }
                 }
+                return MYMQ_Public::CommonErrorCode::Success;
+            }
+            else if constexpr (std::is_same_v<T, LeaveGroupResponse>) {
+                const auto& resp = arg;
+                if (resp.error == MYMQ_Public::CommonErrorCode::Success) {
+                    out_group_reset();
+                    out("Leave Group : Leaved Group '" + resp.group_id + "'");
+                } else {
+                    cerr("Leave Group : Leaving Group '" + resp.group_id + "' : " + MYMQ_Public::to_string(resp.error));
+                }
+                return MYMQ_Public::CommonErrorCode::Success;
+            }
+            else if constexpr (std::is_same_v<T, HeartbeatResponse>) {
+                const auto& resp = arg;
+                 if (resp.error == MYMQ_Public::CommonErrorCode::UPDATE_GENERATION) {
+                    std::unordered_map<TopicPartition, size_t> new_assignment_map;
+                    new_assignment_map.reserve(resp.assignments.size());
 
-                // 2. 【清理阶段】找出旧 Map 中有，但新方案中没有的分区 -> 移除 (Revoke)
-                // (这部分逻辑保持不变，因为 new_assignment_map 已经构造好了)
-                std::vector<TopicPartition> to_remove;
-                for(auto it = map_final_assign.begin(); it != map_final_assign.end(); ++it){
-                    if(new_assignment_map.find(it->first) == new_assignment_map.end()){
-                        to_remove.push_back(it->first);
+                    for (const auto& assignment : resp.assignments) {
+                        TopicPartition tp(assignment.topic, assignment.partition);
+                        new_assignment_map[tp] = assignment.end_offset;
                     }
-                }
 
-                // 执行删除
-                for(const auto& tp : to_remove){
-                    // Log: Revoked partition
-                    map_final_assign.erase(tp);
-                }
-
-                // 3. 【新增阶段】遍历新方案，执行插入或保留
-                // (这部分逻辑保持不变)
-                for(const auto& [tp, server_offset] : new_assignment_map){
-                    TP_PointMap::accessor ac;
-                    if(map_final_assign.insert(ac, tp)){
-                        // Case A: 新分区 -> 初始化
-                        ac->second.endoffset_ptr = std::make_shared<MYMQ::MYMQ_Client::endoffset_point>(server_offset, tp);
-                        ac->second.pollqueue_ptr = std::make_shared<MYMQ::MYMQ_Client::PollBuffer>(20000000, 1000000000);
+                    std::vector<TopicPartition> to_remove;
+                    for (auto it = map_final_assign.begin(); it != map_final_assign.end(); ++it) {
+                        if (new_assignment_map.find(it->first) == new_assignment_map.end()) {
+                            to_remove.push_back(it->first);
+                        }
                     }
-                    else {
-                        // Case B: 已存在 -> 这是一个“保留”的分区，不做任何操作，保留本地状态
+                    for (const auto& tp : to_remove) {
+                        map_final_assign.erase(tp);
                     }
+
+                    for (const auto& [tp, server_offset] : new_assignment_map) {
+                        TP_PointMap::accessor ac;
+                        if (map_final_assign.insert(ac, tp)) {
+                            ac->second.endoffset_ptr = std::make_shared<MYMQ::Client::Commitedoffset_point>(server_offset, tp);
+                            ac->second.pollqueue_ptr = std::make_shared<MYMQ::Client::PollBuffer>(20000000, 1000000000);
+                        }
+                    }
+
+                    {
+                        std::unique_lock<std::shared_mutex> ulock(info_basic.mtx);
+                        info_basic.groupid = resp.group_id;
+                        info_basic.generation_id = resp.generation_id;
+                        info_basic.memberid = resp.member_id;
+                    }
+
+                    cerr("[Heartbeat] Generation updated to " + std::to_string(resp.generation_id) + ". Partitions Rebalanced.");
+                    is_ingroup.store(1);
+
+                    heartbeat_stop();
+                    heartbeat_start();
+                    if (is_auto_commit) {
+                        autocommit_stop();
+                        autocommit_start();
+                    }
+                    trigger_poll_for_low_cap_pollbuffer();
+
+                } else if (resp.error != MYMQ_Public::CommonErrorCode::Success) {
+                    cerr("[Heartbeat] Error : " + MYMQ_Public::to_string(resp.error));
+                }
+                return MYMQ_Public::CommonErrorCode::Success;
+            }
+            else if constexpr (std::is_same_v<T, CreateTopicResponse>) {
+                if (arg.success) {
+                    cerr("CREATE TOPIC RESULT : Topic created successfully");
+                } else {
+                    cerr("CREATE TOPIC RESULT : Topic created failed");
+                }
+                return MYMQ_Public::CommonErrorCode::Success;
+            }
+            else if constexpr (std::is_same_v<T, CommitOffsetResponse>) {
+                const auto& resp = arg;
+                if (!get_is_ingroup()) {
+                    cerr("Get commit respose but now not in group");
+                    return (MYMQ_Public::ResultVariant)MYMQ_Public::CommonErrorCode::GENERATION_EXPIRED;
                 }
 
-                // 4. 更新元数据 (Group Info)
-                {
-                    std::unique_lock<std::shared_mutex> ulock(info_basic.mtx);
-                    info_basic.groupid = groupid;
-                    info_basic.generation_id = generationid;
-                    info_basic.memberid = memberid;
+                std::shared_lock<std::shared_mutex> slock(info_basic.mtx);
+                bool expired = (resp.error == MYMQ_Public::CommonErrorCode::GENERATION_EXPIRED ||
+                               !(resp.group_id == info_basic.groupid && resp.member_id == info_basic.memberid && resp.generation_id == info_basic.generation_id));
+                slock.unlock();
+
+                if (expired) {
+                    out("[Commit offset] Get commit respose but it has already expired.");
+                    heartbeat();
+                    return MYMQ_Public::CommonErrorCode::GENERATION_EXPIRED;
                 }
 
-                cerr("[Heartbeat] Generation updated to " + std::to_string(generationid) + ". Partitions Rebalanced.");
-
-                is_ingroup.store(1);
-
-                // 重启定时任务
-                heartbeat_stop();
-                heartbeat_start();
-
-                if(is_auto_commit){
-                    autocommit_stop();
-                    autocommit_start();
-                }
-                trigger_poll_for_low_cap_pollbuffer();
-
-            } // end if(UPDATE_GENERATION)
-            else if(error == Err::NULL_ERROR){
-                // 心跳正常
-            }
-            else{
-                cerr("[Heartbeat] Error : " + MYMQ_Public::to_string(error));
-            }
-        }
-
-        else if(event_type==Eve::SERVER_RESPONSE_CREATE_TOPIC){
-            auto res= mp.read_bool();
-            if(res){
-                cerr("CREATE TOPIC RESULT : Topic created successfully");
-            }
-            else{
-                cerr("CREATE TOPIC RESULT : Topic created failed");
-
-            }
-        }
-        else if(event_type==Eve::SERVER_RESPONCE_COMMIT_OFFSET){
-
-
-            auto groupid=mp.read_string();
-            auto memberid=mp.read_string();
-            auto generation=mp.read_size_t();
-            auto topicname=mp.read_string();
-            auto partition=mp.read_size_t();
-            auto errorcode=static_cast<Err>(mp.read_uint16()) ;
-            auto offset=mp.read_size_t();
-
-            if(!get_is_ingroup()){
-                cerr("Get commit respose but now not in group");
-                return Err::GENERATION_EXPIRED;
-            }
-
-
-
-            std::shared_lock<std::shared_mutex> slock(info_basic.mtx);
-            bool expired= (errorcode==Err::GENERATION_EXPIRED||! (groupid==info_basic.groupid&&memberid==info_basic.memberid&&generation==info_basic.generation_id));//世代很重要，必须强逻辑检查
-            slock.unlock();
-            if(expired){
-                out("[Commit offset] Get commit respose but it has already expired.");
-                heartbeat();
-                return Err::GENERATION_EXPIRED;
-            }
-            if(errorcode==Err::NULL_ERROR){
-                {
-                    auto key= topicname+"_"+std::to_string(partition);
-
-
+                if (resp.error == MYMQ_Public::CommonErrorCode::Success) {
                     TP_PointMap::const_accessor cac;
-                    auto it=map_final_assign.find(cac,TopicPartition(key,partition));
-                    if(!it){
+                    if (!map_final_assign.find(cac, TopicPartition(resp.topic, resp.partition))) {
                         cerr("Error : Failed to update committed offset : Invalid topic or partition .");
                         return MYMQ_Public::CommonErrorCode::INTERNAL_ERROR;
                     }
-                    auto endoffset_ptr=cac->second.endoffset_ptr;
-                    auto& point=*endoffset_ptr;
-                    point.off.store(offset,std::memory_order_release) ;
-
-
+                    cac->second.endoffset_ptr->off.store(resp.offset, std::memory_order_release);
+                    cerr("Commit SYNC result : Success to commit '" + std::to_string(resp.offset) + "'");
+                } else {
+                    cerr("Commit SYNC result : Failed to commit '" + std::to_string(resp.offset) + "'");
                 }
 
+                commit_ready.store(1);
+                cv_commit_ready.notify_all();
 
-                cerr("Commit SYNC result : Success to commit '"+std::to_string(offset) +"'");
+                return MYMQ_Public::CommonErrorCode::Success;
             }
-            else{
-                cerr("Commit SYNC result : Failed to commit '"+std::to_string(offset) +"'");
+            else {
+                return MYMQ_Public::CommonErrorCode::Success;
             }
-
-            commit_ready.store(1);
-            cv_commit_ready.notify_all();
-        }
-        else if(event_type==Eve::EVENTTYPE_NULL){
-            return Err::REQUEST_TIMEOUT;
-        }
-
-
-        return MYMQ_Public::CommonErrorCode::NULL_ERROR;
+        }, protocol_resp);
     }
 
     void MYMQ_Consumeruse::out_group_reset(){
@@ -1201,10 +1000,9 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             auto ptr=tp_point.pollqueue_ptr;
             auto& pollqueue=*ptr;
                  size_t now_off= pollqueue.local_consume_offset.load();
-                 size_t bytes= pull_bytes_once_of_request.load();
-                    MB mb;
-                    mb.append(groupid,tp.topic,tp.partition,now_off,bytes);
-                    send(Eve:: CLIENT_REQUEST_PULL,mb.data);
+                 size_t bytes= pull_fetch_min_bytes.load();
+                    auto req = ClientProtocol::build_pull_packet(groupid, tp.topic, tp.partition, now_off, bytes);
+                    send(Eve::CLIENT_REQUEST_PULL, req);
 
 
         }
@@ -1223,7 +1021,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
     //Producer
 
 
-    MYMQ_Produceruse::MYMQ_Produceruse(const std::string& clientid,uint8_t ack_level):path_(MYMQ::run_directory_DEFAULT),cmc_(MYMQ::run_directory_DEFAULT,MYMQ::REQUEST_TIMEOUT_MS_DEFAULT),tbb_dctx_pool([]() {
+    MYMQ_Produceruse::MYMQ_Produceruse(const std::string& clientid,uint8_t ack_level):ClientBase(MYMQ::run_directory_DEFAULT),path_(MYMQ::run_directory_DEFAULT),tbb_dctx_pool([]() {
             // 初始化函数：当新线程第一次访问时调用
             return ZSTD_createDCtx();
         }){
@@ -1282,7 +1080,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                 // [核心逻辑修正]
                 // 只有当回调对象“非空” 且 配置允许响应时，才入队保存
                 if (has_callback && ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
-                    push_queue.active_cbs->push_back({
+                    push_queue.active_cbs.push_back({
                         static_cast<uint32_t>(push_queue.current_batch_count),
                         std::move(cb) // 移动语义，存入后外部cb失效
                     });
@@ -1290,46 +1088,58 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
                 push_queue.current_batch_count++;
 
-                return Err_Client::NULL_ERROR;
+                return Err_Client::Success;
             }
 
-            // 1. 背压检查
-            while (push_queue.is_flushing) {
+            // --- Active Buffer 已满，需要轮转 ---
+
+            // 1. 背压检查 (Backpressure)
+            // 如果就绪队列太长，说明发送端跟不上，阻塞生产者
+            while (push_queue.ready_queue.size() >= push_queue.max_queued_batches_) {
                 push_queue.cv_full.wait(ulock);
             }
 
-            // 2. 交换双缓冲
-            std::swap(push_queue.active_buf, push_queue.flushing_buf);
-            std::swap(push_queue.active_cbs, push_queue.flushing_cbs);
+            // 2. 轮转：将 Active 移动到 Ready Queue
+            auto item = std::make_unique<MYMQ::Client::BatchItem>();
+            item->buffer = std::move(push_queue.active_buf);
+            item->callbacks = std::move(push_queue.active_cbs); // 移动回调列表
+            item->batch_count = push_queue.current_batch_count;
 
-            // 3. 重置计数器
+            push_queue.ready_queue.push_back(std::move(item));
+
+            // 3. 获取新的 Active Buffer (从对象池或新建)
+            if (!push_queue.free_pool.empty()) {
+                push_queue.active_buf = std::move(push_queue.free_pool.back());
+                push_queue.free_pool.pop_back();
+            } else {
+                push_queue.active_buf = std::make_unique<MYMQ::MSG_serial::BatchBuffer>(push_queue.buffer_size_);
+            }
+            
+            // 重置计数器 (active_cbs 已经被 move 空了，不需要 clear)
             push_queue.current_batch_count = 0;
 
-            // 4. 标记状态
-            push_queue.is_flushing = true;
+            // 4. 触发 Flush 任务 (如果还没运行)
+            if (!push_queue.is_flushing) {
+                push_queue.is_flushing = true;
+                
+                auto push_queue_key = tp.topic + "_" + std::to_string(tp.partition);
+                uint32_t shard_id = MurmurHash2::hash(push_queue_key);
+                
+                pool_.submit(shard_id, [this, &push_queue]() {
+                    this->flush_batch_task(push_queue);
+                });
+            }
 
-            // 5. 提交 Flush 任务
-            auto push_queue_key = tp.topic + "_" + std::to_string(tp.partition);
-            uint32_t shard_id = MurmurHash2::hash(push_queue_key);
-            pool_.submit(shard_id, [this, &push_queue]() {
-                this->flush_batch_task(push_queue);
-            });
-
-            // 6. 循环继续，重试 append_record
+            // 5. 循环继续，重试 append_record (现在 active_buf 是新的空 buffer，肯定能成功)
         }
 
-        return Err_Client::NULL_ERROR;
+        return Err_Client::Success;
     }
 
 
     void MYMQ_Produceruse::create_topic(const std::string& topicname,size_t parti_num){
-        MessageBuilder mb;
-        mb.append_string(topicname);
-        mb.append_size_t(parti_num);
-        auto req=mb.data;
-
-        send(Eve::CLIENT_REQUEST_CREATE_TOPIC,req);
-
+        auto req = ClientProtocol::build_create_topic_packet(topicname, parti_num);
+        send(Eve::CLIENT_REQUEST_CREATE_TOPIC, req);
     }
 
     void MYMQ_Produceruse::init(const std::string& clientid,uint8_t ack_level){
@@ -1345,7 +1155,10 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
             auto zstd_level_tmp= cm_sys.getint("zstd_level");
             if(!inrange(zstd_level_tmp,1,22)){
-                zstd_level=MYMQ::zstd_level_DEFAULT;
+                zstd_level_tmp=1;
+            }
+            if(zstd_level_tmp > 1){
+                 zstd_level_tmp = 1;
             }
 
 
@@ -1372,7 +1185,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
 
             size_t max_in_flight_requests_num_tmp= cm_sys.get_size_t("max_in_flight_requests_num");
-            if(!inrange(zstd_level_tmp,1,5000)){
+            if(!inrange(max_in_flight_requests_num_tmp,1,5000)){
                 max_in_flight_requests_num_tmp=MYMQ:: MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT;
                 cerr("Initialization : Invaild 'max_in_flight_requests_num' in config . Use default 'max_in_flight_requests_num' : "+std::to_string(MYMQ:: MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT));
             }
@@ -1393,139 +1206,61 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
 
 
-    void MYMQ_Produceruse::flush_batch_task(MYMQ::MYMQ_Client::Push_queue& pq) {
-        MYMQ::MSG_serial::BatchBuffer* src_buf = pq.flushing_buf;
-        auto* src_cbs = pq.flushing_cbs;
+    void MYMQ_Produceruse::flush_batch_task(MYMQ::Client::Push_queue& pq) {
+        
+        while (true) {
+            std::unique_ptr<MYMQ::Client::BatchItem> item;
 
-        if (src_buf->size() == 0) {
-            finish_flush(pq);
-            return;
+            // 1. 获取任务
+            {
+                std::unique_lock<std::mutex> ulock(pq.mtx);
+                
+                if (pq.ready_queue.empty()) {
+                    pq.is_flushing = false;
+                    pq.cv_full.notify_all(); // 唤醒可能的等待者
+                    return;
+                }
+
+                item = std::move(pq.ready_queue.front());
+                pq.ready_queue.pop_front();
+
+                // 如果队列稍微腾出空间了，可以唤醒生产者
+                if (pq.ready_queue.size() < pq.max_queued_batches_) {
+                    pq.cv_full.notify_all();
+                }
+            }
+
+            // 2. 处理任务 (无锁)
+            if (item->buffer->size() > 0) {
+                auto final_packet = ClientProtocol::build_push_packet(
+                    pq.tp.topic,
+                    pq.tp.partition,
+                    item->buffer.get(),
+                    pq.cctx,
+                    zstd_level
+                );
+
+                if (!final_packet.empty()) {
+                    if (ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
+                        send(Eve::CLIENT_REQUEST_PUSH, final_packet, std::move(item->callbacks));
+                    } else {
+                        send(Eve::CLIENT_REQUEST_PUSH, final_packet);
+                    }
+                }
+            }
+
+            // 3. 归还 Buffer
+            {
+                std::unique_lock<std::mutex> ulock(pq.mtx);
+                item->buffer->clear(); // 重置状态
+                pq.free_pool.push_back(std::move(item->buffer));
+            }
         }
-
-        // --- 准备内存 ---
-        size_t zstd_bound = ZSTD_compressBound(src_buf->size());
-        std::vector<unsigned char> final_packet;
-        // 预估大小：Header + Meta + ZstdBound
-        final_packet.resize(1024 + zstd_bound);
-
-        unsigned char* ptr = final_packet.data();
-        unsigned char* packet_start = ptr;
-
-        // =========================================================
-        // 第一层：网络包头 (Topic, Partition, BatchCRC, GlobalBodyLength)
-        // =========================================================
-
-        // 1. Topic (Length + Data)
-        uint32_t topic_len = static_cast<uint32_t>(pq.tp.topic.size());
-        uint32_t n_topic_len = htonl(topic_len); // [Network Order]
-        std::memcpy(ptr, &n_topic_len, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-        std::memcpy(ptr, pq.tp.topic.data(), topic_len);  ptr += topic_len;
-
-        // 2. Partition (8 bytes)
-        uint64_t part_val = static_cast<uint64_t>(pq.tp.partition);
-        uint64_t n_part = htonll(part_val);      // [Network Order]
-        std::memcpy(ptr, &n_part, sizeof(uint64_t)); ptr += sizeof(uint64_t);
-
-        // 3. Batch CRC 占位 (4 bytes)
-        unsigned char* crc_ptr = ptr;
-        ptr += sizeof(uint32_t);
-
-        // 4. Global Body Length 占位 (4 bytes)
-        unsigned char* global_len_ptr = ptr;
-        ptr += sizeof(uint32_t);
-
-        // =========================================================
-        // 第二层：Batch Body (CRC 计算范围)
-        // =========================================================
-        unsigned char* body_start = ptr;
-
-        // 5. Batch Base Offset (8 bytes) - Outer
-        uint64_t base_offset = 0; // 实际逻辑中应填入真实 Offset
-        uint64_t n_base_outer = htonll(base_offset); // [Network Order]
-        std::memcpy(ptr, &n_base_outer, sizeof(uint64_t)); ptr += sizeof(uint64_t);
-
-        // 6. Batch Internal Length 占位 (4 bytes)
-        unsigned char* batch_internal_len_ptr = ptr;
-        ptr += sizeof(uint32_t);
-
-        // --- 开始 Payload (Consumer 内层解压范围) ---
-        unsigned char* payload_start = ptr;
-
-        // 7. Inner Base Offset (8 bytes)
-        // 为了方便 Consumer 内部逻辑，重复写入 BaseOffset
-        uint64_t n_base_inner = htonll(base_offset); // [Network Order]
-        std::memcpy(ptr, &n_base_inner, sizeof(uint64_t)); ptr += sizeof(uint64_t);
-
-        // 8. Record Count (8 bytes)
-        uint64_t record_count = static_cast<uint64_t>(src_buf->record_count_);
-        uint64_t n_record_count = htonll(record_count); // [Network Order]
-        std::memcpy(ptr, &n_record_count, sizeof(uint64_t)); ptr += sizeof(uint64_t);
-
-        // 9. ZSTD Length 占位 (4 bytes)
-        unsigned char* zstd_len_ptr = ptr;
-        ptr += sizeof(uint32_t);
-
-        // 10. ZSTD Data (压缩写入)
-        size_t capacity_left = final_packet.size() - (ptr - packet_start);
-        size_t compressed_size = ZSTD_compressCCtx(
-            pq.cctx, ptr, capacity_left,
-            src_buf->data_ptr(), src_buf->size(),
-            zstd_level
-            );
-
-        if (ZSTD_isError(compressed_size)) { finish_flush(pq); return; }
-        ptr += compressed_size;
-
-        // =========================================================
-        // 回填阶段 (Backfill)
-        // =========================================================
-
-        // A. 回填 ZSTD Length
-        uint32_t n_zstd_len = htonl(static_cast<uint32_t>(compressed_size)); // [Network Order]
-        std::memcpy(zstd_len_ptr, &n_zstd_len, sizeof(uint32_t));
-
-        // B. 回填 Batch Internal Length
-        // Length = (InnerBase + InnerCount + ZstdLen + ZstdData)
-        size_t internal_len = ptr - payload_start;
-        uint32_t n_internal_len = htonl(static_cast<uint32_t>(internal_len)); // [Network Order]
-        std::memcpy(batch_internal_len_ptr, &n_internal_len, sizeof(uint32_t));
-
-        // C. 回填 Global Body Length
-        size_t global_body_len = ptr - body_start;
-        uint32_t n_global_len = htonl(static_cast<uint32_t>(global_body_len)); // [Network Order]
-        std::memcpy(global_len_ptr, &n_global_len, sizeof(uint32_t));
-
-        // D. 计算并回填 CRC
-        uint32_t crc = MYMQ::Crc32::calculate_crc32(body_start, global_body_len);
-        uint32_t n_crc = htonl(crc); // [Network Order]
-        std::memcpy(crc_ptr, &n_crc, sizeof(uint32_t));
-
-        // E. 发送
-        final_packet.resize(ptr - packet_start);
-        if (ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
-            send(Eve::CLIENT_REQUEST_PUSH, final_packet, std::move(*src_cbs));
-        } else {
-            send(Eve::CLIENT_REQUEST_PUSH, final_packet);
-        }
-        finish_flush(pq);
     }
 
 
-    void MYMQ_Produceruse::finish_flush(MYMQ::MYMQ_Client::Push_queue& pq) {
-        std::unique_lock<std::mutex> ulock(pq.mtx);
+    // finish_flush is deprecated and removed
 
-        // 1. 复用内存：只是重置指针，不释放 heap 内存
-        pq.flushing_buf->clear();
-
-        // 2. 清空回调 vector
-        pq.flushing_cbs->clear();
-
-        // 3. 归还控制权
-        pq.is_flushing = false;
-
-        // 4. 唤醒生产者
-        pq.cv_full.notify_all();
-    }
 
     void MYMQ_Produceruse::push_perioric_start(){
         push_perioric_taskid= timer.commit_ms([this]{
@@ -1539,104 +1274,31 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
     }
 
 
-    bool MYMQ_Produceruse::send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::MYMQ_Client::SparseCallback> cbs_)
-    {
-        // 1. 检查飞行请求数 (保持不变)
-        size_t curr_fly = SIZE_MAX;
-        cmc_.get_curr_flying_request_num(curr_fly);
-        if (curr_fly >= max_in_flight_requests_num) {
-            return 0;
-        }
-
-        // 2. 发送消息并挂载回调
-        auto succ = cmc_.send_msg(static_cast<short>(event_type), msg_body,
-                                  [this, saved_cbs = std::move(cbs_)] // 捕获稀疏列表
-                                  (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
-                                  {
-                                      // 解析响应
-                                      auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
-
-                                      // 3. 遍历稀疏回调列表
-                                      // saved_cbs 中只包含需要回调的消息，非需要回调的已被跳过
-                                      for (auto& sparse_item : saved_cbs) {
-
-                                          uint32_t msg_idx = sparse_item.relative_index; // [关键] 获取该消息在 Batch 中的相对位置
-                                          auto& current_cb = sparse_item.cb;             // 获取对应的回调函数 variant
-
-                                          std::visit([&](auto&& specific_cb) {
-                                              using CBType = std::decay_t<decltype(specific_cb)>;
-
-                                              // --- Push 响应处理 (需要用到 msg_idx 计算 offset) ---
-                                              if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>)
-                                              {
-                                                  if (auto* data = std::get_if<MYMQ_Public::PushResponce>(&resp)) {
-                                                      MYMQ_Public::PushResponce individual_resp = *data;
-
-                                                      // [核心修改]: Offset = Batch基准Offset + 消息相对索引
-                                                      individual_resp.offset = data->offset + msg_idx;
-
-                                                      specific_cb(individual_resp);
-                                                  }
-                                              }
-                                              // --- Commit 响应处理 (不需要索引，直接透传) ---
-                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>)
-                                              {
-                                                  if (auto* data = std::get_if<MYMQ_Public::CommitAsyncResponce>(&resp)) {
-                                                      specific_cb(*data);
-                                                  }
-                                              }
-                                              // --- Noop/Error 处理 (不需要索引，直接透传) ---
-                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>)
-                                              {
-                                                  if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
-                                                      specific_cb(*err);
-                                                  } else {
-                                                      specific_cb(MYMQ_Public::CommonErrorCode::NULL_ERROR);
-                                                  }
-                                              }
-                                              else
-                                              {
-                                                  static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
-                                              }
-
-                                          }, current_cb);
-                                      }
-                                  }
-                                  );
-        return succ;
-    }
 
 
     MYMQ_Public::ResultVariant MYMQ_Produceruse::handle_response(Eve event_type,const Mybyte& msg_body){
+        auto protocol_resp = ClientProtocol::parse_response(event_type, msg_body);
 
-        MessageParser mp(msg_body.data(),msg_body.size());
-        if(event_type==MYMQ::EventType::SERVER_RESPONSE_PUSH_ACK){
-            auto topicname=mp.read_string();
-            auto partition=mp.read_size_t();
-            auto error=static_cast<Err>(mp.read_uint16());
-            size_t base=SIZE_MAX;
-            if(error==Err::NULL_ERROR){
-                base=mp.read_size_t();
+        return std::visit([this](auto&& arg) -> MYMQ_Public::ResultVariant {
+             using T = std::decay_t<decltype(arg)>;
+             if constexpr (std::is_same_v<T, MYMQ_Public::PushResponce>) {
+                 return arg;
+             }
+             else if constexpr (std::is_same_v<T, CreateTopicResponse>) {
+                 if (arg.success) {
+                    cerr("CREATE TOPIC RESULT : Topic created successfully");
+                } else {
+                    cerr("CREATE TOPIC RESULT : Topic created failed");
+                }
+                return MYMQ_Public::CommonErrorCode::Success;
             }
-
-            return  MYMQ_Public::PushResponce(std::move(topicname),partition,error,base);
-        }  
-        else if(event_type==Eve::SERVER_RESPONSE_CREATE_TOPIC){
-            auto res= mp.read_bool();
-            if(res){
-                cerr("CREATE TOPIC RESULT : Topic created successfully");
+            else if constexpr (std::is_same_v<T, MYMQ_Public::CommonErrorCode>) {
+                return arg;
             }
-            else{
-                cerr("CREATE TOPIC RESULT : Topic created failed");
-
+            else {
+                return MYMQ_Public::CommonErrorCode::Success;
             }
-        }
-        else if(event_type==Eve::EVENTTYPE_NULL){
-            return Err::REQUEST_TIMEOUT;
-        }
-
-
-        return MYMQ_Public::CommonErrorCode::NULL_ERROR;
+        }, protocol_resp);
     }
 
 
@@ -1649,17 +1311,13 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         }
 
         // 2. 遍历所有分区队列
-        // 假设 map_push_queue 是 tbb::concurrent_hash_map 或 std::unordered_map
-        // 如果是 TBB map，遍历通常是线程安全的，但要注意锁粒度
         for (auto it = recordaccumulator.begin(); it != recordaccumulator.end(); ++it) {
             // key 是 partition string, value 是 Push_queue
             const TopicPartition& pq_key = (*it).first;
             auto& pq = *((*it).second);
 
             // 【优化】无锁预检查 (Dirty Check)
-            // active_buf 是指针，读取指针指向的 size 是相对安全的（哪怕读到旧值也没事，下次再发）
-            // 如果 size 为 0，直接跳过，绝不抢锁
-            if (pq.active_buf->size() == 0) {
+            if (pq.active_buf->size() == 0 && pq.ready_queue.empty()) {
                 continue;
             }
 
@@ -1668,41 +1326,49 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             // ==========================================
             std::unique_lock<std::mutex> ulock(pq.mtx);
 
-            // A. Double Check: 再次确认是否有数据
+            // A. Double Check
             if (pq.active_buf->size() == 0) {
+                // 如果 Active 为空，但 Ready 有东西且未 Flushing，则触发 Flush
+                if (!pq.ready_queue.empty() && !pq.is_flushing) {
+                    pq.is_flushing = true;
+                    auto push_queue_key = pq.tp.topic + "_" + std::to_string(pq.tp.partition);
+                    uint32_t shard_id = MurmurHash2::hash(push_queue_key);
+                    pool_.submit(shard_id, [this, &pq]() {
+                        this->flush_batch_task(pq);
+                    });
+                }
                 continue;
             }
 
-            // B. 【关键】检查后台是否忙碌 (Backpressure)
-            // 如果 is_flushing 为 true，说明上一次的 Batch 还没压完/发完。
-            // 此时定时器不能强制 Swap，否则会覆盖 flushing_buf 里的数据！
-            // 策略：跳过本次，让数据继续积攒，等后台空闲了再说。
-            if (pq.is_flushing) {
-                continue;
+            // B. 强制轮转 Active Buffer (Force Rotate)
+            // 只要 Active 有数据，就将其转入 Ready Queue
+            auto item = std::make_unique<MYMQ::Client::BatchItem>();
+            item->buffer = std::move(pq.active_buf);
+            item->callbacks = std::move(pq.active_cbs);
+            item->batch_count = pq.current_batch_count;
+
+            pq.ready_queue.push_back(std::move(item));
+
+            // C. 补充新的 Active Buffer
+            if (!pq.free_pool.empty()) {
+                pq.active_buf = std::move(pq.free_pool.back());
+                pq.free_pool.pop_back();
+            } else {
+                pq.active_buf = std::make_unique<MYMQ::MSG_serial::BatchBuffer>(pq.buffer_size_);
             }
+            pq.current_batch_count = 0;
 
-            // ==========================================
-            // C. 执行交换 (Swap) - 极速操作
-            // ==========================================
-            // 既然后台不忙，且 active 有数据，说明因为没填满所以没触发 push 里的 flush
-            // 定时器强制触发它！
-            std::swap(pq.active_buf, pq.flushing_buf);
-            std::swap(pq.active_cbs, pq.flushing_cbs);
-
-            // 标记后台忙
-            pq.is_flushing = true;
-
-            // ==========================================
-            // D. 派发给线程池 (非阻塞)
-            // ==========================================
-
-            auto key_hash=pq_key.topic+"_"+std::to_string( pq_key.partition);
-            uint32_t shard_id = MurmurHash2::hash(key_hash);
-
-            pool_.submit(shard_id, [this, &pq]() {
-                this->flush_batch_task(pq);
-            });
-
-
+            // D. 触发 Flush 任务
+            if (!pq.is_flushing) {
+                pq.is_flushing = true;
+                auto push_queue_key = pq.tp.topic + "_" + std::to_string(pq.tp.partition);
+                uint32_t shard_id = MurmurHash2::hash(push_queue_key);
+                pool_.submit(shard_id, [this, &pq]() {
+                    this->flush_batch_task(pq);
+                });
+            }
         }
     }
+
+}
+}
