@@ -94,6 +94,7 @@ target_include_directories(MYMQ
       ${Zstd_INCLUDE_DIRS}
       # 显式添加 OpenSSL include 路径 (如果是手动找到的，这一步很关键)
       ${OPENSSL_INCLUDE_DIR}
+      ${CMAKE_CURRENT_BINARY_DIR}/generated
 )
 
 # 链接所有依赖

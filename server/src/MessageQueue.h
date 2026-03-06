@@ -14,6 +14,7 @@
 #include"Logsegment.h"
 #include"MYMQ_innercodes.h"
 #include"MYMQ_Server_ns.h"
+#include"SharedThreadPool.h"
 #include"Controller.h"
 #include"unordered_set"
 
@@ -921,8 +922,7 @@ private:
             
             if (res.second == Err::NULL_ERROR) {
                 // 成功拉取到数据 -> 发送响应并移除请求
-                SendFileTask file_resp(res.first, topic, partition, list_it->correlation_id, list_it->ack_level);
-                list_it->session.send(Eve::SERVER_RESPONSE_PULL_DATA, list_it->correlation_id, list_it->ack_level, std::move(file_resp));
+                send_file_packet(list_it->session, Eve::SERVER_RESPONSE_PULL_DATA, list_it->correlation_id, list_it->ack_level, res.first, list_it->topic, list_it->partition, list_it->offset);
                 list_it = list.erase(list_it);
             } else {
                 // 仍然没有数据 -> 检查超时
@@ -979,53 +979,7 @@ private:
         }
     }
 
-    // Helper to send standard packet
-    void send_packet(TcpSession& session, Eve type, uint32_t correlation_id, uint16_t ack_level, std::vector<unsigned char> body) {
-        MessageBuilder mb;
-        uint32_t total_length = MYMQ::HEADER_SIZE + sizeof(uint32_t) + body.size();
-        mb.reserve(total_length);
-        mb.append_uint32(total_length);
-        mb.append_uint16(static_cast<uint16_t>(type));
-        mb.append_uint32(correlation_id);
-        mb.append_uint16(ack_level);
-        mb.append_uchar_vector(body);
-        session.send(std::move(mb.data));
-    }
 
-    // Helper to send file packet (Zero-Copy)
-    void send_file_packet(TcpSession& session, Eve type, uint32_t correlation_id, uint16_t ack_level, MesLoc loc) {
-        MessageBuilder mb;
-        // Header: TotalLen(4) | Event(2) | Cid(4) | Ack(2) | BodySize(4)
-        // TotalLen = 12 + 4 + loc.length
-        uint32_t total_length = MYMQ::HEADER_SIZE + sizeof(uint32_t) + loc.length;
-        
-        mb.reserve(16);
-        mb.append_uint32(total_length);
-        mb.append_uint16(static_cast<uint16_t>(type));
-        mb.append_uint32(correlation_id);
-        mb.append_uint16(ack_level);
-        mb.append_uint32(static_cast<uint32_t>(loc.length)); // Body Size prefix for the file content
-        
-        FileSendTask task(loc.file_descriptor, loc.offset_in_file, loc.length, std::move(mb.data));
-        session.send_file(std::move(task));
-    }
-
-    // 辅助发送错误响应
-    void send_error_response(TcpSession& session, uint32_t correlation_id, uint16_t ack_level, 
-                             const std::string& topic, size_t partition, Err error_code, size_t offset) {
-        MessageBuilder mb_meta;
-        mb_meta.append_string(topic);
-        mb_meta.append_size_t(partition);
-        mb_meta.append_uint16(static_cast<uint16_t>(error_code));
-        mb_meta.append_size_t(offset);
-
-        MessageBuilder mb_body;
-        mb_body.append_uchar_vector(mb_meta.data);
-        std::vector<unsigned char> empty_payload;
-        mb_body.append_uchar_vector(empty_payload);
-
-        send_packet(session, Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, std::move(mb_body.data));
-    }
 
 
     void start_server(){
@@ -1055,7 +1009,7 @@ private:
                 auto res= pull(offset,topicname,partition,bytes_need);
                 bool failed=1;
                 if(res.second==Err::NULL_ERROR){
-                    send_file_packet(session, Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, res.first);
+                    send_file_packet(session, Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, res.first, topicname, partition, offset);
                     failed=0;
 
                 }
@@ -1083,29 +1037,7 @@ private:
 
                 if (failed) {
                     cerr(MYMQ_Public::to_string(static_cast<Err>(res.second)));
-
-                    // 1. 构建 Metadata (必须与 SendFileTask 里的结构完全一致！)
-                    // SendFileTask: Topic -> Partition -> Error -> Offset
-                    MessageBuilder mb_meta;
-                    mb_meta.append_string(topicname);
-                    mb_meta.append_size_t(partition);
-                    mb_meta.append_uint16(static_cast<uint16_t>(res.second));
-                    mb_meta.append_size_t(offset);
-
-                    // 2. 将 Metadata 包装进 Body，并追加一个空的 Payload
-
-                    MessageBuilder mb_body;
-
-                    // 第一层：Metadata Vector
-                    mb_body.append_uchar_vector(mb_meta.data);
-
-                    // 第二层：空的 Payload Vector (长度0)
-                    std::vector<unsigned char> empty_payload;
-                    mb_body.append_uchar_vector(empty_payload);
-
-                    // 3. 发送 (session.send 会给整个 mb_body 再加一层长度头，作为最外层的 Body)
-                    session.send(Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, std::move(mb_body.data));
-
+                    send_error_response(session, correlation_id, ack_level, topicname, partition, static_cast<Err>(res.second), offset);
                     cerr(std::to_string(offset));
                 }
 
@@ -1134,7 +1066,7 @@ private:
                     cerr("Push CRC verify : Not match , refused to push");
                     if(ack_level!=static_cast<uint16_t>(MYMQ::ACK_Level::ACK_NORESPONCE)){
                             mb_res.append_uint16(static_cast<uint16_t>(Err::CRC_VERIFY_FAILED));
-                            session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
+                            send_packet(session, Eve::SERVER_RESPONSE_PUSH_ACK, correlation_id, ack_level, mb_res.data);
                     }
                       return ;
                 }
@@ -1148,7 +1080,7 @@ private:
                 if(ack_level==static_cast<uint16_t>(MYMQ::ACK_Level::ACK_PROMISE_INDISK)){
                     mb_res.append_uint16(static_cast<uint16_t>(push_res));
                     mb_res.append_uint64(baseoffset);
-                    session.send(Eve::SERVER_RESPONSE_PUSH_ACK,correlation_id,ack_level,mb_res.data);
+                    send_packet(session, Eve::SERVER_RESPONSE_PUSH_ACK, correlation_id, ack_level, mb_res.data);
                 }
                  cerr("Push result : "+MYMQ_Public::to_string(push_res));
             }
@@ -1167,7 +1099,7 @@ private:
                 MB mb;
                 mb.reserve(sizeof (uint32_t)*2+groupid.size()+topicname.size()+sizeof (size_t)*2+sizeof (uint16_t));
                 mb.append(groupid,topicname,partition,static_cast<uint16_t>(error),offset_digit);
-                session.send(Eve::SERVER_RESPONCE_COMMIT_OFFSET,correlation_id,ack_level,mb.data);
+                send_packet(session, Eve::SERVER_RESPONCE_COMMIT_OFFSET, correlation_id, ack_level, mb.data);
 
 
 
@@ -1175,7 +1107,7 @@ private:
             else if(type==MYMQ::EventType::CLIENT_REQUEST_REGISTER){
                 MB mb;
                 mb.append_bool(mp.read_bool());
-                session.send(Eve::SERVER_RESPONSE_REGISTER,correlation_id,ack_level,mb.data);
+                send_packet(session, Eve::SERVER_RESPONSE_REGISTER, correlation_id, ack_level, mb.data);
             }
            else if(type==MYMQ::EventType::CLIENT_REQUEST_LEAVE_GROUP){
                 auto groupid=mp.read_string();
@@ -1183,7 +1115,7 @@ private:
                 auto res=  leave_group(groupid,memberid);
                 MB mb;
                 mb.append(static_cast<uint16_t>(res),groupid);
-               session.send(Eve::SERVER_RESPONCE_LEAVE_GROUP,correlation_id,ack_level,mb.data);
+               send_packet(session, Eve::SERVER_RESPONCE_LEAVE_GROUP, correlation_id, ack_level, mb.data);
             }
              else if(type==MYMQ::EventType::CLIENT_REQUEST_HEARTBEAT){
 
@@ -1242,7 +1174,7 @@ private:
                     }
 
                 }
-                session.send(Eve::SERVER_RESPONCE_HEARTBEAT,correlation_id,ack_level,mb.data);
+                send_packet(session, Eve::SERVER_RESPONCE_HEARTBEAT, correlation_id, ack_level, mb.data);
 
 
 
@@ -1254,7 +1186,7 @@ private:
                 auto res= create_topic(topicname,num);
                 MB mb;
                 mb.append(res);
-                session.send(Eve::SERVER_RESPONSE_CREATE_TOPIC,correlation_id,ack_level,mb.data);
+                send_packet(session, Eve::SERVER_RESPONSE_CREATE_TOPIC, correlation_id, ack_level, mb.data);
 
             }
 
@@ -1302,6 +1234,74 @@ private:
     Err leave_group(const std::string& groupid,const std::string& memberid){
         return groupcoordinator_->leave_group(groupid,memberid);
     }
+
+    void send_packet(Net::TcpSession& session, Eve type, uint32_t correlation_id, uint16_t ack_level, std::vector<unsigned char> body) {
+        if (!session.is_connected()) return;
+
+        MB mb_header;
+        uint32_t total_len = 4 + 4 + 2 + 2 + body.size(); // TotalLen(4) + Type(2) + CorrID(4) + Ack(2) + Body
+        
+        // Ensure header size matches Server's expectation (12 bytes)
+        // [TotalLen:4][Type:2][CorrID:4][Ack:2] = 12 bytes
+        
+        mb_header.append_uint32(total_len);
+        mb_header.append_uint16(static_cast<uint16_t>(type));
+        mb_header.append_uint32(correlation_id);
+        mb_header.append_uint16(ack_level);
+
+        // Combine header and body
+        std::vector<unsigned char> packet = std::move(mb_header.data);
+        packet.insert(packet.end(), std::make_move_iterator(body.begin()), std::make_move_iterator(body.end()));
+
+        session.send(std::move(packet));
+    }
+
+    void send_file_packet(Net::TcpSession& session, Eve type, uint32_t correlation_id, uint16_t ack_level, MesLoc loc, const std::string& topic, size_t partition, size_t offset) {
+         if (!session.is_connected()) return;
+
+         // Construct Body for File Send (Metadata only)
+         // The actual file content is sent via send_file
+         // Body structure: [Topic:Str][Partition:8][ErrorCode:2][Offset:8][DataLen:8]
+         
+         // Let's construct the Metadata part of the body first
+         MB mb_metadata;
+         mb_metadata.append(topic);
+         mb_metadata.append_size_t(partition);
+         mb_metadata.append_uint16(0); // ErrorCode = 0 (Success)
+         mb_metadata.append_size_t(offset);
+         mb_metadata.append_size_t(loc.length); // Data Length
+
+         // Total Length = Header(12) + Metadata + FileContent
+         uint32_t total_len = 12 + mb_metadata.data.size() + loc.length;
+
+         MB mb_header;
+         mb_header.append_uint32(total_len);
+         mb_header.append_uint16(static_cast<uint16_t>(type));
+         mb_header.append_uint32(correlation_id);
+         mb_header.append_uint16(ack_level);
+
+         // Combine Header + Metadata
+         std::vector<unsigned char> header_and_meta = std::move(mb_header.data);
+         header_and_meta.insert(header_and_meta.end(), mb_metadata.data.begin(), mb_metadata.data.end());
+
+         // Use Net::FileSendTask
+         Net::FileSendTask task(loc.file_descriptor, loc.offset_in_file, loc.length, std::move(header_and_meta));
+         session.send_file(std::move(task));
+    }
+
+    void send_error_response(Net::TcpSession& session, uint32_t correlation_id, uint16_t ack_level, const std::string& topic, size_t partition, Err error_code, size_t offset) {
+        MB mb_res;
+        // Construct error body
+        // Body: [Topic][Partition][ErrorCode][Offset][DataLen=0]
+        mb_res.append(topic);
+        mb_res.append_size_t(partition);
+        mb_res.append_uint16(static_cast<uint16_t>(error_code));
+        mb_res.append_size_t(offset);
+        mb_res.append_size_t(0); // Data Length = 0
+        
+        send_packet(session, Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, std::move(mb_res.data));
+    }
+
 
 
 
