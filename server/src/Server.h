@@ -890,10 +890,14 @@ private:
     }
 
     void handle_event(std::shared_ptr<ClientState> state, std::vector<unsigned char>&& body) {
-        std::shared_lock<std::shared_mutex> ulock(mtx_callback);
-        if (client_msg_callback_) {
+        ClientMessageCallback curr_cb;
+        {
+            std::shared_lock<std::shared_mutex> slock(mtx_callback);
+            curr_cb = client_msg_callback_;
+        }
+        if (curr_cb) {
             TcpSession session(state);
-            client_msg_callback_(session, state->header_buffer, std::move(body));
+            curr_cb(session, state->header_buffer, std::move(body));
         }
     }
 
@@ -1036,24 +1040,6 @@ private:
         }
 
         return IOStatus::OK_WAITING;
-    }
-
-    void handle_event(std::shared_ptr<ClientState> state, Mybyte msg_body) {
-
-        // 1. 准备回调
-        ClientMessageCallback curr_cb;
-        {
-            std::shared_lock<std::shared_mutex> slock(mtx_callback);
-            curr_cb = client_msg_callback_;
-        }
-
-        if (curr_cb) {
-            TcpSession session(state);
-            short type = state->event_type;
-            uint32_t cid = state->correlation_id;
-            uint16_t ack = state->ack_level;
-            curr_cb(session, type, cid, ack, std::move(msg_body));
-        }
     }
 
 private:

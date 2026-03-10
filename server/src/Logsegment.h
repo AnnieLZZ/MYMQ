@@ -5,6 +5,7 @@
 #include"MYMQ_Publiccodes.h"
 #include <sys/uio.h>
 #include"CONFIG_MANAGER.h"
+#include"Printqueue.h"
 #include"MYMQ_Server_ns.h"
 using Err=MYMQ_Public::CommonErrorCode;
 using MesLoc=MYMQ_Server::MessageLocation;
