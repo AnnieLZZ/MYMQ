@@ -174,7 +174,18 @@ using Net::TcpSession;
 using Net::FileSendTask;
 
 // Helper for time string (keep as is)
-std::string now_ms_time_gen_str(); // (Forward declaration, impl below or separate)
+inline std::string now_ms_time_gen_str() {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+    std::time_t t = system_clock::to_time_t(now);
+    std::tm tm_local{};
+    localtime_r(&t, &tm_local);
+    std::ostringstream oss;
+    oss << std::put_time(&tm_local, "%Y-%m-%d %H:%M:%S") << '.'
+        << std::setw(3) << std::setfill('0') << ms.count();
+    return oss.str();
+}
 
 using ClientStateMap = tbb::concurrent_hash_map<int, std::shared_ptr<ClientState>>;
 
@@ -901,7 +912,7 @@ private:
         }
     }
 
-    void process_message( int sock, Mybyte&& body,std::shared_ptr<ClientState> state) {
+    void process_message( int sock, std::vector<unsigned char>&& body,std::shared_ptr<ClientState> state) {
         handle_event(state, std::move(body));
     }
 
@@ -956,7 +967,7 @@ private:
 
                         // 【改动 2】process_message 需要接收 shared_ptr state
                         // 这样 handle_event 才能把 session 传给用户
-                        process_message(sock, Mybyte{}, state);
+                        process_message(sock, std::vector<unsigned char>{}, state);
 
                         return IOStatus::OK_COMPLETED;
                     } else {
