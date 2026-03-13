@@ -105,6 +105,13 @@ enum class ClientErrorCode :uint16_t{
 
 };
 
+enum class ChannelRole : uint16_t {
+    UNKNOWN = 0,
+    CONTROL = 1,
+    FETCH = 2,
+    PRODUCE = 3
+};
+
 // ClientErrorCode 的 to_string 函数
 inline std::string to_string(ClientErrorCode code) {
     switch (code) {

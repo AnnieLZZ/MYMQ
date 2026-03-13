@@ -7,6 +7,7 @@
 #include"CONFIG_MANAGER.h"
 #include"Printqueue.h"
 #include"MYMQ_Server_ns.h"
+#include <vector>
 using Err=MYMQ_Public::CommonErrorCode;
 using MesLoc=MYMQ_Server::MessageLocation;
 
@@ -583,6 +584,28 @@ log_bytes_since_last_flush.store(0);
         }
 
         return loc;
+    }
+
+    std::vector<std::vector<unsigned char>> dump_payloads_snapshot() {
+        std::vector<std::vector<unsigned char>> result;
+        size_t logsize = committed_file_size_.load(std::memory_order_acquire);
+        size_t pos = 0;
+        while (pos + 12 <= logsize) {
+            char header_buf[12];
+            ssize_t r = pread(log_file_fd, header_buf, 12, pos);
+            if (r < 12) break;
+            uint32_t size_net;
+            std::memcpy(&size_net, header_buf + 8, 4);
+            uint32_t payload_len = ntohl(size_net);
+            if (payload_len == 0) break;
+            if (pos + 12ULL + payload_len > logsize) break;
+            std::vector<unsigned char> payload(payload_len);
+            ssize_t r2 = pread(log_file_fd, payload.data(), payload_len, pos + 12);
+            if (r2 < static_cast<ssize_t>(payload_len)) break;
+            result.emplace_back(std::move(payload));
+            pos += 12ULL + payload_len;
+        }
+        return result;
     }
 
     uint64_t base_offset() const { return base_offset_; }

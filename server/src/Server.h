@@ -73,6 +73,7 @@ namespace Net {
         uint32_t correlation_id = 0;
         uint16_t ack_level = 0;
         bool id_registered = false;
+        uint16_t channel_role = 0;
         
         // These were MYMQ specific, but are common enough for a length-prefixed protocol.
         // We can keep them generic or parse them in the callback.
@@ -160,6 +161,18 @@ namespace Net {
             if (state) {
                 state->clientid = id;
                 clientid = id;
+            }
+        }
+        
+        uint16_t get_channel_role() const {
+            auto state = state_.lock();
+            return state ? state->channel_role : 0;
+        }
+        
+        void set_channel_role(uint16_t role) {
+            auto state = state_.lock();
+            if (state) {
+                state->channel_role = role;
             }
         }
 

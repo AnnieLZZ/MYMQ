@@ -20,6 +20,7 @@
 #include <memory>
 #include "Timer.h"
 #include "MYMQ_innercodes.h"
+#include "MYMQ_PublicCodes.h"
 #include "zlib.h"
 #include "readerwriterqueue.h"
 #include "tbb/concurrent_hash_map.h"
@@ -98,7 +99,7 @@ public:
     };
 
     Communication_client(const std::string& path_,size_t request_timeout_ms) :
-        path(path_), client_state(0),request_timeout_timer(this->map_wait_responces,curr_flying_request_num,request_timeout_ms) {
+        path(path_), client_state(0), default_request_timeout_ms_(request_timeout_ms) {
     }
 
     ~Communication_client() {
@@ -129,6 +130,20 @@ public:
             IO_buffer_size=config_mgr.get_size_t("IO_buffer_size");
             IO_buffer.resize(IO_buffer_size);
 
+        }
+
+        {
+            size_t request_timeout_ms = default_request_timeout_ms_;
+            try {
+                Config_manager cm_sys(path + "\\config\\sys.ini");
+                request_timeout_ms = cm_sys.get_size_t("request_timeout_ms");
+            } catch (...) {
+                request_timeout_ms = default_request_timeout_ms_;
+            }
+            if(!inrange(request_timeout_ms,10,3600000)){
+                request_timeout_ms = default_request_timeout_ms_;
+            }
+            request_timeout_timer = std::make_unique<RequestTimeoutQueue>(this->map_wait_responces, curr_flying_request_num, request_timeout_ms);
         }
 
 
@@ -248,7 +263,9 @@ public:
                 acc->second = std::move(handler); // 转移所有权，保存回调
             }
             curr_flying_request_num++;
-            request_timeout_timer.add(coid);
+            if (request_timeout_timer) {
+                request_timeout_timer->add(coid);
+            }
         }
 
         send_queue.try_emplace(std::move(mb.data), coid, ResponseCallback{});
@@ -276,10 +293,15 @@ public:
         if (iResult != 0) {
             std::cerr << "[" << now_ms_time_gen_str() << "] WSACleanup failed: " << iResult << std::endl;
         }
+        request_timeout_timer.reset();
     }
 
     void set_clientid(const std::string clientid) {
         client_id_str = clientid;
+    }
+    
+    void set_channel_role(MYMQ_Public::ChannelRole role) {
+        channel_role_ = static_cast<uint16_t>(role);
     }
 
     void send_msg_prior(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler){
@@ -396,20 +418,23 @@ private:
         if (client_id_sent_.load()) return;
 
 
-        MessageBuilder mb_full;
-        uint16_t event_type = static_cast<uint16_t>(Eve::CLIENT_REQUEST_REGISTER);
-        uint32_t total_length_on_wire = static_cast<uint32_t>(HEADER_SIZE + sizeof(uint32_t) +client_id_str.size());
-        mb_full.reserve(total_length_on_wire);
+        MessageBuilder payload;
+        payload.append_uint16(1);
+        payload.append_uint16(channel_role_);
+        payload.append_string(client_id_str);
 
-        ////HEADER
+        const uint32_t total_length_on_wire =
+            static_cast<uint32_t>(HEADER_SIZE + sizeof(uint32_t) + payload.data.size());
+
+        MessageBuilder mb_full;
+        mb_full.reserve(total_length_on_wire);
         mb_full.append_uint32(total_length_on_wire);
-        mb_full.append_uint16(event_type);
+        mb_full.append_uint16(static_cast<uint16_t>(Eve::CLIENT_REQUEST_REGISTER));
         mb_full.append_uint32(Correlation_ID++);
         mb_full.append_uint16(static_cast<uint16_t>(ack_level));
-        ////HEADER
-        mb_full.append_string(client_id_str);
+        mb_full.append_uchar_vector(payload.data);
 
-        auto full_message = mb_full.data;
+        auto full_message = std::move(mb_full.data);
         client_id_message_to_send_ = std::make_pair(std::move(full_message), 0);
         send_pending.store(true);
         client_id_sent_.store(true);
@@ -748,6 +773,7 @@ private:
     std::string server_IP;
     int port;
     uint16_t HEADER_SIZE;
+    size_t default_request_timeout_ms_ = MYMQ::REQUEST_TIMEOUT_MS_DEFAULT;
 
 
     SOCKET clientSocket;
@@ -768,9 +794,10 @@ private:
     std::atomic<bool> client_id_sent_{false};
 
     MYMQ::ACK_Level ack_level=MYMQ::ACK_Level::ACK_PROMISE_INDISK;
+    uint16_t channel_role_ = static_cast<uint16_t>(MYMQ_Public::ChannelRole::CONTROL);
 
     tbb::concurrent_hash_map<uint32_t, ResponseCallback> map_wait_responces;
-    RequestTimeoutQueue request_timeout_timer;
+    std::unique_ptr<RequestTimeoutQueue> request_timeout_timer;
 
     std::atomic<uint32_t> Correlation_ID{0};
 

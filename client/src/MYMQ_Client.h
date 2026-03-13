@@ -35,6 +35,7 @@ protected:
 
     // Common send method
     bool send(MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::Client::SparseCallback> cbs_ = std::vector<MYMQ::Client::SparseCallback>());
+    bool send_via(MYMQ::Network::Communication_client& channel, MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::Client::SparseCallback> cbs_ = std::vector<MYMQ::Client::SparseCallback>());
 
     // Virtual hook for response handling
     virtual MYMQ_Public::ResultVariant handle_response(Eve event_type, const Mybyte& msg_body) = 0;
@@ -97,10 +98,11 @@ private:
     size_t autopush_perior_ms;
     //size_t max_in_flight_requests_num; // Moved to base
     size_t local_push_buffer_size;
+    size_t push_max_queued_batches;
 
     //Config配置项
     std::string path_;
-    //MYMQ::Network::Communication_client cmc_; // Moved to base
+    MYMQ::Network::Communication_client cmc_produce_{MYMQ::run_directory_DEFAULT, MYMQ::REQUEST_TIMEOUT_MS_DEFAULT};
 
     Timer timer;
     size_t push_perioric_taskid{0};
@@ -194,6 +196,7 @@ public:
        void  trigger_poll_for_low_cap_pollbuffer();
 
 private:
+    MYMQ::Network::Communication_client cmc_fetch_{MYMQ::run_directory_DEFAULT, MYMQ::REQUEST_TIMEOUT_MS_DEFAULT};
     void call_parse_impl(
         const std::vector<unsigned char>& raw_big_chunk,            // IO 线程收到的原始大包
         std::vector<MYMQ_Public::ConsumerRecord>& out_records,      // 输出结果
@@ -247,7 +250,8 @@ private:
     size_t commit_wait_timeout_s;
 
     size_t zstd_level;
-    size_t local_pollqueue_size;
+    size_t local_pollqueue_low_bytes;
+    size_t local_pollqueue_high_bytes;
     size_t batch_size;
     MYMQ::PullSet pull_start_location;
     size_t autopush_perior_ms;

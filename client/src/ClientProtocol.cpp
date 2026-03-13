@@ -50,14 +50,21 @@ ProtocolResponse ClientProtocol::parse_response(MYMQ::EventType event_type, cons
              return r;
         }
         case MYMQ::EventType::SERVER_RESPONSE_PULL_DATA: {
-             parser.read_uint32();
              std::string topic = parser.read_string();
              uint64_t partition = parser.read_uint64();
              auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
              uint64_t next_offset = parser.read_uint64();
-             
-             std::vector<unsigned char> batch = parser.read_uchar_vector();
-             
+             uint64_t data_len = parser.read_uint64();
+
+             std::vector<unsigned char> batch;
+             if (data_len > 0) {
+                 if (parser.get_remaining_bytes() < data_len) {
+                     return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
+                 }
+                 const auto* ptr = parser.get_current_ptr();
+                 batch.assign(ptr, ptr + data_len);
+             }
+
              return PullResponseData{topic, partition, err, next_offset, batch, 0};
         }
         case MYMQ::EventType::SERVER_RESPONCE_LEAVE_GROUP: {

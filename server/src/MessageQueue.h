@@ -17,6 +17,7 @@
 #include"SharedThreadPool.h"
 #include"Controller.h"
 #include"unordered_set"
+#include<unordered_map>
 
 
 using Record=MYMQ::MSG_serial::Record;
@@ -238,10 +239,96 @@ public:
 
     void start_logcleaner(){
         timer_.commit_s([this]{
-            //            log_compact();
+            log_compact();
         },LOG_CLEAN_S,LOG_CLEAN_S);
     }
-    //暂时不实现
+    void log_compact(){
+        std::vector<LogSegment*> old_segments;
+        uint64_t new_base_offset = 0;
+        {
+            std::shared_lock<std::shared_mutex> lock(mtx_file);
+            if (segments_.empty()) return;
+            LogSegment* active = curr_write_segment;
+            for (size_t i = 0; i < segments_.size(); ++i) {
+                if (segments_[i].get() == active) break;
+                if (i == 0) new_base_offset = segments_[i]->base_offset();
+                old_segments.push_back(segments_[i].get());
+            }
+        }
+        if (old_segments.empty()) return;
+        std::unordered_map<std::string, size_t> latest;
+        for (auto* seg : old_segments) {
+            auto payloads = seg->dump_payloads_snapshot();
+            for (auto& p : payloads) {
+                if (p.size() < 16) continue;
+                MessageParser mp(p.data(), p.size());
+                mp.skip(16);
+                auto key = mp.read_string();
+                auto off = mp.read_size_t();
+                latest[key] = off;
+            }
+        }
+        std::vector<std::unique_ptr<LogSegment>> new_compacted;
+        std::unique_ptr<LogSegment> curr_seg;
+        {
+            std::string log_file_path = partition_data_dir_ + "/" + LogSegment::compute_filename(new_base_offset) + ".log";
+            std::string index_file_path = partition_data_dir_ + "/" + LogSegment::compute_filename(new_base_offset) + ".index";
+            curr_seg = std::make_unique<LogSegment>(log_file_path, index_file_path, new_base_offset);
+        }
+        for (const auto& kv : latest) {
+            MB mb_payload;
+            mb_payload.append(kv.first);
+            mb_payload.append_size_t(kv.second);
+            uint32_t payload_len = static_cast<uint32_t>(sizeof(uint64_t) + sizeof(uint64_t) + mb_payload.data.size());
+            uint32_t payload_len_net = htonl(payload_len);
+            std::vector<unsigned char> entry;
+            entry.resize(sizeof(uint64_t) + sizeof(uint32_t) + payload_len);
+            uint64_t off_net = htonll(0);
+            std::memcpy(entry.data(), &off_net, sizeof(uint64_t));
+            std::memcpy(entry.data() + sizeof(uint64_t), &payload_len_net, sizeof(uint32_t));
+            std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t), &off_net, sizeof(uint64_t));
+            uint64_t msg_num_net = htonll(1);
+            std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t), &msg_num_net, sizeof(uint64_t));
+            if(!mb_payload.data.empty()){
+                std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t),
+                            mb_payload.data.data(),
+                            mb_payload.data.size());
+            }
+            auto res = curr_seg->append(Byte_view_pair{entry.data(), static_cast<uint32_t>(entry.size())});
+            if (res.second == Err::FULL_SEGMENT) {
+                new_compacted.emplace_back(std::move(curr_seg));
+                uint64_t next_base = new_compacted.back()->base_offset() + new_compacted.back()->next_offset();
+                std::string new_log_file_path = partition_data_dir_ + "/" + LogSegment::compute_filename(next_base) + ".log";
+                std::string new_index_file_path = partition_data_dir_ + "/" + LogSegment::compute_filename(next_base) + ".index";
+                curr_seg = std::make_unique<LogSegment>(new_log_file_path, new_index_file_path, next_base);
+                auto res2 = curr_seg->append(Byte_view_pair{entry.data(), static_cast<uint32_t>(entry.size())});
+                (void)res2;
+            }
+        }
+        if (curr_seg) {
+            new_compacted.emplace_back(std::move(curr_seg));
+        }
+        {
+            std::unique_lock<std::shared_mutex> lock(mtx_file);
+            if (segments_.empty()) return;
+            size_t active_idx = 0;
+            for (; active_idx < segments_.size(); ++active_idx) {
+                if (segments_[active_idx].get() == curr_write_segment) break;
+            }
+            for (size_t i = 0; i < active_idx; ++i) {
+                segments_[i]->mark_as_clean_in_lock();
+            }
+            std::vector<std::unique_ptr<LogSegment>> rebuilt;
+            for (auto& ns : new_compacted) {
+                rebuilt.emplace_back(std::move(ns));
+            }
+            for (size_t i = active_idx; i < segments_.size(); ++i) {
+                rebuilt.emplace_back(std::move(segments_[i]));
+            }
+            segments_.swap(rebuilt);
+            curr_write_segment = segments_.back().get();
+        }
+    }
 
 
 
@@ -331,7 +418,11 @@ private:
             LOG_FLUSH_INTERVAL_MS_tmp=MYMQ::LOG_FLUSH_INTERVAL_MS;
         }
         LOG_FLUSH_INTERVAL_MS=LOG_FLUSH_INTERVAL_MS_tmp;
-        LOG_CLEAN_S=MYMQ::LOG_CLEAN_S_DEFAULT;
+        auto LOG_CLEAN_S_tmp=cm_s.get_size_t("LOG_CLEAN_S");
+        if(!inrange(LOG_CLEAN_S_tmp,60,864000)){
+            LOG_CLEAN_S_tmp=MYMQ::LOG_CLEAN_S_DEFAULT;
+        }
+        LOG_CLEAN_S=static_cast<int>(LOG_CLEAN_S_tmp);
 
     }
 
@@ -1006,6 +1097,11 @@ private:
                 auto partition=mp.read_size_t();
                 auto offset=mp.read_size_t();
                 auto bytes_need=mp.read_size_t();
+                const auto role = static_cast<MYMQ_Public::ChannelRole>(session.get_channel_role());
+                if (role != MYMQ_Public::ChannelRole::UNKNOWN && role != MYMQ_Public::ChannelRole::FETCH) {
+                    send_error_response(session, correlation_id, ack_level, topicname, partition, Err::INTERNAL_ERROR, offset);
+                    return;
+                }
                 auto res= pull(offset,topicname,partition,bytes_need);
                 bool failed=1;
                 if(res.second==Err::NULL_ERROR){
@@ -1053,8 +1149,18 @@ private:
                 auto topicname= mp.read_string();
                 auto partition=mp.read_size_t();
 
+                const auto role = static_cast<MYMQ_Public::ChannelRole>(session.get_channel_role());
+                if (role != MYMQ_Public::ChannelRole::UNKNOWN && role != MYMQ_Public::ChannelRole::PRODUCE) {
+                    MB mb_res;
+                    mb_res.append(topicname,partition);
+                    mb_res.append_uint16(static_cast<uint16_t>(Err::INTERNAL_ERROR));
+                    mb_res.append_uint64(0);
+                    send_packet(session, Eve::SERVER_RESPONSE_PUSH_ACK, correlation_id, ack_level, mb_res.data);
+                    return;
+                }
                 auto crc= mp.read_uint32();
                 auto msg_view=mp.read_bytes_view();
+
 
 
                 MB mb_res;
@@ -1094,8 +1200,46 @@ private:
                 auto consumeroffset_parid_hash=mp.read_uint32();
                 auto key_gtp=mp.read_string();
                 auto offset_digit=mp.read_size_t();
+                const auto role = static_cast<MYMQ_Public::ChannelRole>(session.get_channel_role());
+                if (role != MYMQ_Public::ChannelRole::UNKNOWN && role != MYMQ_Public::ChannelRole::CONTROL) {
+                    MB mb;
+                    mb.reserve(sizeof (uint32_t)*2+groupid.size()+topicname.size()+sizeof (size_t)*2+sizeof (uint16_t));
+                    mb.append(groupid,topicname,partition,static_cast<uint16_t>(Err::INTERNAL_ERROR),offset_digit);
+                    send_packet(session, Eve::SERVER_RESPONCE_COMMIT_OFFSET, correlation_id, ack_level, mb.data);
+                    return;
+                }
 
                 auto error= commit_sync(groupid,memberid,generationid,topicname,partition,offset_digit);
+                if(error==Err::NULL_ERROR&&consumer_offset_manager_ptr_){
+                    MB mb_payload;
+                    mb_payload.append(key_gtp);
+                    mb_payload.append_size_t(offset_digit);
+
+                    uint32_t payload_len = static_cast<uint32_t>(sizeof(uint64_t) + sizeof(uint64_t) + mb_payload.data.size());
+                    uint32_t payload_len_net = htonl(payload_len);
+
+                    std::vector<unsigned char> entry;
+                    entry.resize(sizeof(uint64_t) + sizeof(uint32_t) + payload_len);
+
+                    uint64_t off_net = htonll(0);
+                    std::memcpy(entry.data(), &off_net, sizeof(uint64_t));
+                    std::memcpy(entry.data() + sizeof(uint64_t), &payload_len_net, sizeof(uint32_t));
+
+                    std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t), &off_net, sizeof(uint64_t));
+                    uint64_t msg_num_net = htonll(1);
+                    std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t), &msg_num_net, sizeof(uint64_t));
+
+                    if(!mb_payload.data.empty()){
+                        std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t),
+                                    mb_payload.data.data(),
+                                    mb_payload.data.size());
+                    }
+
+                    auto persist_err= consumer_offset_manager_ptr_->commit_sync(consumeroffset_parid_hash, Byte_view_pair{entry.data(), static_cast<uint32_t>(entry.size())});
+                    if(persist_err!=Err::NULL_ERROR){
+                        error=persist_err;
+                    }
+                }
                 MB mb;
                 mb.reserve(sizeof (uint32_t)*2+groupid.size()+topicname.size()+sizeof (size_t)*2+sizeof (uint16_t));
                 mb.append(groupid,topicname,partition,static_cast<uint16_t>(error),offset_digit);
@@ -1105,13 +1249,38 @@ private:
 
             }
             else if(type==MYMQ::EventType::CLIENT_REQUEST_REGISTER){
+                bool ok = false;
+                uint16_t version = 0;
+                uint16_t role = static_cast<uint16_t>(MYMQ_Public::ChannelRole::UNKNOWN);
+                std::string clientid;
+                try {
+                    version = mp.read_uint16();
+                    role = mp.read_uint16();
+                    clientid = mp.read_string();
+                    ok = (version == 1);
+                } catch (...) {
+                    ok = false;
+                }
+
+                if (ok) {
+                    session.set_clientid(clientid);
+                    session.set_channel_role(role);
+                }
+
                 MB mb;
-                mb.append_bool(mp.read_bool());
+                mb.append_bool(ok);
                 send_packet(session, Eve::SERVER_RESPONSE_REGISTER, correlation_id, ack_level, mb.data);
             }
            else if(type==MYMQ::EventType::CLIENT_REQUEST_LEAVE_GROUP){
                 auto groupid=mp.read_string();
                 auto memberid=mp.read_string();
+                const auto role = static_cast<MYMQ_Public::ChannelRole>(session.get_channel_role());
+                if (role != MYMQ_Public::ChannelRole::UNKNOWN && role != MYMQ_Public::ChannelRole::CONTROL) {
+                    MB mb;
+                    mb.append(static_cast<uint16_t>(Err::INTERNAL_ERROR),groupid);
+                    send_packet(session, Eve::SERVER_RESPONCE_LEAVE_GROUP, correlation_id, ack_level, mb.data);
+                    return;
+                }
                 auto res=  leave_group(groupid,memberid);
                 MB mb;
                 mb.append(static_cast<uint16_t>(res),groupid);
@@ -1121,6 +1290,13 @@ private:
 
                 auto groupid=mp.read_string();               
                 auto memberid=mp.read_string();
+                const auto role = static_cast<MYMQ_Public::ChannelRole>(session.get_channel_role());
+                if (role != MYMQ_Public::ChannelRole::UNKNOWN && role != MYMQ_Public::ChannelRole::CONTROL) {
+                    MB mb;
+                    mb.append(static_cast<uint16_t>(Err::INTERNAL_ERROR),groupid,memberid,static_cast<size_t>(0));
+                    send_packet(session, Eve::SERVER_RESPONCE_HEARTBEAT, correlation_id, ack_level, mb.data);
+                    return;
+                }
                 auto generationid=mp.read_size_t();
                 auto pull_start_location=static_cast<MYMQ::PullSet>( mp.read_uint16());
                 bool is_join_group=memberid.empty();
@@ -1183,6 +1359,13 @@ private:
             else if(type==Eve::CLIENT_REQUEST_CREATE_TOPIC){
                 auto topicname=mp.read_string();
                 auto num=mp.read_size_t();
+                const auto role = static_cast<MYMQ_Public::ChannelRole>(session.get_channel_role());
+                if (role != MYMQ_Public::ChannelRole::UNKNOWN && role != MYMQ_Public::ChannelRole::CONTROL) {
+                    MB mb;
+                    mb.append_bool(false);
+                    send_packet(session, Eve::SERVER_RESPONSE_CREATE_TOPIC, correlation_id, ack_level, mb.data);
+                    return;
+                }
                 auto res= create_topic(topicname,num);
                 MB mb;
                 mb.append(res);
@@ -1238,20 +1421,18 @@ private:
     void send_packet(Net::TcpSession& session, Eve type, uint32_t correlation_id, uint16_t ack_level, std::vector<unsigned char> body) {
         if (!session.is_connected()) return;
 
+        MB mb_body;
+        mb_body.append_uchar_vector(body);
+
         MB mb_header;
-        uint32_t total_len = 4 + 4 + 2 + 2 + body.size(); // TotalLen(4) + Type(2) + CorrID(4) + Ack(2) + Body
-        
-        // Ensure header size matches Server's expectation (12 bytes)
-        // [TotalLen:4][Type:2][CorrID:4][Ack:2] = 12 bytes
-        
+        const uint32_t total_len = static_cast<uint32_t>(12 + mb_body.data.size());
         mb_header.append_uint32(total_len);
         mb_header.append_uint16(static_cast<uint16_t>(type));
         mb_header.append_uint32(correlation_id);
         mb_header.append_uint16(ack_level);
 
-        // Combine header and body
         std::vector<unsigned char> packet = std::move(mb_header.data);
-        packet.insert(packet.end(), std::make_move_iterator(body.begin()), std::make_move_iterator(body.end()));
+        packet.insert(packet.end(), std::make_move_iterator(mb_body.data.begin()), std::make_move_iterator(mb_body.data.end()));
 
         session.send(std::move(packet));
     }
@@ -1271,8 +1452,10 @@ private:
          mb_metadata.append_size_t(offset);
          mb_metadata.append_size_t(loc.length); // Data Length
 
-         // Total Length = Header(12) + Metadata + FileContent
-         uint32_t total_len = 12 + mb_metadata.data.size() + loc.length;
+         MB mb_prefix;
+         mb_prefix.append_uint32(static_cast<uint32_t>(mb_metadata.data.size() + loc.length));
+
+         const uint32_t total_len = static_cast<uint32_t>(12 + mb_prefix.data.size() + mb_metadata.data.size() + loc.length);
 
          MB mb_header;
          mb_header.append_uint32(total_len);
@@ -1280,8 +1463,8 @@ private:
          mb_header.append_uint32(correlation_id);
          mb_header.append_uint16(ack_level);
 
-         // Combine Header + Metadata
          std::vector<unsigned char> header_and_meta = std::move(mb_header.data);
+         header_and_meta.insert(header_and_meta.end(), mb_prefix.data.begin(), mb_prefix.data.end());
          header_and_meta.insert(header_and_meta.end(), mb_metadata.data.begin(), mb_metadata.data.end());
 
          // Use Net::FileSendTask

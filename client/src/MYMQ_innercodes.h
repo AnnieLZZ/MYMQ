@@ -527,8 +527,8 @@ struct Push_queue {
     size_t buffer_size_ = 1024 * 1024;
     size_t max_queued_batches_ = 5; // Allow 5 pending batches + 1 active
 
-    Push_queue(const TopicPartition& tp, size_t buffer_size = 1024 * 1024)
-        : tp(tp), buffer_size_(buffer_size)
+    Push_queue(const TopicPartition& tp, size_t buffer_size = 1024 * 1024, size_t max_queued_batches = 5)
+        : tp(tp), buffer_size_(buffer_size), max_queued_batches_(max_queued_batches)
     {
         cctx = ZSTD_createCCtx();
         // Initialize active buffer
@@ -659,13 +659,13 @@ public:
 
     PushqueueMap::iterator begin() { return batches.begin(); }
     PushqueueMap::iterator end() { return batches.end(); }
-    PushQueuePtr get_queue(const MYMQ_Public::TopicPartition& tp,size_t buffer_size) {
+    PushQueuePtr get_queue(const MYMQ_Public::TopicPartition& tp, size_t buffer_size, size_t max_queued_batches) {
         auto it = batches.find(tp);
         if (it != batches.end()) {
             return it->second;
         }
 
-        auto new_queue = std::make_shared<Push_queue>(tp,buffer_size);
+        auto new_queue = std::make_shared<Push_queue>(tp, buffer_size, max_queued_batches);
 
         // 原子插入
         auto result = batches.emplace(tp, new_queue);

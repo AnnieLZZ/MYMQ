@@ -73,6 +73,61 @@ using namespace MYMQ_Public;
                                   );
         return succ;
     }
+    
+    bool ClientBase::send_via(MYMQ::Network::Communication_client& channel, MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::Client::SparseCallback> cbs_)
+    {
+        size_t curr_fly = SIZE_MAX;
+        channel.get_curr_flying_request_num(curr_fly);
+        if (curr_fly >= max_in_flight_requests_num) {
+            return 0;
+        }
+
+        auto succ = channel.send_msg(static_cast<short>(event_type), msg_body,
+                                  [this, saved_cbs = std::move(cbs_)]
+                                  (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
+                                  {
+                                      auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
+
+                                      for (auto& sparse_item : saved_cbs) {
+                                          uint32_t msg_idx = sparse_item.relative_index;
+                                          auto& current_cb = sparse_item.cb;
+
+                                          std::visit([&](auto&& specific_cb) {
+                                              using CBType = std::decay_t<decltype(specific_cb)>;
+
+                                              if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>)
+                                              {
+                                                  if (auto* data = std::get_if<MYMQ_Public::PushResponce>(&resp)) {
+                                                      MYMQ_Public::PushResponce individual_resp = *data;
+                                                      individual_resp.offset = data->offset + msg_idx;
+                                                      specific_cb(individual_resp);
+                                                  }
+                                              }
+                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>)
+                                              {
+                                                  if (auto* data = std::get_if<MYMQ_Public::CommitAsyncResponce>(&resp)) {
+                                                      specific_cb(*data);
+                                                  }
+                                              }
+                                              else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>)
+                                              {
+                                                  if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
+                                                      specific_cb(*err);
+                                                  } else {
+                                                      specific_cb(MYMQ_Public::CommonErrorCode::Success);
+                                                  }
+                                              }
+                                              else
+                                              {
+                                                  static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
+                                              }
+
+                                          }, current_cb);
+                                      }
+                                  }
+                                  );
+        return succ;
+    }
 
 MYMQ_Consumeruse::MYMQ_Consumeruse(const std::string& clientid,uint8_t ack_level):ClientBase(MYMQ::run_directory_DEFAULT),path_(MYMQ::run_directory_DEFAULT),tbb_dctx_pool([]() {
         // 初始化函数：当新线程第一次访问时调用
@@ -82,6 +137,7 @@ MYMQ_Consumeruse::MYMQ_Consumeruse(const std::string& clientid,uint8_t ack_level
     Config_manager::ensure_path_existed(MYMQ::run_directory_DEFAULT);
     init(clientid,ack_level);
      cmc_.init();
+     cmc_fetch_.init();
 }
 MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
@@ -666,10 +722,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
 
             auto zstd_level_tmp= cm_sys.getint("zstd_level");
-            if(zstd_level_tmp > 1){
-                 zstd_level=1;
-                 cerr("ZSTD level capped at 1 to reduce CPU overhead (Configured: " + std::to_string(zstd_level_tmp) + ")");
-            } else if(!inrange(zstd_level_tmp,1,22)){
+            if(!inrange(zstd_level_tmp,0,22)){
                 zstd_level=MYMQ::zstd_level_DEFAULT;
             } else {
                 zstd_level=zstd_level_tmp;
@@ -682,6 +735,9 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                 cerr("Initialization : Invaild 'clientid' in config . Use default 'clientid' : "+MYMQ::CLIENTID_DEFAULT);
             }
             cmc_.set_clientid(tmp_clientid);
+            cmc_.set_channel_role(MYMQ_Public::ChannelRole::CONTROL);
+            cmc_fetch_.set_clientid(tmp_clientid);
+            cmc_fetch_.set_channel_role(MYMQ_Public::ChannelRole::FETCH);
             {
                 std::unique_lock<std::shared_mutex> ulock(info_basic.mtx);
                 info_basic.clientid=tmp_clientid;
@@ -693,15 +749,36 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                  cerr("Initialization : Invaild 'ack_level' in config . Use default 'ack_level' : "+std::to_string(MYMQ::ack_level_DEFAULT));
             }
             cmc_.set_ACK_level(static_cast<MYMQ::ACK_Level>(tmp_ack_level));
+            cmc_fetch_.set_ACK_level(static_cast<MYMQ::ACK_Level>(tmp_ack_level));
             ack_level_=static_cast<MYMQ::ACK_Level>(tmp_ack_level);
 
 
             size_t max_in_flight_requests_num_tmp= cm_sys.get_size_t("max_in_flight_requests_num");
-            if(!inrange(zstd_level_tmp,1,5000)){
+            if(!inrange(max_in_flight_requests_num_tmp,1,5000000)){
                 max_in_flight_requests_num_tmp=MYMQ:: MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT;
                 cerr("Initialization : Invaild 'max_in_flight_requests_num' in config . Use default 'max_in_flight_requests_num' : "+std::to_string(MYMQ:: MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT));
             }
             max_in_flight_requests_num=max_in_flight_requests_num_tmp;
+
+            size_t local_pollqueue_size_cfg = 20000000;
+            try {
+                local_pollqueue_size_cfg = cm_sys.get_size_t("local_pollqueue_size");
+            } catch (...) {
+                local_pollqueue_size_cfg = 20000000;
+            }
+
+            size_t high_bytes = local_pollqueue_size_cfg;
+            if (high_bytes > 0 && high_bytes < 1024 * 1024) {
+                high_bytes *= 1024;
+            }
+            if (!inrange(high_bytes, 1024 * 1024, 2ULL * 1024 * 1024 * 1024)) {
+                high_bytes = 20000000;
+            }
+            local_pollqueue_high_bytes = high_bytes;
+            local_pollqueue_low_bytes = high_bytes / 2;
+            if (local_pollqueue_low_bytes < 1024 * 1024) {
+                local_pollqueue_low_bytes = 1024 * 1024;
+            }
         }
 
 
@@ -849,7 +926,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                         }
                         
                         auto req = ClientProtocol::build_pull_packet(group_id, resp.topic, resp.partition, resp.next_offset, bytes);
-                        send(Eve::CLIENT_REQUEST_PULL, req);
+                        send_via(cmc_fetch_, Eve::CLIENT_REQUEST_PULL, req);
                     }
                 }
                 return MYMQ_Public::CommonErrorCode::Success;
@@ -889,7 +966,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                         TP_PointMap::accessor ac;
                         if (map_final_assign.insert(ac, tp)) {
                             ac->second.endoffset_ptr = std::make_shared<MYMQ::Client::Commitedoffset_point>(server_offset, tp);
-                            ac->second.pollqueue_ptr = std::make_shared<MYMQ::Client::PollBuffer>(20000000, 1000000000);
+                            ac->second.pollqueue_ptr = std::make_shared<MYMQ::Client::PollBuffer>(local_pollqueue_low_bytes, local_pollqueue_high_bytes);
                         }
                     }
 
@@ -1002,7 +1079,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                  size_t now_off= pollqueue.local_consume_offset.load();
                  size_t bytes= pull_fetch_min_bytes.load();
                     auto req = ClientProtocol::build_pull_packet(groupid, tp.topic, tp.partition, now_off, bytes);
-                    send(Eve::CLIENT_REQUEST_PULL, req);
+                    send_via(cmc_fetch_, Eve::CLIENT_REQUEST_PULL, req);
 
 
         }
@@ -1029,6 +1106,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         Config_manager::ensure_path_existed(MYMQ::run_directory_DEFAULT);
         init(clientid,ack_level);
         cmc_.init();
+        cmc_produce_.init();
     }
     MYMQ_Produceruse::~MYMQ_Produceruse(){
 
@@ -1053,7 +1131,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         }
 
 
-        auto it=recordaccumulator.get_queue(tp,local_push_buffer_size);
+        auto it=recordaccumulator.get_queue(tp, local_push_buffer_size, push_max_queued_batches);
 
         auto& push_queue=*it;
         std::unique_lock<std::mutex> ulock(push_queue.mtx);
@@ -1154,15 +1232,11 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
 
             auto zstd_level_tmp= cm_sys.getint("zstd_level");
-            if(!inrange(zstd_level_tmp,1,22)){
-                zstd_level_tmp=1;
+            if(!inrange(zstd_level_tmp,0,22)){
+                zstd_level=MYMQ::zstd_level_DEFAULT;
+            } else {
+                zstd_level=zstd_level_tmp;
             }
-            if(zstd_level_tmp > 1){
-                 zstd_level_tmp = 1;
-            }
-
-
-            zstd_level=zstd_level_tmp;
             dctx=ZSTD_createDCtx();
             auto tmp_clientid=clientid;
             if(!inrange(tmp_clientid.size(),1,30)){
@@ -1170,6 +1244,9 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                 cerr("Initialization : Invaild 'clientid' in config . Use default 'clientid' : "+MYMQ::CLIENTID_DEFAULT);
             }
             cmc_.set_clientid(tmp_clientid);
+            cmc_.set_channel_role(MYMQ_Public::ChannelRole::CONTROL);
+            cmc_produce_.set_clientid(tmp_clientid);
+            cmc_produce_.set_channel_role(MYMQ_Public::ChannelRole::PRODUCE);
             {
                 std::unique_lock<std::shared_mutex> ulock(info_basic.mtx);
                 info_basic.clientid=tmp_clientid;
@@ -1181,11 +1258,12 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                 cerr("Initialization : Invaild 'ack_level' in config . Use default 'ack_level' : "+std::to_string(MYMQ::ack_level_DEFAULT));
             }
             cmc_.set_ACK_level(static_cast<MYMQ::ACK_Level>(tmp_ack_level));
+            cmc_produce_.set_ACK_level(static_cast<MYMQ::ACK_Level>(tmp_ack_level));
             ack_level_=static_cast<MYMQ::ACK_Level>(tmp_ack_level);
 
 
             size_t max_in_flight_requests_num_tmp= cm_sys.get_size_t("max_in_flight_requests_num");
-            if(!inrange(max_in_flight_requests_num_tmp,1,5000)){
+            if(!inrange(max_in_flight_requests_num_tmp,1,5000000)){
                 max_in_flight_requests_num_tmp=MYMQ:: MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT;
                 cerr("Initialization : Invaild 'max_in_flight_requests_num' in config . Use default 'max_in_flight_requests_num' : "+std::to_string(MYMQ:: MAX_IN_FLIGHT_REQUEST_NUM_DEFAULT));
             }
@@ -1199,6 +1277,16 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             batch_size=cm_business.get_size_t("batch_size");
             autopush_perior_ms=cm_business.get_size_t ("autopush_perior_ms");
             local_push_buffer_size=cm_business.get_size_t("local_push_buffer_size");
+            size_t max_queued_batches_tmp = 5;
+            try {
+                max_queued_batches_tmp = cm_business.get_size_t("push_max_queued_batches");
+            } catch (...) {
+                max_queued_batches_tmp = 5;
+            }
+            if(!inrange(max_queued_batches_tmp,1,1024)){
+                max_queued_batches_tmp = 5;
+            }
+            push_max_queued_batches = max_queued_batches_tmp;
         }
 
         push_perioric_start();
@@ -1242,9 +1330,9 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
                 if (!final_packet.empty()) {
                     if (ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
-                        send(Eve::CLIENT_REQUEST_PUSH, final_packet, std::move(item->callbacks));
+                        send_via(cmc_produce_, Eve::CLIENT_REQUEST_PUSH, final_packet, std::move(item->callbacks));
                     } else {
-                        send(Eve::CLIENT_REQUEST_PUSH, final_packet);
+                        send_via(cmc_produce_, Eve::CLIENT_REQUEST_PUSH, final_packet);
                     }
                 }
             }
