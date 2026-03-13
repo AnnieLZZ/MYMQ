@@ -1124,7 +1124,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         }
 
         size_t curr_fly = SIZE_MAX;
-        cmc_.get_curr_flying_request_num(curr_fly);
+        cmc_produce_.get_curr_flying_request_num(curr_fly);
         if (curr_fly >= max_in_flight_requests_num) {
             cerr("[PUSH] FLYING REQUEST GOT TO LIMIT");
             return Err_Client::REACHED_MAX_FLYING_REQUEST;

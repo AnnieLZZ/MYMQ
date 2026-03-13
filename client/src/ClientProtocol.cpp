@@ -29,76 +29,80 @@ ProtocolResponse ClientProtocol::parse_response(MYMQ::EventType event_type, cons
         return MYMQ_Public::CommonErrorCode::UNKNOWN_SERVER_ERROR;
     }
 
-    MessageParser parser(msg_body.data(), msg_body.size());
+    try {
+        MessageParser parser(msg_body.data(), msg_body.size());
 
-    switch (event_type) {
-        case MYMQ::EventType::SERVER_RESPONSE_PUSH_ACK: {
-             std::string topic = parser.read_string();
-             uint64_t partition = parser.read_uint64();
-             auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
-             uint64_t offset = parser.read_uint64();
-             return MYMQ_Public::PushResponce(topic, partition, err, offset);
-        }
-        case MYMQ::EventType::SERVER_RESPONCE_COMMIT_OFFSET: {
-             std::string groupid = parser.read_string();
-             std::string topic = parser.read_string();
-             uint64_t partition = parser.read_uint64();
-             auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
-             uint64_t offset = parser.read_uint64();
-             
-             MYMQ_Public::CommitAsyncResponce r{groupid, {topic, partition}, offset, err};
-             return r;
-        }
-        case MYMQ::EventType::SERVER_RESPONSE_PULL_DATA: {
-             std::string topic = parser.read_string();
-             uint64_t partition = parser.read_uint64();
-             auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
-             uint64_t next_offset = parser.read_uint64();
-             uint64_t data_len = parser.read_uint64();
+        switch (event_type) {
+            case MYMQ::EventType::SERVER_RESPONSE_PUSH_ACK: {
+                 std::string topic = parser.read_string();
+                 uint64_t partition = parser.read_uint64();
+                 auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
+                 uint64_t offset = parser.read_uint64();
+                 return MYMQ_Public::PushResponce(topic, partition, err, offset);
+            }
+            case MYMQ::EventType::SERVER_RESPONCE_COMMIT_OFFSET: {
+                 std::string groupid = parser.read_string();
+                 std::string topic = parser.read_string();
+                 uint64_t partition = parser.read_uint64();
+                 auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
+                 uint64_t offset = parser.read_uint64();
+                 
+                 MYMQ_Public::CommitAsyncResponce r{groupid, {topic, partition}, offset, err};
+                 return r;
+            }
+            case MYMQ::EventType::SERVER_RESPONSE_PULL_DATA: {
+                 std::string topic = parser.read_string();
+                 uint64_t partition = parser.read_uint64();
+                 auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
+                 uint64_t next_offset = parser.read_uint64();
+                 uint64_t data_len = parser.read_uint64();
 
-             std::vector<unsigned char> batch;
-             if (data_len > 0) {
-                 if (parser.get_remaining_bytes() < data_len) {
-                     return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
+                 std::vector<unsigned char> batch;
+                 if (data_len > 0) {
+                     if (parser.get_remaining_bytes() < data_len) {
+                         return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
+                     }
+                     const auto* ptr = parser.get_current_ptr();
+                     batch.assign(ptr, ptr + data_len);
                  }
-                 const auto* ptr = parser.get_current_ptr();
-                 batch.assign(ptr, ptr + data_len);
-             }
 
-             return PullResponseData{topic, partition, err, next_offset, batch, 0};
-        }
-        case MYMQ::EventType::SERVER_RESPONCE_LEAVE_GROUP: {
-             auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
-             std::string group_id = parser.read_string();
-             return LeaveGroupResponse{group_id, err};
-        }
-        case MYMQ::EventType::SERVER_RESPONCE_HEARTBEAT: {
+                 return PullResponseData{topic, partition, err, next_offset, batch, 0};
+            }
+            case MYMQ::EventType::SERVER_RESPONCE_LEAVE_GROUP: {
                  auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
                  std::string group_id = parser.read_string();
-                 std::string member_id = parser.read_string();
-                 size_t generation_id = parser.read_size_t();
-                 
-                 std::vector<PartitionAssignment> assignments;
-                 if (err == MYMQ_Public::CommonErrorCode::UPDATE_GENERATION) {
-                     size_t topic_count = parser.read_size_t(); 
-                     for(size_t i=0; i<topic_count; ++i) {
-                         std::string topic = parser.read_string();
-                         size_t partition_count = parser.read_size_t();
-                         for(size_t j=0; j<partition_count; ++j){
-                             size_t part = parser.read_size_t();
-                             size_t end_off = parser.read_size_t();
-                             assignments.push_back({topic, part, end_off});
+                 return LeaveGroupResponse{group_id, err};
+            }
+            case MYMQ::EventType::SERVER_RESPONCE_HEARTBEAT: {
+                     auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
+                     std::string group_id = parser.read_string();
+                     std::string member_id = parser.read_string();
+                     size_t generation_id = parser.read_size_t();
+                     
+                     std::vector<PartitionAssignment> assignments;
+                     if (err == MYMQ_Public::CommonErrorCode::UPDATE_GENERATION) {
+                         size_t topic_count = parser.read_size_t(); 
+                         for(size_t i=0; i<topic_count; ++i) {
+                             std::string topic = parser.read_string();
+                             size_t partition_count = parser.read_size_t();
+                             for(size_t j=0; j<partition_count; ++j){
+                                 size_t part = parser.read_size_t();
+                                 size_t end_off = parser.read_size_t();
+                                 assignments.push_back({topic, part, end_off});
+                             }
                          }
                      }
-                 }
-                 return HeartbeatResponse{err, group_id, member_id, generation_id, assignments};
+                     return HeartbeatResponse{err, group_id, member_id, generation_id, assignments};
+                }
+            case MYMQ::EventType::SERVER_RESPONSE_CREATE_TOPIC: {
+                bool success = parser.read_bool();
+                return CreateTopicResponse{success};
             }
-        case MYMQ::EventType::SERVER_RESPONSE_CREATE_TOPIC: {
-            bool success = parser.read_bool();
-            return CreateTopicResponse{success};
+            default:
+                 return MYMQ_Public::CommonErrorCode::UNKNOWN_SERVER_ERROR;
         }
-        default:
-             return MYMQ_Public::CommonErrorCode::UNKNOWN_SERVER_ERROR;
+    } catch (...) {
+        return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
     }
 }
 
@@ -390,31 +394,28 @@ std::vector<unsigned char> ClientProtocol::build_push_packet(
         ZSTD_CCtx* cctx,
         int compression_level
     ) {
-    // 1. Topic & Partition
-    MessageBuilder mb;
-    mb.append_string(topic);
-    mb.append_uint64(partition);
-    
+    MessageBuilder mb_recordbatch;
+
     // Start of RecordBatch
-    size_t batch_start_idx = mb.data.size();
+    size_t batch_start_idx = mb_recordbatch.data.size();
     
     // --- Batch Header Placeholders ---
     // 1. Base Offset (8)
-    mb.append_int64(0); 
+    mb_recordbatch.append_int64(0); 
     
     // 2. Batch Length (4) - Placeholder
-    size_t batch_len_offset = mb.data.size();
-    mb.append_int32(0);
+    size_t batch_len_offset = mb_recordbatch.data.size();
+    mb_recordbatch.append_int32(0);
     
     // 3. Partition Leader Epoch (4)
-    mb.append_int32(0);
+    mb_recordbatch.append_int32(0);
     
     // 4. Magic (1)
-    mb.append_byte(2);
+    mb_recordbatch.append_byte(2);
     
     // 5. CRC (4) - Placeholder
-    size_t crc_offset = mb.data.size();
-    mb.append_uint32(0);
+    size_t crc_offset = mb_recordbatch.data.size();
+    mb_recordbatch.append_uint32(0);
     
     // 6. Attributes (2)
     // Bit 0~2: Compression Codec (0=None, 1=ZSTD)
@@ -422,43 +423,43 @@ std::vector<unsigned char> ClientProtocol::build_push_packet(
     if (compression_level > 0 && src_buf->size() > 0) {
         attributes |= 1; // ZSTD
     }
-    mb.append_int16(attributes);
+    mb_recordbatch.append_int16(attributes);
     
     // 7. Last Offset Delta (4)
     int32_t last_offset_delta = (src_buf->record_count_ > 0) ? (static_cast<int32_t>(src_buf->record_count_) - 1) : 0;
-    mb.append_int32(last_offset_delta);
+    mb_recordbatch.append_int32(last_offset_delta);
     
     // 8. First Timestamp (8)
     int64_t first_ts = src_buf->first_timestamp_;
     if (first_ts == -1) first_ts = 0; // Should handle empty batch case
-    mb.append_int64(first_ts);
+    mb_recordbatch.append_int64(first_ts);
     
     // 9. Max Timestamp (8) - Approximated as FirstTimestamp for now (or could be current time)
     // ideally BatchBuffer should track max timestamp.
-    mb.append_int64(first_ts);
+    mb_recordbatch.append_int64(first_ts);
     
     // 10. Producer ID (8)
-    mb.append_int64(-1);
+    mb_recordbatch.append_int64(-1);
     
     // 11. Producer Epoch (2)
-    mb.append_int16(-1);
+    mb_recordbatch.append_int16(-1);
     
     // 12. Base Sequence (4)
-    mb.append_int32(-1);
+    mb_recordbatch.append_int32(-1);
     
     // 13. Records Count (4)
-    mb.append_uint32(static_cast<uint32_t>(src_buf->record_count_));
+    mb_recordbatch.append_uint32(static_cast<uint32_t>(src_buf->record_count_));
     
     // --- Records Body ---
     if (compression_level > 0 && src_buf->size() > 0) {
         // Compress src_buf->data_
         size_t zstd_bound = ZSTD_compressBound(src_buf->size());
-        size_t current_size = mb.data.size();
-        mb.data.resize(current_size + zstd_bound);
+        size_t current_size = mb_recordbatch.data.size();
+        mb_recordbatch.data.resize(current_size + zstd_bound);
         
         size_t compressed_size = ZSTD_compressCCtx(
             cctx, 
-            mb.data.data() + current_size, 
+            mb_recordbatch.data.data() + current_size, 
             zstd_bound,
             src_buf->data_ptr(), 
             src_buf->size(),
@@ -468,12 +469,12 @@ std::vector<unsigned char> ClientProtocol::build_push_packet(
         if (ZSTD_isError(compressed_size)) {
             return {}; // Error
         }
-        mb.data.resize(current_size + compressed_size);
+        mb_recordbatch.data.resize(current_size + compressed_size);
     } else {
         // Raw Copy
-        size_t current_size = mb.data.size();
-        mb.data.resize(current_size + src_buf->size());
-        std::memcpy(mb.data.data() + current_size, src_buf->data_ptr(), src_buf->size());
+        size_t current_size = mb_recordbatch.data.size();
+        mb_recordbatch.data.resize(current_size + src_buf->size());
+        std::memcpy(mb_recordbatch.data.data() + current_size, src_buf->data_ptr(), src_buf->size());
     }
     
     // --- Fill Placeholders ---
@@ -482,29 +483,36 @@ std::vector<unsigned char> ClientProtocol::build_push_packet(
     // Batch Start is at batch_start_idx.
     // Length field is at batch_len_offset (size 4).
     // Length counts bytes AFTER the Length field.
-    size_t total_batch_size = mb.data.size() - batch_start_idx;
+    size_t total_batch_size = mb_recordbatch.data.size() - batch_start_idx;
     // Length field is 8 bytes into the batch (BaseOffset is 8).
     // So Length value = total_batch_size - 8 - 4 = total_batch_size - 12.
     int32_t batch_length_val = static_cast<int32_t>(total_batch_size - 12);
     
     // Rewrite Batch Length (Big Endian)
     uint32_t n_batch_len = htonl(batch_length_val);
-    std::memcpy(mb.data.data() + batch_len_offset, &n_batch_len, sizeof(uint32_t));
+    std::memcpy(mb_recordbatch.data.data() + batch_len_offset, &n_batch_len, sizeof(uint32_t));
     
     // B. CRC: Covers Attributes (offset 21 from batch start) to End
     // Header structure:
     // BaseOffset(8) + Length(4) + Epoch(4) + Magic(1) + CRC(4) + Attributes(2)...
     // 8+4+4+1+4 = 21 bytes. Attributes starts at index 21 relative to batch start.
     size_t crc_start_idx = batch_start_idx + 21; 
-    size_t crc_len = mb.data.size() - crc_start_idx;
+    size_t crc_len = mb_recordbatch.data.size() - crc_start_idx;
     
-    uint32_t crc_val = MYMQ::Crc32::calculate_crc32(mb.data.data() + crc_start_idx, crc_len);
+    uint32_t crc_val = MYMQ::Crc32::calculate_crc32(mb_recordbatch.data.data() + crc_start_idx, crc_len);
     // CRC32C usually, but let's stick to what Crc32 namespace provides.
     
     // Rewrite CRC (Big Endian)
     uint32_t n_crc = htonl(crc_val);
-    std::memcpy(mb.data.data() + crc_offset, &n_crc, sizeof(uint32_t));
-    
+    std::memcpy(mb_recordbatch.data.data() + crc_offset, &n_crc, sizeof(uint32_t));
+
+    const uint32_t outer_crc = MYMQ::Crc32::calculate_crc32(mb_recordbatch.data.data(), mb_recordbatch.data.size());
+
+    MessageBuilder mb;
+    mb.append_string(topic);
+    mb.append_uint64(partition);
+    mb.append_uint32(outer_crc);
+    mb.append_uchar_vector(mb_recordbatch.data);
     return mb.data;
 }
 
