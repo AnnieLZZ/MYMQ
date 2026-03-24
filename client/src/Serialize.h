@@ -16,7 +16,7 @@
 #define NOMINMAX
 #endif
 #include <winsock2.h>
-#include"zstd.h"
+#include <zstd.h>
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "zstd_static.lib")
 #else

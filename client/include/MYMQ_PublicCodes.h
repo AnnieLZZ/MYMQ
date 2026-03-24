@@ -42,6 +42,11 @@ enum class CommonErrorCode : uint16_t {
     UPDATE_GENERATION=4021,
     GENERATION_EXPIRED=4022,
 
+    QUEUE_FULL=4023,
+    PRODUCER_STOPPED=4024,
+    NETWORK_FATAL=4025,
+    TIMEOUT=4026,
+
 
 
     // Logsegment 错误
@@ -75,6 +80,10 @@ inline std::string to_string(CommonErrorCode code) {
     case CommonErrorCode::REQUEST_TIMEOUT: return "REQUEST_TIMEOUT";
     case CommonErrorCode::UNKNOWN_TOPICPARTITION: return "UNKNOWN_TOPICPARTITION";
     case CommonErrorCode::CLIENT_NOT_IN_GROUP: return "CLIENT_NOT_IN_GROUP";
+    case CommonErrorCode::QUEUE_FULL: return "QUEUE_FULL";
+    case CommonErrorCode::PRODUCER_STOPPED: return "PRODUCER_STOPPED";
+    case CommonErrorCode::NETWORK_FATAL: return "NETWORK_FATAL";
+    case CommonErrorCode::TIMEOUT: return "TIMEOUT";
     case CommonErrorCode::FULL_SEGMENT: return "FULL_SEGMENT";
     case CommonErrorCode::FAILED_ALLOCATE: return "FAILED_ALLOCATE";
     case CommonErrorCode::IO_ERROR: return "IO_ERROR";
@@ -101,7 +110,11 @@ enum class ClientErrorCode :uint16_t{
     REACHED_MAX_FLYING_REQUEST=1014,
     CRC_VERIFY_FAILED=1015,
     PARTIAL_PARASE_FAILED=1016,
-    NOT_REGISTER=1017
+    NOT_REGISTER=1017,
+    PRODUCER_STOPPED=1018,
+    QUEUE_FULL=1019,
+    TIMEOUT=1020,
+    NETWORK_FATAL=1021
 
 
 };
@@ -132,6 +145,10 @@ inline std::string to_string(ClientErrorCode code) {
     case ClientErrorCode::CRC_VERIFY_FAILED: return "CRC_VERIFY_FAILED"; // <-- 补齐
     case ClientErrorCode::PARTIAL_PARASE_FAILED: return "PARTIAL_PARASE_FAILED"; // <-- 补齐
     case ClientErrorCode::NOT_REGISTER: return "NOT_REGISTER"; // <-- 补齐
+    case ClientErrorCode::PRODUCER_STOPPED: return "PRODUCER_STOPPED";
+    case ClientErrorCode::QUEUE_FULL: return "QUEUE_FULL";
+    case ClientErrorCode::TIMEOUT: return "TIMEOUT";
+    case ClientErrorCode::NETWORK_FATAL: return "NETWORK_FATAL";
     default: return "UNKNOWN_CLIENT_ERROR_CODE (" + std::to_string(static_cast<uint16_t>(code)) + ")";
     }
 }

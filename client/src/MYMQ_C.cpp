@@ -25,6 +25,10 @@ void MYMQ_Producer::create_topic(std::string topicname, size_t parti_num) {
     pimpl->create_topic(topicname, parti_num);
 }
 
+void MYMQ_Producer::stop() {
+    pimpl->stop();
+}
+
 
 
 

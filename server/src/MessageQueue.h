@@ -56,7 +56,7 @@ public:
         curr_write_segment = segments_.back().get();
         uint64_t actual_max_offset_from_segments = 0;
         if (!segments_.empty()) {
-            actual_max_offset_from_segments = segments_.back()->next_offset()+segments_.back()->base_offset() ;
+            actual_max_offset_from_segments = segments_.back()->next_offset();
         }
         end_offset.store(actual_max_offset_from_segments);
         //因为这个只是便于查看endoffset的一个变量
@@ -279,29 +279,25 @@ public:
             MB mb_payload;
             mb_payload.append(kv.first);
             mb_payload.append_size_t(kv.second);
-            uint32_t payload_len = static_cast<uint32_t>(sizeof(uint64_t) + sizeof(uint64_t) + mb_payload.data.size());
-            uint32_t payload_len_net = htonl(payload_len);
-            std::vector<unsigned char> entry;
-            entry.resize(sizeof(uint64_t) + sizeof(uint32_t) + payload_len);
+            std::vector<unsigned char> payload;
+            payload.resize(sizeof(uint64_t) + sizeof(uint64_t) + mb_payload.data.size());
             uint64_t off_net = htonll(0);
-            std::memcpy(entry.data(), &off_net, sizeof(uint64_t));
-            std::memcpy(entry.data() + sizeof(uint64_t), &payload_len_net, sizeof(uint32_t));
-            std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t), &off_net, sizeof(uint64_t));
+            std::memcpy(payload.data(), &off_net, sizeof(uint64_t));
             uint64_t msg_num_net = htonll(1);
-            std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t), &msg_num_net, sizeof(uint64_t));
+            std::memcpy(payload.data() + sizeof(uint64_t), &msg_num_net, sizeof(uint64_t));
             if(!mb_payload.data.empty()){
-                std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t),
+                std::memcpy(payload.data() + sizeof(uint64_t) + sizeof(uint64_t),
                             mb_payload.data.data(),
                             mb_payload.data.size());
             }
-            auto res = curr_seg->append(Byte_view_pair{entry.data(), static_cast<uint32_t>(entry.size())});
+            auto res = curr_seg->append(Byte_view_pair{payload.data(), static_cast<uint32_t>(payload.size())});
             if (res.second == Err::FULL_SEGMENT) {
                 new_compacted.emplace_back(std::move(curr_seg));
-                uint64_t next_base = new_compacted.back()->base_offset() + new_compacted.back()->next_offset();
+                uint64_t next_base = new_compacted.back()->next_offset();
                 std::string new_log_file_path = partition_data_dir_ + "/" + LogSegment::compute_filename(next_base) + ".log";
                 std::string new_index_file_path = partition_data_dir_ + "/" + LogSegment::compute_filename(next_base) + ".index";
                 curr_seg = std::make_unique<LogSegment>(new_log_file_path, new_index_file_path, next_base);
-                auto res2 = curr_seg->append(Byte_view_pair{entry.data(), static_cast<uint32_t>(entry.size())});
+                auto res2 = curr_seg->append(Byte_view_pair{payload.data(), static_cast<uint32_t>(payload.size())});
                 (void)res2;
             }
         }
@@ -1076,9 +1072,10 @@ private:
     void start_server(){
 
         server_.set_client_message_callback(
-                    [this](TcpSession session, const std::vector<unsigned char>& header, std::vector<unsigned char>&& msg_body) {
+                    [this](TcpSession session, const std::vector<unsigned char>& header, std::shared_ptr<std::vector<unsigned char>> msg_body) {
             
             if (header.size() < 12) return;
+            if (!msg_body) return;
             MessageParser mp_header(header.data(), header.size());
             mp_header.skip(4); // Skip TotalLen
             uint16_t event_type_short = mp_header.read_uint16();
@@ -1088,7 +1085,7 @@ private:
             MYMQ::EventType type = static_cast<MYMQ::EventType>(event_type_short);
 
             cerr("["+std::to_string(correlation_id)+"]["+session.get_clientid()+"]"+ MYMQ::to_string(type)+" called.");
-            MessageParser mp(msg_body.data(),msg_body.size());
+            MessageParser mp(msg_body->data(),msg_body->size());
             mp.skip(4);
             if(type==MYMQ::EventType::CLIENT_REQUEST_PULL){
 
@@ -1214,28 +1211,20 @@ private:
                     MB mb_payload;
                     mb_payload.append(key_gtp);
                     mb_payload.append_size_t(offset_digit);
-
-                    uint32_t payload_len = static_cast<uint32_t>(sizeof(uint64_t) + sizeof(uint64_t) + mb_payload.data.size());
-                    uint32_t payload_len_net = htonl(payload_len);
-
-                    std::vector<unsigned char> entry;
-                    entry.resize(sizeof(uint64_t) + sizeof(uint32_t) + payload_len);
-
+                    std::vector<unsigned char> payload;
+                    payload.resize(sizeof(uint64_t) + sizeof(uint64_t) + mb_payload.data.size());
                     uint64_t off_net = htonll(0);
-                    std::memcpy(entry.data(), &off_net, sizeof(uint64_t));
-                    std::memcpy(entry.data() + sizeof(uint64_t), &payload_len_net, sizeof(uint32_t));
-
-                    std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t), &off_net, sizeof(uint64_t));
+                    std::memcpy(payload.data(), &off_net, sizeof(uint64_t));
                     uint64_t msg_num_net = htonll(1);
-                    std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t), &msg_num_net, sizeof(uint64_t));
+                    std::memcpy(payload.data() + sizeof(uint64_t), &msg_num_net, sizeof(uint64_t));
 
                     if(!mb_payload.data.empty()){
-                        std::memcpy(entry.data() + sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint64_t) + sizeof(uint64_t),
+                        std::memcpy(payload.data() + sizeof(uint64_t) + sizeof(uint64_t),
                                     mb_payload.data.data(),
                                     mb_payload.data.size());
                     }
 
-                    auto persist_err= consumer_offset_manager_ptr_->commit_sync(consumeroffset_parid_hash, Byte_view_pair{entry.data(), static_cast<uint32_t>(entry.size())});
+                    auto persist_err= consumer_offset_manager_ptr_->commit_sync(consumeroffset_parid_hash, Byte_view_pair{payload.data(), static_cast<uint32_t>(payload.size())});
                     if(persist_err!=Err::NULL_ERROR){
                         error=persist_err;
                     }
@@ -1449,7 +1438,7 @@ private:
          mb_metadata.append(topic);
          mb_metadata.append_size_t(partition);
          mb_metadata.append_uint16(0); // ErrorCode = 0 (Success)
-         mb_metadata.append_size_t(offset);
+         mb_metadata.append_size_t(loc.offset_next_to_consume);
          mb_metadata.append_size_t(loc.length); // Data Length
 
          MB mb_prefix;

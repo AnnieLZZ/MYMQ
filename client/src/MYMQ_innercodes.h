@@ -27,14 +27,25 @@
 #include<deque>
 #include <string>
 #include"zlib.h"
-#include"zstd.h"
+#include <zstd.h>
 #include"../src/Serialize.h"
 #include <ctime>
 #include <iomanip>
 #include<functional>
 #include"MYMQ_Publiccodes.h"
+#include "BufferPool.h"
 #include"tbb/concurrent_unordered_map.h"
 #include<memory>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <windows.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
+#endif
 
 
 namespace MYMQ { // 推荐使用命名空间进一步封装
@@ -310,17 +321,24 @@ struct Record{
 
 class BatchBuffer {//生产者用的
 public:
-    std::vector<unsigned char> data_;
+    MYMQ::Client::BufferPool::Block block_{};
+    unsigned char* data_ = nullptr;
+    size_t capacity_ = 0;
     size_t write_pos_ = 0; // 当前写到了哪里
     size_t record_count_ = 0;
     int64_t first_timestamp_ = -1; // For calculating timestamp delta
 
-    // 初始化时直接分配固定大小（比如 1MB），禁止后续扩容
-    explicit BatchBuffer(size_t capacity) {
-        data_.resize(capacity);
+    explicit BatchBuffer(size_t capacity) : capacity_(capacity) {
         write_pos_ = 0;
         first_timestamp_ = -1;
     }
+
+    ~BatchBuffer() {
+        release();
+    }
+
+    BatchBuffer(const BatchBuffer&) = delete;
+    BatchBuffer& operator=(const BatchBuffer&) = delete;
 
     // 重置 Buffer（复用时调用，不释放内存）
     void clear() {
@@ -329,16 +347,36 @@ public:
         first_timestamp_ = -1;
     }
 
+    bool ensure_allocated_for(std::chrono::milliseconds timeout) {
+        if (data_ != nullptr && capacity_ > 0) return true;
+        MYMQ::Client::BufferPool::Block blk;
+        if (!MYMQ::Client::BufferPool::instance().try_allocate_for(capacity_, timeout, blk)) {
+            return false;
+        }
+        block_ = blk;
+        data_ = reinterpret_cast<unsigned char*>(block_.data);
+        return true;
+    }
+
+    void release() {
+        if (!block_.valid()) return;
+        MYMQ::Client::BufferPool::instance().release(block_);
+        data_ = nullptr;
+        write_pos_ = 0;
+        record_count_ = 0;
+        first_timestamp_ = -1;
+    }
+
     // 检查剩余空间是否足够
     bool has_capacity_for(size_t size_needed) const {
-        return (write_pos_ + size_needed) <= data_.size();
+        return (write_pos_ + size_needed) <= capacity_;
     }
 
     // 返回有效数据大小
     size_t size() const { return write_pos_; }
 
     // 返回数据指针（给 ZSTD 用）
-    const void* data_ptr() const { return data_.data(); }
+    const void* data_ptr() const { return data_; }
 
     // Helper: Calculate Varint Size (ZigZag)
     static size_t varint_size(int64_t value) {
@@ -364,6 +402,7 @@ public:
     // --- 核心：替代 build_Record 的逻辑 ---
     // 返回 true 表示写入成功，false 表示空间不足
     bool append_record(const std::string& key, const std::string& value) {
+        if (data_ == nullptr) return false;
         // 1. Calculate Timestamps
         auto now = std::chrono::system_clock::now();
         int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
@@ -392,7 +431,7 @@ public:
         size_t total_size_needed = sz_length + body_size;
 
         // 3. Check Capacity
-        if (write_pos_ + total_size_needed > data_.size()) {
+        if (write_pos_ + total_size_needed > capacity_) {
             return false;
         }
 
@@ -412,14 +451,14 @@ public:
         // Key
         write_varint_unsafe(static_cast<int64_t>(key_len));
         if (key_len > 0) {
-            std::memcpy(data_.data() + write_pos_, key.data(), key_len);
+            std::memcpy(data_ + write_pos_, key.data(), key_len);
             write_pos_ += key_len;
         }
 
         // Value
         write_varint_unsafe(static_cast<int64_t>(val_len));
         if (val_len > 0) {
-            std::memcpy(data_.data() + write_pos_, value.data(), val_len);
+            std::memcpy(data_ + write_pos_, value.data(), val_len);
             write_pos_ += val_len;
         }
 
@@ -435,7 +474,13 @@ public:
 
 }
 
-using ResponseCallback = std::function<void(uint16_t event_type, std::vector<unsigned char> msg_body)>;
+struct OwnedBytes {
+    const unsigned char* data = nullptr;
+    size_t size = 0;
+    std::shared_ptr<void> owner{};
+};
+
+using ResponseCallback = std::function<void(uint16_t event_type, OwnedBytes msg_body)>;
 struct PendingMessage {
     std::vector<unsigned char> message_bytes;
     size_t offset;
@@ -515,7 +560,6 @@ struct Push_queue {
     // Ready queue (full buffers waiting to be flushed)
     std::deque<std::unique_ptr<BatchItem>> ready_queue;
 
-    // Free pool (reusable empty buffers)
     std::vector<std::unique_ptr<BatchBuffer>> free_pool;
 
     bool is_flushing = false; // Flag to ensure only one flush task per partition runs at a time
@@ -531,8 +575,7 @@ struct Push_queue {
         : tp(tp), buffer_size_(buffer_size), max_queued_batches_(max_queued_batches)
     {
         cctx = ZSTD_createCCtx();
-        // Initialize active buffer
-        active_buf = std::make_unique<BatchBuffer>(buffer_size);
+        active_buf = std::make_unique<BatchBuffer>(buffer_size_);
     }
 
     ~Push_queue() {
@@ -553,7 +596,7 @@ struct Commitedoffset_point
 
 
 class PollBuffer {
-    using Chuckitem= std::pair<size_t,std::vector<unsigned char>> ;
+    using Chuckitem= std::pair<size_t, OwnedBytes> ;
 public:
 
     mutable std::atomic<size_t> local_consume_offset{0};
@@ -599,7 +642,7 @@ public:
         target = std::move(item);
 
 
-        size_t popped_size = target.second.size();
+        size_t popped_size = target.second.size;
         queue_.pop_front();
 
         size_t current = curr_size.fetch_sub(popped_size, std::memory_order_relaxed) - popped_size;
@@ -613,10 +656,10 @@ public:
         return true;
     }
 
-    void push(std::vector<unsigned char>& obj,size_t record_num_of_chuck) {
+    void push(OwnedBytes obj,size_t record_num_of_chuck) {
         std::lock_guard<std::mutex> ulock(mtx);
 
-        size_t obj_size = obj.size();
+        size_t obj_size = obj.size;
         queue_.emplace_back(record_num_of_chuck,std::move(obj));
 
         // 更新大小
@@ -656,7 +699,6 @@ private:
 
 public:
 
-
     PushqueueMap::iterator begin() { return batches.begin(); }
     PushqueueMap::iterator end() { return batches.end(); }
     PushQueuePtr get_queue(const MYMQ_Public::TopicPartition& tp, size_t buffer_size, size_t max_queued_batches) {
@@ -664,7 +706,6 @@ public:
         if (it != batches.end()) {
             return it->second;
         }
-
         auto new_queue = std::make_shared<Push_queue>(tp, buffer_size, max_queued_batches);
 
         // 原子插入

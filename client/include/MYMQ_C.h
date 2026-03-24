@@ -39,6 +39,7 @@ public:
                     MYMQ_Public::PushResponceCallback cb=MYMQ_Public::PushResponceCallback());
 
     void create_topic(std::string topicname, size_t parti_num = 1);
+    void stop();
 
 private:
     // 2. 唯一的成员变量：指向实现的指针

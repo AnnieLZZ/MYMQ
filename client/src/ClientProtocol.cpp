@@ -24,13 +24,21 @@ namespace Client {
 #endif
 #endif
 
-ProtocolResponse ClientProtocol::parse_response(MYMQ::EventType event_type, const std::vector<unsigned char>& msg_body) {
-    if (msg_body.empty() && event_type != MYMQ::EventType::CLIENT_REQUEST_HEARTBEAT) {
+ProtocolResponse ClientProtocol::parse_response(MYMQ::EventType event_type, const MYMQ::OwnedBytes& msg_body) {
+    if (event_type == MYMQ::EventType::EVENTTYPE_NULL) {
+        if (msg_body.size >= 2) {
+            MessageParser parser(msg_body.data, msg_body.size);
+            auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
+            return err;
+        }
+        return MYMQ_Public::CommonErrorCode::UNKNOWN_SERVER_ERROR;
+    }
+    if ((msg_body.data == nullptr || msg_body.size == 0) && event_type != MYMQ::EventType::CLIENT_REQUEST_HEARTBEAT) {
         return MYMQ_Public::CommonErrorCode::UNKNOWN_SERVER_ERROR;
     }
 
     try {
-        MessageParser parser(msg_body.data(), msg_body.size());
+        MessageParser parser(msg_body.data, msg_body.size);
 
         switch (event_type) {
             case MYMQ::EventType::SERVER_RESPONSE_PUSH_ACK: {
@@ -57,16 +65,16 @@ ProtocolResponse ClientProtocol::parse_response(MYMQ::EventType event_type, cons
                  uint64_t next_offset = parser.read_uint64();
                  uint64_t data_len = parser.read_uint64();
 
-                 std::vector<unsigned char> batch;
+                 MYMQ::OwnedBytes batch{};
                  if (data_len > 0) {
                      if (parser.get_remaining_bytes() < data_len) {
                          return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
                      }
                      const auto* ptr = parser.get_current_ptr();
-                     batch.assign(ptr, ptr + data_len);
+                     batch = MYMQ::OwnedBytes{ptr, static_cast<size_t>(data_len), msg_body.owner};
                  }
 
-                 return PullResponseData{topic, partition, err, next_offset, batch, 0};
+                 return PullResponseData{topic, partition, err, next_offset, batch, batch.size > 0 ? 1U : 0U};
             }
             case MYMQ::EventType::SERVER_RESPONCE_LEAVE_GROUP: {
                  auto err = static_cast<MYMQ_Public::CommonErrorCode>(parser.read_uint16());
@@ -106,10 +114,18 @@ ProtocolResponse ClientProtocol::parse_response(MYMQ::EventType event_type, cons
     }
 }
 
-MYMQ_Public::CommonErrorCode ClientProtocol::parse_record_batch(const std::vector<unsigned char>& raw_batch, ZSTD_DCtx* dctx, std::vector<MYMQ_Public::ConsumerRecord>& out_records, const MYMQ_Public::TopicPartition& tp) {
-    if (raw_batch.size() < 12) return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
+MYMQ_Public::CommonErrorCode ClientProtocol::parse_record_batch(
+    const MYMQ::OwnedBytes& raw_batch,
+    ZSTD_DCtx* dctx,
+    std::vector<MYMQ_Public::ConsumerRecord>& out_records,
+    const MYMQ_Public::TopicPartition& tp
+) {
+    if (raw_batch.data == nullptr || raw_batch.size == 0) {
+        return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
+    }
+    if (raw_batch.size < 12) return MYMQ_Public::CommonErrorCode::FAILED_PARASE_PULL_DATA;
 
-    MessageParser parser(raw_batch.data(), raw_batch.size());
+    MessageParser parser(raw_batch.data, raw_batch.size);
     
     // Header Parsing
     // 1. Batch Base Offset (8)
@@ -196,69 +212,35 @@ MYMQ_Public::CommonErrorCode ClientProtocol::parse_record_batch(const std::vecto
     // ----------------------------------------------------------------------
     out_records.reserve(records_count);
     
-    // Shared pointer to owner (original batch or decompressed buffer)
-    // If compressed, owner is the decompressed_buffer (we need to keep it alive)
-    // If not compressed, owner is likely the raw_batch passed in? 
-    // Actually, `raw_batch` is const ref, we can't share ownership of it easily unless we copy it or the caller keeps it.
-    // The `ConsumerRecord` expects `std::shared_ptr<void> data_owner`.
-    // We should copy the data if we want to be safe, OR we rely on the fact that `out_records` 
-    // will copy string_views into strings? 
-    // Wait, `ConsumerRecord` stores `string_view` AND `std::shared_ptr<void> owner`.
-    // So we MUST provide an owner that holds the data.
-    
-    std::shared_ptr<std::vector<unsigned char>> data_owner;
+    std::shared_ptr<void> data_owner;
     if (is_compressed) {
-        data_owner = std::make_shared<std::vector<unsigned char>>(std::move(decompressed_buffer));
-        parser = MessageParser(data_owner->data(), data_owner->size());
+        auto decompressed_owner = std::make_shared<std::vector<unsigned char>>(std::move(decompressed_buffer));
+        data_owner = decompressed_owner;
+        parser = MessageParser(decompressed_owner->data(), decompressed_owner->size());
     } else {
-        // If not compressed, the data is in `raw_batch`. 
-        // We need to copy it to a shared_ptr because `raw_batch` lifespan is not guaranteed beyond this function.
-        // Or we copy the relevant part.
-        // Ideally we should have a zero-copy mechanism from the network buffer.
-        // For now, let's copy the raw batch to ensure safety.
-        data_owner = std::make_shared<std::vector<unsigned char>>(raw_batch);
-        // We need to advance parser to the records part in the NEW copy
-        parser = MessageParser(data_owner->data(), data_owner->size());
-        // Skip header
+        data_owner = raw_batch.owner;
+        parser = MessageParser(raw_batch.data, raw_batch.size);
         parser.skip(8+4+4+1+4+2+4+8+8+8+2+4+4); 
     }
 
-    const unsigned char* base_ptr = is_compressed ? data_owner->data() : data_owner->data(); // Correct base for offsets
-
     for (uint32_t i = 0; i < records_count; ++i) {
         try {
-            // Record Parsing (Varint Lengths)
-            size_t record_start_offset = parser.get_offset();
-            
-            // 1. Length (signed varint)
-            int64_t length = parser.read_varint(); 
-            
-            // 2. Attributes (1 byte)
-            int8_t attributes = parser.read_byte();
-            
-            // 3. Timestamp Delta (signed varint)
+            parser.read_varint();
+            parser.read_byte();
             int64_t timestamp_delta = parser.read_varint();
-            
-            // 4. Offset Delta (signed varint)
             int64_t offset_delta = parser.read_varint();
-            
-            // 5. Key Length (signed varint)
             int64_t key_length = parser.read_varint();
             const char* key_ptr = nullptr;
             if (key_length >= 0) {
                 key_ptr = reinterpret_cast<const char*>(parser.get_current_ptr());
                 parser.skip(key_length);
             }
-            
-            // 6. Value Length (signed varint)
             int64_t value_length = parser.read_varint();
             const char* value_ptr = nullptr;
             if (value_length >= 0) {
                 value_ptr = reinterpret_cast<const char*>(parser.get_current_ptr());
                 parser.skip(value_length);
             }
-            
-            // 7. Headers (Varint count)
             int64_t header_count = parser.read_varint();
             for (int h = 0; h < header_count; ++h) {
                 int64_t header_key_len = parser.read_varint();
@@ -266,14 +248,12 @@ MYMQ_Public::CommonErrorCode ClientProtocol::parse_record_batch(const std::vecto
                 int64_t header_val_len = parser.read_varint();
                 parser.skip(header_val_len);
             }
-
-            // Construct Record
             std::string_view key_view = (key_length > 0) ? std::string_view(key_ptr, key_length) : std::string_view();
             std::string_view value_view = (value_length > 0) ? std::string_view(value_ptr, value_length) : std::string_view();
             
             out_records.emplace_back(
-                tp.topic, // Topic (filled by caller)
-                tp.partition,  // Partition (filled by caller)
+                tp.topic,
+                tp.partition,
                 key_view,
                 value_view,
                 first_timestamp + timestamp_delta,

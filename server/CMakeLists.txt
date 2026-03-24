@@ -18,6 +18,33 @@ find_package(ZLIB REQUIRED)
 # 使用 pkg-config 查找 libzstd
 pkg_check_modules(Zstd REQUIRED libzstd)
 
+set(MYMQ_MIMALLOC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/mimalloc")
+set(MYMQ_MIMALLOC_LINK_TARGET "")
+if(EXISTS "${MYMQ_MIMALLOC_DIR}/share/mimalloc/mimalloc-config.cmake")
+    list(APPEND CMAKE_PREFIX_PATH "${MYMQ_MIMALLOC_DIR}")
+    find_package(mimalloc CONFIG QUIET)
+    if(TARGET mimalloc-static)
+        set(MYMQ_MIMALLOC_LINK_TARGET mimalloc-static)
+    elseif(TARGET mimalloc)
+        set(MYMQ_MIMALLOC_LINK_TARGET mimalloc)
+    endif()
+endif()
+if(MYMQ_MIMALLOC_LINK_TARGET STREQUAL "")
+    find_library(MYMQ_MIMALLOC_LIBRARY
+        NAMES mimalloc mimalloc-static
+        PATHS "${MYMQ_MIMALLOC_DIR}/lib" "${MYMQ_MIMALLOC_DIR}/debug/lib"
+        NO_DEFAULT_PATH
+    )
+    if(MYMQ_MIMALLOC_LIBRARY)
+        add_library(mymq_mimalloc UNKNOWN IMPORTED)
+        set_target_properties(mymq_mimalloc PROPERTIES
+            IMPORTED_LOCATION "${MYMQ_MIMALLOC_LIBRARY}"
+            INTERFACE_INCLUDE_DIRECTORIES "${MYMQ_MIMALLOC_DIR}/include"
+        )
+        set(MYMQ_MIMALLOC_LINK_TARGET mymq_mimalloc)
+    endif()
+endif()
+
 # ============================================================
 # (核心修改) OpenSSL 查找逻辑：优先手动查找 OpenSSL 3
 # ============================================================
@@ -95,6 +122,7 @@ target_include_directories(MYMQ
       # 显式添加 OpenSSL include 路径 (如果是手动找到的，这一步很关键)
       ${OPENSSL_INCLUDE_DIR}
       ${CMAKE_CURRENT_BINARY_DIR}/generated
+      $<$<BOOL:${MYMQ_MIMALLOC_LINK_TARGET}>:${MYMQ_MIMALLOC_DIR}/include>
 )
 
 # 链接所有依赖
@@ -113,6 +141,7 @@ target_link_libraries(MYMQ
       OpenSSL::SSL    # 链接我们上面定义的目标
       OpenSSL::Crypto
       dl              # OpenSSL 3 在 Linux 上通常需要链接 libdl
+      ${MYMQ_MIMALLOC_LINK_TARGET}
 )
 
 # --- 6. 创建可执行文件 ---

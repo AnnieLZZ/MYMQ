@@ -19,7 +19,7 @@ using namespace MYMQ_Public;
         // 2. 发送消息并挂载回调
         auto succ = cmc_.send_msg(static_cast<short>(event_type), msg_body,
                                   [this, saved_cbs = std::move(cbs_)] // 捕获稀疏列表
-                                  (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
+                                  (uint16_t event_type_responce, MYMQ::OwnedBytes msg_body_responce) mutable
                                   {
                                       // 解析响应
                                       auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
@@ -84,7 +84,7 @@ using namespace MYMQ_Public;
 
         auto succ = channel.send_msg(static_cast<short>(event_type), msg_body,
                                   [this, saved_cbs = std::move(cbs_)]
-                                  (uint16_t event_type_responce, const Mybyte& msg_body_responce) mutable
+                                  (uint16_t event_type_responce, MYMQ::OwnedBytes msg_body_responce) mutable
                                   {
                                       auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
 
@@ -140,15 +140,30 @@ MYMQ_Consumeruse::MYMQ_Consumeruse(const std::string& clientid,uint8_t ack_level
      cmc_fetch_.init();
 }
 MYMQ_Consumeruse::~MYMQ_Consumeruse(){
-
-     out_group_reset();
-    cv_commit_ready.notify_all();
-    cv_poll_ready.notify_all();
+    stop();
 
     for (ZSTD_DCtx* ctx : tbb_dctx_pool) {
         ZSTD_freeDCtx(ctx);
     }
 
+}
+
+void MYMQ_Consumeruse::stop() {
+    bool expected = false;
+    if (!stopped_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    out_group_reset();
+    {
+        std::lock_guard<std::mutex> lock(mtx_poll_ready);
+        poll_ready.store(true);
+    }
+    cv_poll_ready.notify_all();
+    commit_ready.store(true);
+    cv_commit_ready.notify_all();
+    cmc_fetch_.stop();
+    cmc_.stop();
 }
 
 
@@ -207,22 +222,18 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
     // 2. 完整的 Consumer (解析)
     // ----------------------------------------------------------------------
     void MYMQ_Consumeruse::call_parse_impl(
-        const std::vector<unsigned char>& raw_big_chunk,
+        const MYMQ::OwnedBytes& raw_big_chunk_owner,
         std::vector<MYMQ_Public::ConsumerRecord>& out_records,
         const MYMQ::Client::TopicPartition& tp,
         Err_Client& out_error
         ) {
         out_error = Err_Client::Success;
 
-        if (raw_big_chunk.empty()) return;
+        if (raw_big_chunk_owner.data == nullptr || raw_big_chunk_owner.size == 0) return;
 
         ZSTD_DCtx* dctx = tbb_dctx_pool.local();
-        
-        // 记录当前记录数，以便后续填充 Topic/Partition
-        size_t start_idx = out_records.size();
 
-        // 调用协议层解析
-        auto ret = ClientProtocol::parse_record_batch(raw_big_chunk, dctx, out_records, tp);
+        auto ret = ClientProtocol::parse_record_batch(raw_big_chunk_owner, dctx, out_records, tp);
 
         if (ret != MYMQ_Public::CommonErrorCode::Success) {
             out_error = Err_Client::UNKNOWN_ERROR; // 简单映射错误
@@ -265,19 +276,19 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
                 // 变更点 4: 适配 try_pop 返回 pair<size_t, vector>
                 // first: 记录条数, second: 二进制数据块
-                std::pair<size_t, std::vector<unsigned char>> popped_data;
+                std::pair<size_t, MYMQ::OwnedBytes> popped_data;
 
                 if (tp_point.pollqueue_ptr->try_pop(popped_data)) {
                     size_t batch_rec_num = popped_data.first;
-                    std::vector<unsigned char>& raw_chunk = popped_data.second;
+                    MYMQ::OwnedBytes raw_chunk = std::move(popped_data.second);
 
                     // 只有 vector 非空才处理（防御性编程）
-                    if (!raw_chunk.empty()) {
+                    if (raw_chunk.data != nullptr && raw_chunk.size > 0) {
                         if (active_item_count < m_todo_cache.size()) {
                             auto& item = m_todo_cache[active_item_count];
                             item.index = active_item_count;
                             item.tp = tp;
-                            item.raw_big_chunk = std::move(raw_chunk); // 移动语义
+                            item.raw_big_chunk_owner = std::move(raw_chunk);
                             item.err = Err_Client::Success;
                             item.parsed_records.clear();
                         }
@@ -353,7 +364,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         // 代码保持不变，解析逻辑通常不依赖于前面的计数方式
         tbb::parallel_for_each(m_todo_cache.begin(), m_todo_cache.begin() + active_item_count,
                                [this](Workitem& item) {
-                                   this->call_parse_impl(item.raw_big_chunk, item.parsed_records, item.tp, item.err);
+                                   this->call_parse_impl(item.raw_big_chunk_owner, item.parsed_records, item.tp, item.err);
                                });
 
         bool has_partial_error = false;
@@ -431,20 +442,20 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             for (auto& [tp, tp_point] : map_final_assign) {
 
                 // [同步更新] 适配 try_pop 返回 pair
-                std::pair<size_t, std::vector<unsigned char>> popped_data;
+                std::pair<size_t, MYMQ::OwnedBytes> popped_data;
 
                 // try_pop 是内存/锁操作，属于有效工作时间
                 if (tp_point.pollqueue_ptr->try_pop(popped_data)) {
                     size_t batch_rec_num = popped_data.first;
-                    std::vector<unsigned char>& raw_chunk = popped_data.second;
+                    MYMQ::OwnedBytes raw_chunk = std::move(popped_data.second);
 
-                    if (!raw_chunk.empty()) {
+                    if (raw_chunk.data != nullptr && raw_chunk.size > 0) {
                         // 缓存复用逻辑
                         if (active_item_count < m_todo_cache.size()) {
                             auto& item = m_todo_cache[active_item_count];
                             item.index = active_item_count;
                             item.tp = tp;
-                            item.raw_big_chunk = std::move(raw_chunk);
+                            item.raw_big_chunk_owner = std::move(raw_chunk);
                             item.err = Err_Client::Success;
                             item.parsed_records.clear();
                         }
@@ -521,7 +532,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         // CPU 密集型操作，属于有效工作时间
         tbb::parallel_for_each(m_todo_cache.begin(), m_todo_cache.begin() + active_item_count,
                                [this](Workitem& item) {
-                                   this->call_parse_impl(item.raw_big_chunk, item.parsed_records, item.tp, item.err);
+                                   this->call_parse_impl(item.raw_big_chunk_owner, item.parsed_records, item.tp, item.err);
                                });
 
         bool has_partial_error = false;
@@ -734,10 +745,21 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                 tmp_clientid=MYMQ::CLIENTID_DEFAULT;
                 cerr("Initialization : Invaild 'clientid' in config . Use default 'clientid' : "+MYMQ::CLIENTID_DEFAULT);
             }
+            auto make_role_clientid = [](const std::string& base, const std::string& suffix) {
+                constexpr size_t kMaxClientIdLen = 30;
+                if (suffix.size() >= kMaxClientIdLen) {
+                    return suffix.substr(0, kMaxClientIdLen);
+                }
+                if (base.size() + suffix.size() <= kMaxClientIdLen) {
+                    return base + suffix;
+                }
+                return base.substr(0, kMaxClientIdLen - suffix.size()) + suffix;
+            };
             cmc_.set_clientid(tmp_clientid);
             cmc_.set_channel_role(MYMQ_Public::ChannelRole::CONTROL);
-            cmc_fetch_.set_clientid(tmp_clientid);
+            cmc_fetch_.set_clientid(make_role_clientid(tmp_clientid, "#fetch"));
             cmc_fetch_.set_channel_role(MYMQ_Public::ChannelRole::FETCH);
+            cmc_fetch_.set_request_timeout_ms(60000);
             {
                 std::unique_lock<std::shared_mutex> ulock(info_basic.mtx);
                 info_basic.clientid=tmp_clientid;
@@ -792,7 +814,12 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             join_collect_timeout_ms=MYMQ::join_collect_timeout_ms;
             memberid_wait_timeout_s=MYMQ::memberid_ready_timeout_s;
             commit_wait_timeout_s=MYMQ::commit_ready_timeout_s;
-            pull_fetch_min_bytes=cm_business.get_size_t("pull_fetch_min_bytes");
+            size_t pull_fetch_min_bytes_cfg = cm_business.get_size_t("pull_fetch_min_bytes");
+            if (pull_fetch_min_bytes_cfg <= 1 || pull_fetch_min_bytes_cfg > MYMQ::pull_bytes_max) {
+                pull_fetch_min_bytes_cfg = MYMQ::pull_bytes_max;
+                cerr("Initialization : Invaild 'pull_fetch_min_bytes' in config . Clamp to " + std::to_string(MYMQ::pull_bytes_max));
+            }
+            pull_fetch_min_bytes = pull_fetch_min_bytes_cfg;
             batch_size=cm_business.get_size_t("batch_size");
             autopush_perior_ms=cm_business.get_size_t ("autopush_perior_ms");
             autocommit_perior_ms=cm_business.get_size_t ("autocommit_perior_ms");
@@ -868,7 +895,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         return MYMQ_Public::ClientErrorCode::Success;
     }
 
-    MYMQ_Public::ResultVariant MYMQ_Consumeruse::handle_response(Eve event_type,const Mybyte& msg_body){
+    MYMQ_Public::ResultVariant MYMQ_Consumeruse::handle_response(Eve event_type,const MYMQ::OwnedBytes& msg_body){
         auto protocol_resp = ClientProtocol::parse_response(event_type, msg_body);
 
         return std::visit([this](auto&& arg) -> MYMQ_Public::ResultVariant {
@@ -891,11 +918,35 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                 out("[PULL] Messages batch from (TOPIC '" + resp.topic + "' PARTITION '" + std::to_string(resp.partition) + ") responce reached. ");
                 out(std::string{} + "[PULL] Result : " + " State : " + MYMQ_Public::to_string(resp.error));
 
+                if (resp.error == MYMQ_Public::CommonErrorCode::NO_RECORD) {
+                    if (!is_ingroup.load()) {
+                        return MYMQ_Public::CommonErrorCode::CLIENT_NOT_IN_GROUP;
+                    }
+                    TP_PointMap::accessor cac;
+                    if (!map_final_assign.find(cac, TopicPartition(resp.topic, resp.partition))) {
+                        return MYMQ_Public::CommonErrorCode::Success;
+                    }
+                    auto pollqueue_ptr = cac->second.pollqueue_ptr;
+                    cac.release();
+                    if (!pollqueue_ptr->need_poll()) {
+                        return MYMQ_Public::CommonErrorCode::Success;
+                    }
+                    size_t bytes = pull_fetch_min_bytes.load();
+                    std::string group_id;
+                    {
+                        std::shared_lock<std::shared_mutex> slock(info_basic.mtx);
+                        group_id = info_basic.groupid;
+                    }
+                    auto req = ClientProtocol::build_pull_packet(group_id, resp.topic, resp.partition, resp.next_offset, bytes);
+                    send_via(cmc_fetch_, Eve::CLIENT_REQUEST_PULL, req);
+                    return MYMQ_Public::CommonErrorCode::Success;
+                }
+
                 if (resp.error != MYMQ_Public::CommonErrorCode::Success) {
                     return resp.error;
                 }
 
-                bool need_poll = true;
+                bool need_poll = false;
                 if (resp.error == MYMQ_Public::CommonErrorCode::Success) {
                     TP_PointMap::accessor cac;
                     if (map_final_assign.find(cac, TopicPartition(resp.topic, resp.partition))) {
@@ -1072,15 +1123,15 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         }
 
         for(const auto& [tp,tp_point]:map_final_assign){
-
-
             auto ptr=tp_point.pollqueue_ptr;
             auto& pollqueue=*ptr;
-                 size_t now_off= pollqueue.local_consume_offset.load();
-                 size_t bytes= pull_fetch_min_bytes.load();
-                    auto req = ClientProtocol::build_pull_packet(groupid, tp.topic, tp.partition, now_off, bytes);
-                    send_via(cmc_fetch_, Eve::CLIENT_REQUEST_PULL, req);
-
+            if(!pollqueue.need_poll()){
+                continue;
+            }
+            size_t now_off= pollqueue.local_consume_offset.load();
+            size_t bytes= pull_fetch_min_bytes.load();
+            auto req = ClientProtocol::build_pull_packet(groupid, tp.topic, tp.partition, now_off, bytes);
+            send_via(cmc_fetch_, Eve::CLIENT_REQUEST_PULL, req);
 
         }
 
@@ -1109,17 +1160,128 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         cmc_produce_.init();
     }
     MYMQ_Produceruse::~MYMQ_Produceruse(){
+        stop();
 
         for (ZSTD_DCtx* ctx : tbb_dctx_pool) {
             ZSTD_freeDCtx(ctx);
         }
 
     }
+
+    void MYMQ_Produceruse::stop() {
+        bool expected = false;
+        if (!stopped_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        push_perioric_stop();
+
+        struct PendingCb {
+            TopicPartition tp;
+            uint32_t rel_index = 0;
+            MYMQ_Public::SupportedCallbacks cb;
+        };
+
+        std::vector<PendingCb> pending;
+
+        for (auto it = recordaccumulator.begin(); it != recordaccumulator.end(); ++it) {
+            auto& pq = *((*it).second);
+
+            std::unique_lock<std::mutex> ulock(pq.mtx);
+
+            if (pq.active_buf) {
+                for (auto& scb : pq.active_cbs) {
+                    pending.push_back(PendingCb{pq.tp, scb.relative_index, std::move(scb.cb)});
+                }
+                pq.active_cbs.clear();
+                pq.current_batch_count = 0;
+                pq.active_buf->release();
+            }
+
+            while (!pq.ready_queue.empty()) {
+                auto item = std::move(pq.ready_queue.front());
+                pq.ready_queue.pop_front();
+                if (item) {
+                    for (auto& scb : item->callbacks) {
+                        pending.push_back(PendingCb{pq.tp, scb.relative_index, std::move(scb.cb)});
+                    }
+                    if (item->buffer) {
+                        item->buffer->release();
+                        pq.free_pool.push_back(std::move(item->buffer));
+                    }
+                }
+            }
+
+            for (auto& buf : pq.free_pool) {
+                if (buf) {
+                    buf->release();
+                }
+            }
+
+            pq.is_flushing = false;
+            pq.cv_full.notify_all();
+        }
+
+        for (auto& p : pending) {
+            std::visit([&](auto&& specific_cb) {
+                using CBType = std::decay_t<decltype(specific_cb)>;
+                if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>) {
+                    specific_cb(MYMQ_Public::PushResponce(p.tp.topic, p.tp.partition, MYMQ_Public::CommonErrorCode::PRODUCER_STOPPED, 0));
+                } else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>) {
+                    specific_cb(MYMQ_Public::CommitAsyncResponce(std::string{}, p.tp, 0, MYMQ_Public::CommonErrorCode::PRODUCER_STOPPED));
+                } else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>) {
+                    specific_cb(MYMQ_Public::CommonErrorCode::PRODUCER_STOPPED);
+                } else {
+                    static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
+                }
+            }, p.cb);
+        }
+
+        cmc_produce_.drain_inflight_with_error(MYMQ_Public::CommonErrorCode::PRODUCER_STOPPED);
+        cmc_produce_.stop();
+        cmc_.stop();
+    }
+
+    void MYMQ_Produceruse::inject_pending_callbacks_for_test(const MYMQ_Public::TopicPartition& tp, size_t active_count, size_t ready_batches, MYMQ_Public::PushResponceCallback cb) {
+        auto pq_ptr = recordaccumulator.get_queue(tp, batch_size, push_max_queued_batches);
+        auto& pq = *pq_ptr;
+        std::unique_lock<std::mutex> ulock(pq.mtx);
+
+        if (!pq.active_buf) {
+            pq.active_buf = std::make_unique<MYMQ::MSG_serial::BatchBuffer>(pq.buffer_size_);
+        }
+
+        pq.active_cbs.clear();
+        pq.active_cbs.reserve(pq.active_cbs.size() + active_count);
+        for (size_t i = 0; i < active_count; ++i) {
+            pq.active_cbs.push_back(MYMQ::Client::SparseCallback{static_cast<uint32_t>(i), cb});
+        }
+        pq.current_batch_count = active_count;
+
+        for (size_t i = 0; i < ready_batches; ++i) {
+            auto item = std::make_unique<MYMQ::Client::BatchItem>();
+            item->buffer = std::make_unique<MYMQ::MSG_serial::BatchBuffer>(pq.buffer_size_);
+            item->buffer->ensure_allocated_for(std::chrono::milliseconds(0));
+            item->callbacks.push_back(MYMQ::Client::SparseCallback{0U, cb});
+            item->batch_count = 1;
+            pq.ready_queue.push_back(std::move(item));
+        }
+    }
     Err_Client MYMQ_Produceruse::push(const MYMQ_Public::TopicPartition& tp, const std::string& key, const std::string& value, MYMQ_Public::PushResponceCallback cb) {
 
         // 1. 基础状态检查
 
+        if (stopped_.load(std::memory_order_acquire)) {
+            if (cb && ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
+                cb(MYMQ_Public::PushResponce(tp.topic, tp.partition, MYMQ_Public::CommonErrorCode::PRODUCER_STOPPED, 0));
+            }
+            return Err_Client::PRODUCER_STOPPED;
+        }
+
         if(!is_register()){
+            if (cb) {
+                cb(MYMQ_Public::PushResponce(tp.topic, tp.partition, MYMQ_Public::CommonErrorCode::CLIENT_LINK_NOT_FOUND, 0));
+            }
             return Err_Client::NOT_REGISTER;
         }
 
@@ -1127,18 +1289,23 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         cmc_produce_.get_curr_flying_request_num(curr_fly);
         if (curr_fly >= max_in_flight_requests_num) {
             cerr("[PUSH] FLYING REQUEST GOT TO LIMIT");
+            if (cb && ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
+                cb(MYMQ_Public::PushResponce(tp.topic, tp.partition, MYMQ_Public::CommonErrorCode::QUEUE_FULL, 0));
+            }
             return Err_Client::REACHED_MAX_FLYING_REQUEST;
         }
 
 
-        auto it=recordaccumulator.get_queue(tp, local_push_buffer_size, push_max_queued_batches);
-
-        auto& push_queue=*it;
+        auto pq_ptr = recordaccumulator.get_queue(tp, batch_size, push_max_queued_batches);
+        auto& push_queue = *pq_ptr;
         std::unique_lock<std::mutex> ulock(push_queue.mtx);
 
         // 3. 检查压缩上下文
         if (!push_queue.cctx) {
             cerr("ZSTD ERROR : CCTX Unavailable . Push Interrupt");
+            if (cb) {
+                cb(MYMQ_Public::PushResponce(tp.topic, tp.partition, MYMQ_Public::CommonErrorCode::INTERNAL_ERROR, 0));
+            }
             return Err_Client::ZSTD_UNAVAILABLE;
         }
 
@@ -1147,10 +1314,21 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         // 检查：如果用户传了有效回调，但客户端配置为“不响应”，则报错
         if (has_callback && ack_level_ == MYMQ::ACK_Level::ACK_NORESPONCE) {
             cerr("WARNING: Callback provided but ignored due to ACK_NORESPONCE level.");
+            cb(MYMQ_Public::PushResponce(tp.topic, tp.partition, MYMQ_Public::CommonErrorCode::INTERNAL_ERROR, 0));
             return Err_Client::INVALID_OPRATION;
         }
 
+        constexpr auto kAllocTimeout = std::chrono::milliseconds(100);
+        constexpr auto kQueueWaitTimeout = std::chrono::milliseconds(100);
+
         while (true) {
+            if (!push_queue.active_buf->ensure_allocated_for(kAllocTimeout)) {
+                if (has_callback && ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
+                    cb(MYMQ_Public::PushResponce(tp.topic, tp.partition, MYMQ_Public::CommonErrorCode::TIMEOUT, 0));
+                }
+                return Err_Client::TIMEOUT;
+            }
+
             // A. 尝试直接写入 Active Buffer
             bool success = push_queue.active_buf->append_record(key, value);
 
@@ -1174,7 +1352,15 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             // 1. 背压检查 (Backpressure)
             // 如果就绪队列太长，说明发送端跟不上，阻塞生产者
             while (push_queue.ready_queue.size() >= push_queue.max_queued_batches_) {
-                push_queue.cv_full.wait(ulock);
+                bool ok = push_queue.cv_full.wait_for(ulock, kQueueWaitTimeout, [&] {
+                    return push_queue.ready_queue.size() < push_queue.max_queued_batches_;
+                });
+                if (!ok) {
+                    if (has_callback && ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
+                        cb(MYMQ_Public::PushResponce(tp.topic, tp.partition, MYMQ_Public::CommonErrorCode::QUEUE_FULL, 0));
+                    }
+                    return Err_Client::QUEUE_FULL;
+                }
             }
 
             // 2. 轮转：将 Active 移动到 Ready Queue
@@ -1199,12 +1385,12 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             // 4. 触发 Flush 任务 (如果还没运行)
             if (!push_queue.is_flushing) {
                 push_queue.is_flushing = true;
-                
+
                 auto push_queue_key = tp.topic + "_" + std::to_string(tp.partition);
                 uint32_t shard_id = MurmurHash2::hash(push_queue_key);
-                
-                pool_.submit(shard_id, [this, &push_queue]() {
-                    this->flush_batch_task(push_queue);
+
+                pool_.submit(shard_id, [this, pq_ptr]() {
+                    this->flush_batch_task(*pq_ptr);
                 });
             }
 
@@ -1243,10 +1429,21 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                 tmp_clientid=MYMQ::CLIENTID_DEFAULT;
                 cerr("Initialization : Invaild 'clientid' in config . Use default 'clientid' : "+MYMQ::CLIENTID_DEFAULT);
             }
+            auto make_role_clientid = [](const std::string& base, const std::string& suffix) {
+                constexpr size_t kMaxClientIdLen = 30;
+                if (suffix.size() >= kMaxClientIdLen) {
+                    return suffix.substr(0, kMaxClientIdLen);
+                }
+                if (base.size() + suffix.size() <= kMaxClientIdLen) {
+                    return base + suffix;
+                }
+                return base.substr(0, kMaxClientIdLen - suffix.size()) + suffix;
+            };
             cmc_.set_clientid(tmp_clientid);
             cmc_.set_channel_role(MYMQ_Public::ChannelRole::CONTROL);
-            cmc_produce_.set_clientid(tmp_clientid);
+            cmc_produce_.set_clientid(make_role_clientid(tmp_clientid, "#produce"));
             cmc_produce_.set_channel_role(MYMQ_Public::ChannelRole::PRODUCE);
+            cmc_produce_.set_request_timeout_ms(60000);
             {
                 std::unique_lock<std::shared_mutex> ulock(info_basic.mtx);
                 info_basic.clientid=tmp_clientid;
@@ -1296,6 +1493,24 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
     void MYMQ_Produceruse::flush_batch_task(MYMQ::Client::Push_queue& pq) {
         
+        auto invoke_callbacks_with_error = [&](const TopicPartition& tp, std::vector<MYMQ::Client::SparseCallback>& callbacks, MYMQ_Public::CommonErrorCode err) {
+            for (auto& sparse_item : callbacks) {
+                auto& current_cb = sparse_item.cb;
+                std::visit([&](auto&& specific_cb) {
+                    using CBType = std::decay_t<decltype(specific_cb)>;
+                    if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>) {
+                        specific_cb(MYMQ_Public::PushResponce(tp.topic, tp.partition, err, 0));
+                    } else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>) {
+                        specific_cb(MYMQ_Public::CommitAsyncResponce(std::string{}, tp, 0, err));
+                    } else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>) {
+                        specific_cb(err);
+                    } else {
+                        static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
+                    }
+                }, current_cb);
+            }
+        };
+
         while (true) {
             std::unique_ptr<MYMQ::Client::BatchItem> item;
 
@@ -1318,6 +1533,20 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                 }
             }
 
+            if (stopped_.load(std::memory_order_acquire)) {
+                if (ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
+                    auto callbacks = std::move(item->callbacks);
+                    invoke_callbacks_with_error(pq.tp, callbacks, MYMQ_Public::CommonErrorCode::PRODUCER_STOPPED);
+                }
+
+                {
+                    std::unique_lock<std::mutex> ulock(pq.mtx);
+                    item->buffer->release();
+                    pq.free_pool.push_back(std::move(item->buffer));
+                }
+                continue;
+            }
+
             // 2. 处理任务 (无锁)
             if (item->buffer->size() > 0) {
                 auto final_packet = ClientProtocol::build_push_packet(
@@ -1330,9 +1559,108 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
                 if (!final_packet.empty()) {
                     if (ack_level_ != MYMQ::ACK_Level::ACK_NORESPONCE) {
-                        send_via(cmc_produce_, Eve::CLIENT_REQUEST_PUSH, final_packet, std::move(item->callbacks));
+                        TopicPartition tp_copy = pq.tp;
+                        auto callbacks_ptr = std::make_shared<std::vector<MYMQ::Client::SparseCallback>>(std::move(item->callbacks));
+                        MYMQ::Network::Communication_client::SendFailReason fail_reason = MYMQ::Network::Communication_client::SendFailReason::None;
+                        auto succ = cmc_produce_.send_msg_blocking(
+                            static_cast<uint16_t>(Eve::CLIENT_REQUEST_PUSH),
+                            final_packet,
+                            [this, callbacks_ptr, tp_copy](uint16_t event_type_responce, MYMQ::OwnedBytes msg_body_responce) mutable
+                            {
+                                auto resp = handle_response(static_cast<Eve>(event_type_responce), msg_body_responce);
+
+                                for (auto& sparse_item : *callbacks_ptr) {
+                                    uint32_t msg_idx = sparse_item.relative_index;
+                                    auto& current_cb = sparse_item.cb;
+
+                                    std::visit([&](auto&& specific_cb) {
+                                        using CBType = std::decay_t<decltype(specific_cb)>;
+
+                                        if constexpr (std::is_same_v<CBType, MYMQ_Public::PushResponceCallback>)
+                                        {
+                                            if (auto* data = std::get_if<MYMQ_Public::PushResponce>(&resp)) {
+                                                MYMQ_Public::PushResponce individual_resp = *data;
+                                                individual_resp.offset = data->offset + msg_idx;
+                                                specific_cb(individual_resp);
+                                            } else if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
+                                                specific_cb(MYMQ_Public::PushResponce(tp_copy.topic, tp_copy.partition, *err, 0));
+                                            }
+                                        }
+                                        else if constexpr (std::is_same_v<CBType, MYMQ_Public::CommitAsyncResponceCallback>)
+                                        {
+                                            if (auto* data = std::get_if<MYMQ_Public::CommitAsyncResponce>(&resp)) {
+                                                specific_cb(*data);
+                                            } else if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
+                                                specific_cb(MYMQ_Public::CommitAsyncResponce(std::string{}, tp_copy, 0, *err));
+                                            }
+                                        }
+                                        else if constexpr (std::is_same_v<CBType, MYMQ_Public::CallbackNoop>)
+                                        {
+                                            if (auto* err = std::get_if<MYMQ_Public::CommonErrorCode>(&resp)) {
+                                                specific_cb(*err);
+                                            } else {
+                                                specific_cb(MYMQ_Public::CommonErrorCode::Success);
+                                            }
+                                        }
+                                        else
+                                        {
+                                            static_assert(MYMQ_Public::always_false_v<CBType>, "Unknown callback type");
+                                        }
+
+                                    }, current_cb);
+                                }
+                            },
+                            max_in_flight_requests_num,
+                            std::chrono::milliseconds(60000),
+                            &fail_reason
+                        );
+
+                        if (!succ) {
+                            if (stopped_.load(std::memory_order_acquire) ||
+                                fail_reason == MYMQ::Network::Communication_client::SendFailReason::Stopped) {
+                                invoke_callbacks_with_error(tp_copy, *callbacks_ptr, MYMQ_Public::CommonErrorCode::PRODUCER_STOPPED);
+                                {
+                                    std::unique_lock<std::mutex> ulock(pq.mtx);
+                                    item->buffer->release();
+                                    pq.free_pool.push_back(std::move(item->buffer));
+                                }
+                                continue;
+                            }
+                            std::unique_lock<std::mutex> ulock(pq.mtx);
+                            auto requeue_item = std::make_unique<MYMQ::Client::BatchItem>();
+                            requeue_item->buffer = std::move(item->buffer);
+                            requeue_item->callbacks = std::move(*callbacks_ptr);
+                            requeue_item->batch_count = item->batch_count;
+                            pq.ready_queue.push_front(std::move(requeue_item));
+                            pq.is_flushing = false;
+                            pq.cv_full.notify_all();
+                            return;
+                        }
                     } else {
-                        send_via(cmc_produce_, Eve::CLIENT_REQUEST_PUSH, final_packet);
+                        MYMQ::Network::Communication_client::SendFailReason fail_reason = MYMQ::Network::Communication_client::SendFailReason::None;
+                        auto succ = cmc_produce_.send_msg_blocking(
+                            static_cast<uint16_t>(Eve::CLIENT_REQUEST_PUSH),
+                            final_packet,
+                            ResponseCallback{},
+                            max_in_flight_requests_num,
+                            std::chrono::milliseconds(60000),
+                            &fail_reason
+                        );
+
+                        if (!succ) {
+                            if (stopped_.load(std::memory_order_acquire) ||
+                                fail_reason == MYMQ::Network::Communication_client::SendFailReason::Stopped) {
+                                std::unique_lock<std::mutex> ulock(pq.mtx);
+                                item->buffer->release();
+                                pq.free_pool.push_back(std::move(item->buffer));
+                                continue;
+                            }
+                            std::unique_lock<std::mutex> ulock(pq.mtx);
+                            pq.ready_queue.push_front(std::move(item));
+                            pq.is_flushing = false;
+                            pq.cv_full.notify_all();
+                            return;
+                        }
                     }
                 }
             }
@@ -1340,7 +1668,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             // 3. 归还 Buffer
             {
                 std::unique_lock<std::mutex> ulock(pq.mtx);
-                item->buffer->clear(); // 重置状态
+                item->buffer->release();
                 pq.free_pool.push_back(std::move(item->buffer));
             }
         }
@@ -1364,7 +1692,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
 
 
 
-    MYMQ_Public::ResultVariant MYMQ_Produceruse::handle_response(Eve event_type,const Mybyte& msg_body){
+    MYMQ_Public::ResultVariant MYMQ_Produceruse::handle_response(Eve event_type,const MYMQ::OwnedBytes& msg_body){
         auto protocol_resp = ClientProtocol::parse_response(event_type, msg_body);
 
         return std::visit([this](auto&& arg) -> MYMQ_Public::ResultVariant {
@@ -1394,15 +1722,17 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
         return cmc_.get_is_register();
     }
     void MYMQ_Produceruse::push_timer_send() {
+        if (stopped_.load(std::memory_order_acquire)) {
+            return;
+        }
         if(!is_register()){
             return ;
         }
 
         // 2. 遍历所有分区队列
         for (auto it = recordaccumulator.begin(); it != recordaccumulator.end(); ++it) {
-            // key 是 partition string, value 是 Push_queue
-            const TopicPartition& pq_key = (*it).first;
-            auto& pq = *((*it).second);
+            auto pq_ptr = (*it).second;
+            auto& pq = *pq_ptr;
 
             // 【优化】无锁预检查 (Dirty Check)
             if (pq.active_buf->size() == 0 && pq.ready_queue.empty()) {
@@ -1421,8 +1751,8 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                     pq.is_flushing = true;
                     auto push_queue_key = pq.tp.topic + "_" + std::to_string(pq.tp.partition);
                     uint32_t shard_id = MurmurHash2::hash(push_queue_key);
-                    pool_.submit(shard_id, [this, &pq]() {
-                        this->flush_batch_task(pq);
+                    pool_.submit(shard_id, [this, pq_ptr]() {
+                        this->flush_batch_task(*pq_ptr);
                     });
                 }
                 continue;
@@ -1444,6 +1774,7 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
             } else {
                 pq.active_buf = std::make_unique<MYMQ::MSG_serial::BatchBuffer>(pq.buffer_size_);
             }
+            pq.active_buf->clear();
             pq.current_batch_count = 0;
 
             // D. 触发 Flush 任务
@@ -1451,8 +1782,8 @@ MYMQ_Consumeruse::~MYMQ_Consumeruse(){
                 pq.is_flushing = true;
                 auto push_queue_key = pq.tp.topic + "_" + std::to_string(pq.tp.partition);
                 uint32_t shard_id = MurmurHash2::hash(push_queue_key);
-                pool_.submit(shard_id, [this, &pq]() {
-                    this->flush_batch_task(pq);
+                pool_.submit(shard_id, [this, pq_ptr]() {
+                    this->flush_batch_task(*pq_ptr);
                 });
             }
         }

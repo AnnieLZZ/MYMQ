@@ -19,16 +19,99 @@
 #include <sys/sendfile.h>
 #include <variant>
 #include <deque>
+#include <vector>
+#include <memory>
+#include <functional>
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
 #include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include "SharedThreadPool.h"
+#include <new>
+#if __has_include(<mimalloc.h>)
+#include <mimalloc.h>
+#else
+#include "../thirdparty/mimalloc/include/mimalloc.h"
+#endif
 // #include "MYMQ_Server_ns.h" // Removed MYMQ dependency
 
 // Generic Networking Types
 namespace Net {
+
+    class ReceiveBufferPool {
+    public:
+        static ReceiveBufferPool& instance() {
+            static ReceiveBufferPool pool;
+            return pool;
+        }
+
+        std::shared_ptr<std::vector<unsigned char>> acquire(size_t required_size) {
+            std::vector<unsigned char>* picked = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                auto best_it = free_buffers_.end();
+                for (auto it = free_buffers_.begin(); it != free_buffers_.end(); ++it) {
+                    if ((*it)->capacity() >= required_size &&
+                        (best_it == free_buffers_.end() || (*it)->capacity() < (*best_it)->capacity())) {
+                        best_it = it;
+                    }
+                }
+                if (best_it != free_buffers_.end()) {
+                    picked = *best_it;
+                    free_buffers_.erase(best_it);
+                }
+            }
+
+            if (!picked) {
+                picked = create_buffer();
+                if (required_size > 0) {
+                    picked->reserve(required_size);
+                }
+            }
+
+            picked->resize(required_size);
+            return std::shared_ptr<std::vector<unsigned char>>(picked, [this](std::vector<unsigned char>* buf) {
+                this->release(buf);
+            });
+        }
+
+    private:
+        void release(std::vector<unsigned char>* buf) {
+            if (!buf) return;
+            constexpr size_t kMaxReusableCapacity = 4ULL * 1024 * 1024;
+            constexpr size_t kMaxFreeBuffers = 4096;
+            if (buf->capacity() > kMaxReusableCapacity) {
+                destroy_buffer(buf);
+                return;
+            }
+            buf->clear();
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (free_buffers_.size() >= kMaxFreeBuffers) {
+                destroy_buffer(buf);
+                return;
+            }
+            free_buffers_.push_back(buf);
+        }
+
+        static std::vector<unsigned char>* create_buffer() {
+            void* raw = mi_malloc(sizeof(std::vector<unsigned char>));
+            if (!raw) {
+                throw std::bad_alloc();
+            }
+            return new(raw) std::vector<unsigned char>();
+        }
+
+        static void destroy_buffer(std::vector<unsigned char>* buf) {
+            if (!buf) return;
+            std::destroy_at(buf);
+            mi_free(buf);
+        }
+
+        std::mutex mtx_;
+        std::vector<std::vector<unsigned char>*> free_buffers_;
+    };
 
     struct FileSendTask {
         int in_fd;           // File descriptor
@@ -62,7 +145,7 @@ namespace Net {
         std::vector<unsigned char> header_buffer;
         size_t bytes_read_in_header = 0;
 
-        std::vector<unsigned char> body_buffer;
+        std::shared_ptr<std::vector<unsigned char>> body_buffer;
         size_t bytes_read_in_body = 0;
 
         // Protocol Fields (Generic)
@@ -215,7 +298,7 @@ public:
     using ClientMessageCallback = std::function<void(
         TcpSession& session,
         const std::vector<unsigned char>& header, // Raw Header
-        std::vector<unsigned char>&& body         // Moved Body
+        std::shared_ptr<std::vector<unsigned char>> body
     )>;
 
     Server(size_t header_size = 12) : HEADER_SIZE(header_size) { // Default 12 for MYMQ compatibility
@@ -913,7 +996,7 @@ private:
         }
     }
 
-    void handle_event(std::shared_ptr<ClientState> state, std::vector<unsigned char>&& body) {
+    void handle_event(std::shared_ptr<ClientState> state, std::shared_ptr<std::vector<unsigned char>> body) {
         ClientMessageCallback curr_cb;
         {
             std::shared_lock<std::shared_mutex> slock(mtx_callback);
@@ -925,7 +1008,7 @@ private:
         }
     }
 
-    void process_message( int sock, std::vector<unsigned char>&& body,std::shared_ptr<ClientState> state) {
+    void process_message(int sock, std::shared_ptr<std::vector<unsigned char>> body, std::shared_ptr<ClientState> state) {
         handle_event(state, std::move(body));
     }
 
@@ -967,29 +1050,26 @@ private:
                         return IOStatus::ERROR_DEAD;
                     }
                     state->expected_body_length = total_length - HEADER_SIZE;
-
-//                    if (state->expected_body_length > msg_body_limit) {
-//                        std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state->expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
-//                        return IOStatus::ERROR_DEAD;
-//                    }
+                    if (state->expected_body_length > msg_body_limit) {
+                        std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state->expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
+                        return IOStatus::ERROR_DEAD;
+                    }
 
                     if (state->expected_body_length == 0) {
                         state->current_state = ClientState::READING_HEADER;
                         state->bytes_read_in_header = 0;
                         state->bytes_read_in_body = 0;
-
-                        // 【改动 2】process_message 需要接收 shared_ptr state
-                        // 这样 handle_event 才能把 session 传给用户
-                        process_message(sock, std::vector<unsigned char>{}, state);
+                        process_message(sock, ReceiveBufferPool::instance().acquire(0), state);
 
                         return IOStatus::OK_COMPLETED;
                     } else {
-                        // 有消息体，准备读取
-                        state->body_buffer.clear();
-                        state->body_buffer.resize(state->expected_body_length);
+                        state->body_buffer = ReceiveBufferPool::instance().acquire(state->expected_body_length);
+                        if (!state->body_buffer || state->body_buffer->size() < state->expected_body_length) {
+                            std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 无法分配消息体缓冲 (FD: " << sock << "), size=" << state->expected_body_length << std::endl;
+                            return IOStatus::ERROR_DEAD;
+                        }
                         state->bytes_read_in_body = 0;
                         state->current_state = ClientState::READING_BODY;
-                        // fall-through
                     }
                 }
             } else { // ret == 0
@@ -1015,15 +1095,18 @@ private:
 
         // --- 状态 2: 正在读取消息体 ---
         if (state->current_state == ClientState::READING_BODY) {
-            // 确保 buffer 大小
-            if (state->body_buffer.size() < state->expected_body_length) {
-                state->body_buffer.resize(state->expected_body_length);
+            if (!state->body_buffer || state->body_buffer->size() < state->expected_body_length) {
+                state->body_buffer = ReceiveBufferPool::instance().acquire(state->expected_body_length);
+                if (!state->body_buffer || state->body_buffer->size() < state->expected_body_length) {
+                    std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 消息体缓冲无效 (FD: " << sock << "), size=" << state->expected_body_length << std::endl;
+                    return IOStatus::ERROR_DEAD;
+                }
             }
 
             if (state->bytes_read_in_body < state->expected_body_length) {
                 size_t bytes_read_this_time = 0;
                 int ret = SSL_read_ex(state->ssl,
-                                      reinterpret_cast<char*>(state->body_buffer.data() + state->bytes_read_in_body),
+                                      reinterpret_cast<char*>(state->body_buffer->data() + state->bytes_read_in_body),
                                       state->expected_body_length - state->bytes_read_in_body,
                                       &bytes_read_this_time);
 
@@ -1037,7 +1120,8 @@ private:
                         state->bytes_read_in_header = 0;
                         state->bytes_read_in_body = 0;
                         state->expected_body_length = 0;
-                        process_message(sock, std::move(state->body_buffer), state);
+                        auto ready_body = std::move(state->body_buffer);
+                        process_message(sock, std::move(ready_body), state);
 
                         return IOStatus::OK_COMPLETED;
                     }

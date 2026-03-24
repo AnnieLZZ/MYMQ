@@ -6,6 +6,7 @@
 #include <vector>
 #include <variant>
 #include <string>
+#include <memory>
 
 namespace MYMQ {
 namespace Client {
@@ -15,7 +16,7 @@ struct PullResponseData {
     size_t partition;
     MYMQ_Public::CommonErrorCode error;
     size_t next_offset;
-    std::vector<unsigned char> message_batch;
+    MYMQ::OwnedBytes message_batch;
     size_t record_num;
 };
 
@@ -65,8 +66,13 @@ using ProtocolResponse = std::variant<
 
 class ClientProtocol {
 public:
-    static ProtocolResponse parse_response(MYMQ::EventType event_type, const std::vector<unsigned char>& msg_body);
-    static MYMQ_Public::CommonErrorCode parse_record_batch(const std::vector<unsigned char>& raw_batch, ZSTD_DCtx* dctx, std::vector<MYMQ_Public::ConsumerRecord>& out_records, const MYMQ_Public::TopicPartition& tp);
+    static ProtocolResponse parse_response(MYMQ::EventType event_type, const MYMQ::OwnedBytes& msg_body);
+    static MYMQ_Public::CommonErrorCode parse_record_batch(
+        const MYMQ::OwnedBytes& raw_batch,
+        ZSTD_DCtx* dctx,
+        std::vector<MYMQ_Public::ConsumerRecord>& out_records,
+        const MYMQ_Public::TopicPartition& tp
+    );
     static std::vector<unsigned char> build_push_packet(
                     const std::string& topic,
                     uint64_t partition,

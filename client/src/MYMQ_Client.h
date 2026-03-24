@@ -38,7 +38,7 @@ protected:
     bool send_via(MYMQ::Network::Communication_client& channel, MYMQ::EventType event_type, const Mybyte& msg_body, std::vector<MYMQ::Client::SparseCallback> cbs_ = std::vector<MYMQ::Client::SparseCallback>());
 
     // Virtual hook for response handling
-    virtual MYMQ_Public::ResultVariant handle_response(Eve event_type, const Mybyte& msg_body) = 0;
+    virtual MYMQ_Public::ResultVariant handle_response(Eve event_type, const MYMQ::OwnedBytes& msg_body) = 0;
 };
 
 class MYMQ_Produceruse : public ClientBase {
@@ -55,6 +55,10 @@ public:
 
     Err_Client push(const MYMQ_Public::TopicPartition& tp,const std::string& key,const std::string& value
                     ,MYMQ_Public::PushResponceCallback cb) ;
+
+    void stop();
+
+    void inject_pending_callbacks_for_test(const MYMQ_Public::TopicPartition& tp, size_t active_count, size_t ready_batches, MYMQ_Public::PushResponceCallback cb);
 
   \
 
@@ -74,7 +78,7 @@ private:
     void init(const std::string& clientid,uint8_t ack_level);
 
 
-    MYMQ_Public::ResultVariant handle_response(Eve event_type,const Mybyte& msg_body) override;
+    MYMQ_Public::ResultVariant handle_response(Eve event_type,const MYMQ::OwnedBytes& msg_body) override;
 
     void push_timer_send();
     bool is_register();
@@ -115,12 +119,13 @@ private:
 
     MYMQ::Client::RecordAccumulator recordaccumulator;
 
+    std::atomic<bool> stopped_{false};
 
     ZSTD_DCtx* dctx;
     MYMQ::ACK_Level ack_level_;
 
     tbb::enumerable_thread_specific<ZSTD_DCtx*> tbb_dctx_pool;
-    ShardedThreadPool& pool_=ShardedThreadPool::instance(8);
+    ShardedThreadPool pool_{8};
 
 
 };
@@ -138,11 +143,11 @@ class MYMQ_Consumeruse : public ClientBase {
     struct Workitem {
         size_t index;
         MYMQ_Public::TopicPartition tp;
-        std::vector<unsigned char> raw_big_chunk;
+        MYMQ::OwnedBytes raw_big_chunk_owner;
         std::vector<MYMQ_Public::ConsumerRecord> parsed_records;
         MYMQ_Public::ClientErrorCode err = Err_Client::Success;
-        Workitem(size_t i, MYMQ_Public::TopicPartition t, std::vector<unsigned char> r)
-            : index(i), tp(std::move(t)), raw_big_chunk(std::move(r)) {}
+        Workitem(size_t i, MYMQ_Public::TopicPartition t, MYMQ::OwnedBytes r)
+            : index(i), tp(std::move(t)), raw_big_chunk_owner(std::move(r)) {}
     };
 
 public:
@@ -186,6 +191,7 @@ public:
 
     std::unordered_set<MYMQ_Public::TopicPartition> get_assigned_partition();
     Err_Client seek(const MYMQ_Public::TopicPartition& tp,size_t offset_next_to_consume);
+    void stop();
 
 
      bool get_is_ingroup(){
@@ -198,10 +204,10 @@ public:
 private:
     MYMQ::Network::Communication_client cmc_fetch_{MYMQ::run_directory_DEFAULT, MYMQ::REQUEST_TIMEOUT_MS_DEFAULT};
     void call_parse_impl(
-        const std::vector<unsigned char>& raw_big_chunk,            // IO 线程收到的原始大包
-        std::vector<MYMQ_Public::ConsumerRecord>& out_records,      // 输出结果
-        const MYMQ_Public::TopicPartition& tp,                // 所属分区
-        Err_Client& out_error                                       // 错误码传出
+        const MYMQ::OwnedBytes& raw_big_chunk_owner,
+        std::vector<MYMQ_Public::ConsumerRecord>& out_records,
+        const MYMQ_Public::TopicPartition& tp,
+        Err_Client& out_error
         ) ;
 
 
@@ -226,7 +232,7 @@ private:
     // bool send(...) moved to base
 
     Err_Client commit_inter(const MYMQ_Public::TopicPartition& tp,size_t next_offset_to_consume,MYMQ_Public::CommitAsyncResponceCallback cb);
-    MYMQ_Public::ResultVariant handle_response(Eve event_type,const Mybyte& msg_body) override;
+    MYMQ_Public::ResultVariant handle_response(Eve event_type,const MYMQ::OwnedBytes& msg_body) override;
     void out_group_reset();
     void cerr(const std::string& str){
         Printqueue::instance().out(str,1,0);
@@ -309,6 +315,7 @@ private:
 
 
     std::vector<Workitem> m_todo_cache;
+    std::atomic<bool> stopped_{false};
 
 
 
