@@ -376,6 +376,17 @@ public:
             io_thread_.join();
         }
 
+        if (ssl_) {
+            SSL_shutdown(ssl_);
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+        }
+
+        if (ctx_) {
+            SSL_CTX_free(ctx_);
+            ctx_ = nullptr;
+        }
+
         if (clientSocket != INVALID_SOCKET) {
             closesocket(clientSocket);
             clientSocket = INVALID_SOCKET;
@@ -759,6 +770,17 @@ private:
                     if (err_code == SSL_ERROR_WANT_READ || err_code == SSL_ERROR_WANT_WRITE) {
                         return true;
                     }
+                    unsigned long ssl_err = ERR_peek_last_error();
+                    const char* reason = ssl_err ? ERR_reason_error_string(ssl_err) : nullptr;
+                    bool unexpected_eof = (err_code == SSL_ERROR_SSL &&
+                                           reason != nullptr &&
+                                           std::string(reason).find("unexpected eof while reading") != std::string::npos);
+                    bool syscall_eof = (err_code == SSL_ERROR_SYSCALL && ssl_err == 0);
+                    if (unexpected_eof || syscall_eof) {
+                        std::cout << "[" << now_ms_time_gen_str() << "] TLS peer closed connection." << std::endl;
+                        running_.store(false);
+                        return false;
+                    }
                     if (err_code == SSL_ERROR_ZERO_RETURN) {
                         cerr("The connection has been closed normally by the other party.");
                     } else if (err_code == SSL_ERROR_SYSCALL) {
@@ -846,6 +868,17 @@ private:
                 int err_code = SSL_get_error(ssl_, ret);
                 if (err_code == SSL_ERROR_WANT_READ || err_code == SSL_ERROR_WANT_WRITE) {
                     return true;
+                }
+                unsigned long ssl_err = ERR_peek_last_error();
+                const char* reason = ssl_err ? ERR_reason_error_string(ssl_err) : nullptr;
+                bool unexpected_eof = (err_code == SSL_ERROR_SSL &&
+                                       reason != nullptr &&
+                                       std::string(reason).find("unexpected eof while reading") != std::string::npos);
+                bool syscall_eof = (err_code == SSL_ERROR_SYSCALL && ssl_err == 0);
+                if (unexpected_eof || syscall_eof) {
+                    std::cout << "[" << now_ms_time_gen_str() << "] TLS peer closed connection." << std::endl;
+                    running_.store(false);
+                    return false;
                 }
                 if (err_code == SSL_ERROR_ZERO_RETURN) {
                     cerr("The connection has been closed normally by the other party.");

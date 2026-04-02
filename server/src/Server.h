@@ -679,18 +679,10 @@ public:
                                             // 1. 标记逻辑死亡，阻止后续异步操作
                                             client->is_closing.store(true);
 
-                                            // 2. 从 Map 中移除 (需要重新获取锁)
-                                            {
-                                                ClientStateMap::accessor ac;
-                                                if (map_client_states.find(ac, fd)) {
-                                                    map_client_states.erase(ac);
-                                                }
-                                            }
-
-                                            // 3. 关闭连接
+                                            // 2. 关闭连接
                                             // fd 是值拷贝进来的，依然有效
                                             // client 指针在这里析构时，如果引用计数归零，会自动释放 ClientState 内存
-                                            close_connection(fd);
+                                            close_connection(fd, client);
                                         }
                                     });
 
@@ -712,17 +704,22 @@ public:
 
     }
 
-    void close_connection(int fd){
+    void close_connection(int fd, const std::shared_ptr<ClientState>& client){
         auto time = now_ms_time_gen_str();
-        std::string clientid_to_log = "UNKNOWN";
+        std::string clientid_to_log = client ? client->clientid : "UNKNOWN";
+
+        if (client) {
+            client->is_closing.store(true);
+            if (client->ssl) {
+                SSL_shutdown(client->ssl);
+                SSL_free(client->ssl);
+                client->ssl = nullptr;
+            }
+        }
 
         ClientStateMap::accessor ac;
         if(map_client_states.find(ac,fd)){
-            clientid_to_log = ac->second->clientid;
             map_client_states.erase(ac);
-        }
-        else{
-            std::cerr << "[" << now_ms_time_gen_str() << "] [Error] FD '" << fd << "' NOT FOUND " << std::endl;
         }
         ac.release();
 
