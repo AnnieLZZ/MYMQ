@@ -271,6 +271,7 @@ void MYMQ_Consumeruse::stop() {
 
         while (true) {
             bool gained_new_data_this_round = false;
+            bool poll_refill_needed = false;
 
             for (auto& [tp, tp_point] : map_final_assign) {
 
@@ -278,9 +279,13 @@ void MYMQ_Consumeruse::stop() {
                 // first: 记录条数, second: 二进制数据块
                 std::pair<size_t, MYMQ::OwnedBytes> popped_data;
 
-                if (tp_point.pollqueue_ptr->try_pop(popped_data)) {
+                bool became_need_poll = false;
+                if (tp_point.pollqueue_ptr->try_pop(popped_data, &became_need_poll)) {
                     size_t batch_rec_num = popped_data.first;
                     MYMQ::OwnedBytes raw_chunk = std::move(popped_data.second);
+                    if (became_need_poll) {
+                        poll_refill_needed = true;
+                    }
 
                     // 只有 vector 非空才处理（防御性编程）
                     if (raw_chunk.data != nullptr && raw_chunk.size > 0) {
@@ -310,6 +315,9 @@ void MYMQ_Consumeruse::stop() {
                         }
                     }
                 }
+            }
+            if (poll_refill_needed) {
+                trigger_poll_for_low_cap_pollbuffer();
             }
 
             // --- 循环控制核心逻辑 ---
@@ -438,6 +446,7 @@ void MYMQ_Consumeruse::stop() {
 
         while (true) {
             bool gained_new_data_this_round = false;
+            bool poll_refill_needed = false;
 
             for (auto& [tp, tp_point] : map_final_assign) {
 
@@ -445,9 +454,13 @@ void MYMQ_Consumeruse::stop() {
                 std::pair<size_t, MYMQ::OwnedBytes> popped_data;
 
                 // try_pop 是内存/锁操作，属于有效工作时间
-                if (tp_point.pollqueue_ptr->try_pop(popped_data)) {
+                bool became_need_poll = false;
+                if (tp_point.pollqueue_ptr->try_pop(popped_data, &became_need_poll)) {
                     size_t batch_rec_num = popped_data.first;
                     MYMQ::OwnedBytes raw_chunk = std::move(popped_data.second);
+                    if (became_need_poll) {
+                        poll_refill_needed = true;
+                    }
 
                     if (raw_chunk.data != nullptr && raw_chunk.size > 0) {
                         // 缓存复用逻辑
@@ -475,6 +488,9 @@ void MYMQ_Consumeruse::stop() {
                         }
                     }
                 }
+            }
+            if (poll_refill_needed) {
+                trigger_poll_for_low_cap_pollbuffer();
             }
 
             // --- 循环控制核心逻辑 ---

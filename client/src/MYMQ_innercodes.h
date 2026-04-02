@@ -631,8 +631,11 @@ public:
 
     }
 
-    bool try_pop(Chuckitem& target) {
+    bool try_pop(Chuckitem& target, bool* became_need_poll = nullptr) {
         std::lock_guard<std::mutex> ulock(mtx);
+        if (became_need_poll) {
+            *became_need_poll = false;
+        }
 
         if (queue_.empty()) {
             return false;
@@ -651,6 +654,9 @@ public:
         // 只有当前是 PAUSE 且水位降到 LOW 以下，才“切换”状态
         if (state.load(std::memory_order_relaxed) == PAUSE && current <= low_level_capacity) {
             state.store(NEED_POLL, std::memory_order_release);
+            if (became_need_poll) {
+                *became_need_poll = true;
+            }
         }
 
         return true;
