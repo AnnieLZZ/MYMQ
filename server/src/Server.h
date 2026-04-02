@@ -1059,11 +1059,11 @@ private:
                         state->current_state = ClientState::READING_HEADER;
                         state->bytes_read_in_header = 0;
                         state->bytes_read_in_body = 0;
-                        process_message(sock, ReceiveBufferPool::instance().acquire(0), state);
+                        process_message(sock, Net::ReceiveBufferPool::instance().acquire(0), state);
 
                         return IOStatus::OK_COMPLETED;
                     } else {
-                        state->body_buffer = ReceiveBufferPool::instance().acquire(state->expected_body_length);
+                        state->body_buffer = Net::ReceiveBufferPool::instance().acquire(state->expected_body_length);
                         if (!state->body_buffer || state->body_buffer->size() < state->expected_body_length) {
                             std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 无法分配消息体缓冲 (FD: " << sock << "), size=" << state->expected_body_length << std::endl;
                             return IOStatus::ERROR_DEAD;
@@ -1096,7 +1096,7 @@ private:
         // --- 状态 2: 正在读取消息体 ---
         if (state->current_state == ClientState::READING_BODY) {
             if (!state->body_buffer || state->body_buffer->size() < state->expected_body_length) {
-                state->body_buffer = ReceiveBufferPool::instance().acquire(state->expected_body_length);
+                state->body_buffer = Net::ReceiveBufferPool::instance().acquire(state->expected_body_length);
                 if (!state->body_buffer || state->body_buffer->size() < state->expected_body_length) {
                     std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 消息体缓冲无效 (FD: " << sock << "), size=" << state->expected_body_length << std::endl;
                     return IOStatus::ERROR_DEAD;

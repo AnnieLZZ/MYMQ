@@ -491,7 +491,7 @@ public:
             TopicPartition tp{topic, partition};
             map_OffsetAndMetadata[tp] = {offset, client_gen_id};
 
-            return Err::NULL_ERROR;
+            return Err::Success;
         }
 
 
@@ -530,7 +530,7 @@ public:
             if(!all_success){
                 return Err::GENERATION_EXPIRED;
             }
-            return Err::NULL_ERROR;
+            return Err::Success;
         }
 
         bool get_committed_offset(const std::string& topic, size_t partition,size_t& offset_ref) {

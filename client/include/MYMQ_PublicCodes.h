@@ -163,6 +163,12 @@ struct TopicPartition
     bool operator==(const TopicPartition& other) const {
         return topic == other.topic && partition == other.partition;
     }
+    bool operator<(const TopicPartition& other) const {
+        if (topic != other.topic) {
+            return topic < other.topic;
+        }
+        return partition < other.partition;
+    }
 };
 
 

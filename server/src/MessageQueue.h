@@ -81,7 +81,7 @@ public:
 
             if (err != Err::FULL_SEGMENT) {
                 // 写入成功（或非 Full 错误），更新 EndOffset 并返回
-                if (err == Err::NULL_ERROR) {
+                if (err == Err::Success) {
                     uint64_t next_val = curr_write_segment->next_offset();
                     end_offset.store(next_val, std::memory_order_release);
                 }
@@ -99,7 +99,7 @@ public:
         if (curr_write_segment != segment_to_write) {
             // 已经被别的线程轮转过了，尝试直接写入新的 Segment
             auto [offset, err] = curr_write_segment->append(msg_view);
-            if (err == Err::NULL_ERROR) {
+            if (err == Err::Success) {
 
             }
             return err; // 无论是否再次 Full，这里简单返回，或者你可以做循环重试
@@ -111,7 +111,7 @@ public:
 
         // 写入新 Segment
         auto pair = curr_write_segment->append(msg_view);
-        if (pair.second == Err::NULL_ERROR) {
+        if (pair.second == Err::Success) {
              uint64_t next_val = curr_write_segment->next_offset();
              end_offset.store(next_val, std::memory_order_release);
         }
@@ -586,7 +586,7 @@ public:
       if(!res){
           return Err::UNKNOWN_OFFSET_KEY;
       }
-        return Err::NULL_ERROR;
+        return Err::Success;
     }
 
      Err leave_group(const std::string& group_id,const std::string& memberid){
@@ -607,7 +607,7 @@ public:
        if(!res){
            return Err::MEMBER_NOT_FOUND;
        }
-       return Err::NULL_ERROR;
+       return Err::Success;
     }
 
     // 3. Heartbeat: 消费者发送心跳
@@ -878,7 +878,7 @@ public:
         auto partition_ptr=cac->second;
         cac.release();
        auto res = partition_ptr->push(msg_view);
-       if(res == Err::NULL_ERROR) {
+       if(res == Err::Success) {
            // 【新增】如果有挂起的 Pull 请求，尝试唤醒
            try_complete_purgatory(topicname, partition);
        }
@@ -898,7 +898,7 @@ public:
             return {MesLoc{},Err::NO_RECORD};
         }
 
-        return {locinf,Err::NULL_ERROR};
+        return {locinf,Err::Success};
 
     }
 
@@ -1007,7 +1007,7 @@ private:
             // 尝试再次拉取
             auto res = pull(list_it->offset, list_it->topic, list_it->partition, list_it->bytes_need);
             
-            if (res.second == Err::NULL_ERROR) {
+            if (res.second == Err::Success) {
                 // 成功拉取到数据 -> 发送响应并移除请求
                 send_file_packet(list_it->session, Eve::SERVER_RESPONSE_PULL_DATA, list_it->correlation_id, list_it->ack_level, res.first, list_it->topic, list_it->partition, list_it->offset);
                 list_it = list.erase(list_it);
@@ -1101,7 +1101,7 @@ private:
                 }
                 auto res= pull(offset,topicname,partition,bytes_need);
                 bool failed=1;
-                if(res.second==Err::NULL_ERROR){
+                if(res.second==Err::Success){
                     send_file_packet(session, Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, res.first, topicname, partition, offset);
                     failed=0;
 
@@ -1207,7 +1207,7 @@ private:
                 }
 
                 auto error= commit_sync(groupid,memberid,generationid,topicname,partition,offset_digit);
-                if(error==Err::NULL_ERROR&&consumer_offset_manager_ptr_){
+                if(error==Err::Success&&consumer_offset_manager_ptr_){
                     MB mb_payload;
                     mb_payload.append(key_gtp);
                     mb_payload.append_size_t(offset_digit);
@@ -1225,7 +1225,7 @@ private:
                     }
 
                     auto persist_err= consumer_offset_manager_ptr_->commit_sync(consumeroffset_parid_hash, Byte_view_pair{payload.data(), static_cast<uint32_t>(payload.size())});
-                    if(persist_err!=Err::NULL_ERROR){
+                    if(persist_err!=Err::Success){
                         error=persist_err;
                     }
                 }
@@ -1437,7 +1437,7 @@ private:
          MB mb_metadata;
          mb_metadata.append(topic);
          mb_metadata.append_size_t(partition);
-         mb_metadata.append_uint16(0); // ErrorCode = 0 (Success)
+         mb_metadata.append_uint16(static_cast<uint16_t>(Err::Success));
          mb_metadata.append_size_t(loc.offset_next_to_consume);
          mb_metadata.append_size_t(loc.length); // Data Length
 

@@ -399,7 +399,7 @@ public:
         // 更新逻辑 Offset (原子变量，本身就是原子的)
         next_offset_ += msg_num;
 
-        return {current_offset, Err::NULL_ERROR};
+        return {current_offset, Err::Success};
     }
 
     void flush_log() {
