@@ -147,6 +147,8 @@ target_link_libraries(MYMQ
 # --- 6. 创建可执行文件 ---
 add_executable(MyMQ_App main.cpp)
 add_executable(MyMQ_PerfProbe perf_probe.cpp)
+target_include_directories(MyMQ_App PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
+target_include_directories(MyMQ_PerfProbe PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/generated)
 
 # --- 6a. 复制 config 目录到构建目录 ---
 add_custom_target(CopyConfig
