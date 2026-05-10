@@ -3,9 +3,10 @@
 
 #include"Mmapfile.h"
 #include"MYMQ_Publiccodes.h"
-#include <sys/uio.h>
 #include"CONFIG_MANAGER.h"
+#include"Printqueue.h"
 #include"MYMQ_Server_ns.h"
+#include <vector>
 using Err=MYMQ_Public::CommonErrorCode;
 using MesLoc=MYMQ_Server::MessageLocation;
 
@@ -80,6 +81,45 @@ public:
         m_receiver = std::move(m_source);
     }
 
+    static bool try_parse_record_count(const unsigned char* record_batch, size_t record_batch_len, uint32_t& out_count) {
+        constexpr size_t kKafkaRecordBatchHeaderSize = 8 + 4 + 4 + 1 + 4 + 2 + 4 + 8 + 8 + 8 + 2 + 4 + 4;
+        constexpr size_t kRecordCountOffset = kKafkaRecordBatchHeaderSize - 4;
+        if (!record_batch || record_batch_len < kKafkaRecordBatchHeaderSize) {
+            return false;
+        }
+        uint32_t net = 0;
+        std::memcpy(&net, record_batch + kRecordCountOffset, sizeof(net));
+        out_count = ntohl(net);
+        return true;
+    }
+
+    static bool try_parse_msg_num(const unsigned char* payload_prefix, size_t prefix_len, uint32_t payload_len, uint64_t& out_msg_num) {
+        if (!payload_prefix) return false;
+
+        if (payload_len >= 61 && prefix_len >= 61 && prefix_len >= 17) {
+            uint32_t batch_len_net = 0;
+            std::memcpy(&batch_len_net, payload_prefix + 8, sizeof(batch_len_net));
+            uint32_t batch_len = ntohl(batch_len_net);
+            const bool magic_ok = payload_prefix[16] == 2;
+            const bool len_ok = (static_cast<uint64_t>(batch_len) + 12ULL) == static_cast<uint64_t>(payload_len);
+            if (magic_ok && len_ok) {
+                uint32_t rc = 0;
+                if (!try_parse_record_count(payload_prefix, prefix_len, rc)) return false;
+                out_msg_num = rc;
+                return true;
+            }
+        }
+
+        if (payload_len >= 16 && prefix_len >= 16) {
+            uint64_t msg_num_net = 0;
+            std::memcpy(&msg_num_net, payload_prefix + sizeof(uint64_t), sizeof(uint64_t));
+            out_msg_num = ntohll(msg_num_net);
+            return true;
+        }
+
+        return false;
+    }
+
     bool recover_index() {
         // --- 1. 准备阶段 ---
         size_t index_size_on_disk = 0;
@@ -151,28 +191,26 @@ public:
 
 
             uint64_t current_batch_count = 0;
-
             if (payload_size >= 16) {
-                char count_buf[8];
-                // 读取位置 = 当前物理位置 + 12(LogHeader) + 8(BatchBaseOffset)
-                ssize_t count_read_bytes = pread(log_file_fd, count_buf, 8, last_phypos + 12 + 8);
-
-                if (count_read_bytes == 8) {
-                    uint64_t batch_cnt_net;
-                    std::memcpy(&batch_cnt_net, count_buf, 8);
-                    current_batch_count = ntohll(batch_cnt_net);
-                } else {
-                    // 理论上不应该发生，因为上面已经检查了文件大小
+                unsigned char prefix[61];
+                size_t prefix_len = payload_size < sizeof(prefix) ? payload_size : sizeof(prefix);
+                ssize_t count_read_bytes = pread(log_file_fd, prefix, prefix_len, last_phypos + 12);
+                if (count_read_bytes != static_cast<ssize_t>(prefix_len)) {
+                    actual_log_data_end = last_phypos;
+                    recovery_failed = true;
+                    break;
+                }
+                if (!try_parse_msg_num(prefix, prefix_len, payload_size, current_batch_count) || current_batch_count == 0) {
+                    std::cerr << "[Recover] Failed to parse msg_num at pos " << last_phypos << ". Stopping." << std::endl;
                     actual_log_data_end = last_phypos;
                     recovery_failed = true;
                     break;
                 }
             } else {
-                 // Payload 太小，连 Header 都不全，视为损坏
-                 std::cerr << "[Recover] Payload too small at pos " << last_phypos << ". Stopping." << std::endl;
-                 actual_log_data_end = last_phypos;
-                 recovery_failed = true;
-                 break;
+                std::cerr << "[Recover] Payload too small at pos " << last_phypos << ". Stopping." << std::endl;
+                actual_log_data_end = last_phypos;
+                recovery_failed = true;
+                break;
             }
 
             // -------------------------------------------------------
@@ -261,28 +299,20 @@ public:
         // 2. 获取当前逻辑 Offset
         uint64_t current_offset = next_offset_;
 
-        // msg 包含了 header(12字节) + payload
-        size_t total_log_entry_size = msg_view.second;
+        const unsigned char* payload = msg_view.first;
+        const uint32_t payload_len = msg_view.second;
+        const size_t total_log_entry_size = 12ULL + payload_len;
 
         // 3. 检查容量 (使用 Writer 自己的非原子变量判断即可)
         if (actual_physical_file_size + total_log_entry_size > max_segment_size_) {
             return {0, Err::FULL_SEGMENT};
         }
 
-        // 4. 准备数据：直接在 msg 内存上修改 (Zero Copy 准备)
-        uint64_t curr_off_net = htonll(current_offset);
-        unsigned char* writeable_ptr = const_cast<unsigned char*>(msg_view.first);
-
-        // 修改 Header Offset
-        std::memcpy(writeable_ptr, &curr_off_net, sizeof(uint64_t));
-        // 修改 Payload BaseOffset
-        std::memcpy(writeable_ptr + 12, &curr_off_net, sizeof(uint64_t));
-
-        // 解析 msg_num
-        size_t msg_num;
-        uint64_t msg_num_raw;
-        std::memcpy(&msg_num_raw, writeable_ptr + 12 + sizeof(uint64_t), sizeof(uint64_t));
-        msg_num = ntohll(msg_num_raw);
+        uint64_t msg_num = 0;
+        size_t prefix_len = payload_len < 61 ? payload_len : 61;
+        if (!try_parse_msg_num(payload, prefix_len, payload_len, msg_num) || msg_num == 0 || payload_len < sizeof(uint64_t)) {
+            return {0, Err::IO_ERROR};
+        }
 
         // 记录写入前的物理位置用于索引
         uint32_t index_physical_pos = actual_physical_file_size;
@@ -290,12 +320,23 @@ public:
         // -------------------------------------------------------
         // 5. 执行写入 (关键步骤)
         // -------------------------------------------------------
-        // 此时数据写入了 OS Cache，但 Reader 还不知道 committed_file_size 变了，
-        // 所以 Reader 就算在 pread 也不会读到这部分（因为被边界卡住了）。
-        ssize_t written = write(log_file_fd, writeable_ptr, total_log_entry_size);
+        uint64_t curr_off_net = htonll(current_offset);
+        uint32_t payload_len_net = htonl(payload_len);
+        std::vector<unsigned char> buf;
+        buf.resize(total_log_entry_size);
+        std::memcpy(buf.data(), &curr_off_net, sizeof(uint64_t));
+        std::memcpy(buf.data() + sizeof(uint64_t), &payload_len_net, sizeof(uint32_t));
+        std::memcpy(buf.data() + 12, payload, payload_len);
+        std::memcpy(buf.data() + 12, &curr_off_net, sizeof(uint64_t));
 
-        if (written != total_log_entry_size) {
-            // 写入失败处理
+        ssize_t written = 0;
+        while (true) {
+            written = ::write(log_file_fd, buf.data(), buf.size());
+            if (written < 0 && errno == EINTR) continue;
+            break;
+        }
+
+        if (written != static_cast<ssize_t>(buf.size())) {
             ftruncate(log_file_fd, actual_physical_file_size);
             return {0, Err::IO_ERROR};
         }
@@ -358,7 +399,7 @@ public:
         // 更新逻辑 Offset (原子变量，本身就是原子的)
         next_offset_ += msg_num;
 
-        return {current_offset, Err::NULL_ERROR};
+        return {current_offset, Err::Success};
     }
 
     void flush_log() {
@@ -502,79 +543,36 @@ log_bytes_since_last_flush.store(0);
             } else {
                 // 检查 Target 是否在 Batch 内部
                 if (batch_len >= 16) {
-                    char count_buf[8];
-                    // Count 位于 Payload 偏移 8 字节处 (Header 12 + 8 = 20)
-                    if (pread(log_file_fd, count_buf, 8, current_scan_pos + 20) == 8) {
-                        uint64_t cnt_net;
-                        std::memcpy(&cnt_net, count_buf, 8);
-                        uint64_t batch_count = ntohll(cnt_net);
-
-                        if (batch_base_offset + batch_count > target_offset) {
-                            is_target_batch = true;
+                    unsigned char prefix[61];
+                    size_t prefix_len = batch_len < sizeof(prefix) ? batch_len : sizeof(prefix);
+                    if (pread(log_file_fd, prefix, prefix_len, current_scan_pos + 12) == static_cast<ssize_t>(prefix_len)) {
+                        uint64_t batch_count = 0;
+                        if (try_parse_msg_num(prefix, prefix_len, batch_len, batch_count) && batch_count > 0) {
+                            if (batch_base_offset + batch_count > target_offset) {
+                                is_target_batch = true;
+                            }
                         }
                     }
                 }
             }
 
             if (is_target_batch) {
-                // --- 4. 命中！开始累积数据并计算尾部 Offset ---
                 loc.found = 1;
                 loc.file_descriptor = log_file_fd;
-                loc.offset_in_file = static_cast<off_t>(current_scan_pos);
-                loc.offset_next_to_consume = batch_base_offset;
-
-                size_t accumulated_len = 0;
-                size_t accumulate_pos = current_scan_pos;
-
-                // 循环读取后续消息，直到满足 byte_need
-                // 注意这里也使用 logsize (safe_log_limit) 控制边界
-                while (accumulated_len < byte_need && accumulate_pos < logsize) {
-                    char temp_buf[28];
-                    // 确保读取不越界
-                    if (accumulate_pos + 12 > logsize) break;
-
-                    // 先读 28 字节
-                    size_t bytes_to_read = 28;
-                    if (accumulate_pos + bytes_to_read > logsize) bytes_to_read = logsize - accumulate_pos;
-
-                    if (pread(log_file_fd, temp_buf, bytes_to_read, accumulate_pos) < 12) break;
-
-                    // 解析 Header
-                    uint64_t this_off_net;
-                    uint32_t this_len_net;
-                    std::memcpy(&this_off_net, temp_buf, 8);
-                    std::memcpy(&this_len_net, temp_buf + 8, 4);
-
-                    uint64_t this_base = ntohll(this_off_net);
-                    uint32_t this_len = ntohl(this_len_net);
-                    size_t this_total_size = 12 + this_len;
-
-                    // 完整性检查
-                    if (accumulate_pos + this_total_size > logsize) break;
-
-                    // 解析 Count
-                    uint64_t this_count = 0;
-                    if (this_len >= 16 && bytes_to_read >= 28) {
-                        uint64_t cnt_net;
-                        std::memcpy(&cnt_net, temp_buf + 20, 8);
-                        this_count = ntohll(cnt_net);
-                    } else if (this_len >= 16) {
-                        char cnt_buf[8];
-                        if (pread(log_file_fd, cnt_buf, 8, accumulate_pos + 20) == 8) {
-                            uint64_t cnt_net;
-                            std::memcpy(&cnt_net, cnt_buf, 8);
-                            this_count = ntohll(cnt_net);
-                        }
+                loc.offset_in_file = static_cast<off_t>(current_scan_pos + 12);
+                loc.length = batch_len;
+                uint64_t batch_count = 0;
+                if (batch_len >= 16) {
+                    unsigned char prefix[61];
+                    size_t prefix_len = batch_len < sizeof(prefix) ? batch_len : sizeof(prefix);
+                    if (pread(log_file_fd, prefix, prefix_len, current_scan_pos + 12) == static_cast<ssize_t>(prefix_len)) {
+                        (void)try_parse_msg_num(prefix, prefix_len, batch_len, batch_count);
                     }
-
-                    // 更新返回的尾部 Offset
-                    loc.offset_next_to_consume = this_base + this_count;
-
-                    accumulated_len += this_total_size;
-                    accumulate_pos += this_total_size;
                 }
-
-                loc.length = accumulated_len;
+                if (batch_count == 0) {
+                    return MesLoc{};
+                }
+                loc.offset_next_to_consume = batch_base_offset + batch_count;
                 return loc;
             }
 
@@ -582,6 +580,28 @@ log_bytes_since_last_flush.store(0);
         }
 
         return loc;
+    }
+
+    std::vector<std::vector<unsigned char>> dump_payloads_snapshot() {
+        std::vector<std::vector<unsigned char>> result;
+        size_t logsize = committed_file_size_.load(std::memory_order_acquire);
+        size_t pos = 0;
+        while (pos + 12 <= logsize) {
+            char header_buf[12];
+            ssize_t r = pread(log_file_fd, header_buf, 12, pos);
+            if (r < 12) break;
+            uint32_t size_net;
+            std::memcpy(&size_net, header_buf + 8, 4);
+            uint32_t payload_len = ntohl(size_net);
+            if (payload_len == 0) break;
+            if (pos + 12ULL + payload_len > logsize) break;
+            std::vector<unsigned char> payload(payload_len);
+            ssize_t r2 = pread(log_file_fd, payload.data(), payload_len, pos + 12);
+            if (r2 < static_cast<ssize_t>(payload_len)) break;
+            result.emplace_back(std::move(payload));
+            pos += 12ULL + payload_len;
+        }
+        return result;
     }
 
     uint64_t base_offset() const { return base_offset_; }

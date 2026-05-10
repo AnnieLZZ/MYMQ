@@ -9,8 +9,12 @@
 #include <cstdint>
 #include<unordered_set>
 
+namespace MYMQ {
+namespace Client {
 class MYMQ_Consumeruse;
 class MYMQ_Produceruse;
+}
+}
 
 
 class MYMQ_Producer {
@@ -35,10 +39,11 @@ public:
                     MYMQ_Public::PushResponceCallback cb=MYMQ_Public::PushResponceCallback());
 
     void create_topic(std::string topicname, size_t parti_num = 1);
+    void stop();
 
 private:
     // 2. 唯一的成员变量：指向实现的指针
-    std::unique_ptr<MYMQ_Produceruse> pimpl;
+    std::unique_ptr<MYMQ::Client::MYMQ_Produceruse> pimpl;
 };
 
 
@@ -94,10 +99,11 @@ void  trigger_pull();
 
     bool get_is_ingroup();
 
-    void set_local_pull_bytes_once(size_t bytes);
+    void set_pull_max_record_num_local(size_t num);
+    void set_pull_fetch_min_bytes(size_t bytes);
 
 private:
-    std::unique_ptr<MYMQ_Consumeruse> pimpl;
+    std::unique_ptr<MYMQ::Client::MYMQ_Consumeruse> pimpl;
 };
 
 

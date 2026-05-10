@@ -356,7 +356,7 @@ struct HeartbeatResponce{
 
     size_t generation_id{0};
     std::map<std::string, std::set<size_t>> assign;
-    MYMQ_Public::CommonErrorCode errorcode=MYMQ_Public::CommonErrorCode::NULL_ERROR;
+    MYMQ_Public::CommonErrorCode errorcode=MYMQ_Public::CommonErrorCode::Success;
     HeartbeatResponce(size_t genid,std::map<std::string, std::set<size_t>> assign_=std::map<std::string, std::set<size_t>>{}):generation_id(genid),assign(assign_){};
     HeartbeatResponce()=default;
 

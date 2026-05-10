@@ -3,8 +3,8 @@
 
 #include "Timer.h"
 #include "CONFIG_MANAGER.h"
-#include "MYMQ_innercodes.h"
-#include"MYMQ_Publiccodes.h"
+// #include "MYMQ_innercodes.h" // Removed MYMQ dependency
+// #include "MYMQ_Publiccodes.h" // Removed MYMQ dependency
 #include "Printqueue.h"
 #include "tbb/concurrent_hash_map.h"
 #include <arpa/inet.h>
@@ -18,120 +18,303 @@
 #include <netinet/in.h>
 #include <sys/sendfile.h>
 #include <variant>
+#include <deque>
+#include <vector>
+#include <memory>
+#include <functional>
+#include <atomic>
+#include <mutex>
+#include <shared_mutex>
 #include <netinet/in.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
-#include"SharedThreadPool.h"
-#include"MYMQ_Server_ns.h"
-
-using Mybyte = std::vector<unsigned char>;
-using Eve= MYMQ::EventType;
-using MesLoc=MYMQ_Server::MessageLocation;
-using Err=MYMQ_Public::CommonErrorCode;
-using ClientState=MYMQ_Server::ClientState;
-using TcpSession=MYMQ_Server::TcpSession;
-using SendFileTask=MYMQ_Server::SendFileTask;
-
-
-// 辅助函数（保持不变）
-
-
-void out(const std::string& str, bool perior = 0){
-//    Printqueue::instance().out(str,0,perior);
-}
-
-void cerr(const std::string& str, bool perior = 0){
-//    Printqueue::instance().out(str,1,perior);
-}
-
-
-std::string now_ms_time_gen_str() {
-    std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
-    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-
-    std::tm p_tm_storage; // 使用本地 tm 结构体
-    std::tm* p_tm = nullptr;
-
-#ifdef _WIN32
-    // 在 Windows 上使用 localtime_s
-    if (localtime_s(&p_tm_storage, &now_c) == 0) {
-        p_tm = &p_tm_storage;
-    }
+#include "SharedThreadPool.h"
+#include <new>
+#if __has_include(<mimalloc.h>)
+#include <mimalloc.h>
 #else
-    // 在 POSIX 系统上使用 localtime_r
-    if (localtime_r(&now_c, &p_tm_storage) != nullptr) {
-        p_tm = &p_tm_storage;
-    }
+#include "../thirdparty/mimalloc/include/mimalloc.h"
 #endif
+// #include "MYMQ_Server_ns.h" // Removed MYMQ dependency
 
-    if (p_tm == nullptr) {
-        // 处理错误，例如返回一个默认字符串
-        return "[Time Error]";
-    }
+// Generic Networking Types
+namespace Net {
 
-    std::stringstream ss_full;
-    ss_full << std::put_time(p_tm, "%Y-%m-%d %H:%M:%S");
+    class ReceiveBufferPool {
+    public:
+        static ReceiveBufferPool& instance() {
+            static ReceiveBufferPool pool;
+            return pool;
+        }
 
-    auto duration_since_epoch = now.time_since_epoch();
-    auto seconds_part = std::chrono::duration_cast<std::chrono::seconds>(duration_since_epoch);
-    auto fractional_seconds = duration_since_epoch - seconds_part;
-    auto milliseconds_part = std::chrono::duration_cast<std::chrono::milliseconds>(fractional_seconds);
+        std::shared_ptr<std::vector<unsigned char>> acquire(size_t required_size) {
+            std::vector<unsigned char>* picked = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mtx_);
+                auto best_it = free_buffers_.end();
+                for (auto it = free_buffers_.begin(); it != free_buffers_.end(); ++it) {
+                    if ((*it)->capacity() >= required_size &&
+                        (best_it == free_buffers_.end() || (*it)->capacity() < (*best_it)->capacity())) {
+                        best_it = it;
+                    }
+                }
+                if (best_it != free_buffers_.end()) {
+                    picked = *best_it;
+                    free_buffers_.erase(best_it);
+                }
+            }
 
-    ss_full << "." << std::setfill('0') << std::setw(3) << milliseconds_part.count();
-    return ss_full.str();
+            if (!picked) {
+                picked = create_buffer();
+                if (required_size > 0) {
+                    picked->reserve(required_size);
+                }
+            }
+
+            picked->resize(required_size);
+            return std::shared_ptr<std::vector<unsigned char>>(picked, [this](std::vector<unsigned char>* buf) {
+                this->release(buf);
+            });
+        }
+
+    private:
+        void release(std::vector<unsigned char>* buf) {
+            if (!buf) return;
+            constexpr size_t kMaxReusableCapacity = 4ULL * 1024 * 1024;
+            constexpr size_t kMaxFreeBuffers = 4096;
+            if (buf->capacity() > kMaxReusableCapacity) {
+                destroy_buffer(buf);
+                return;
+            }
+            buf->clear();
+            std::lock_guard<std::mutex> lock(mtx_);
+            if (free_buffers_.size() >= kMaxFreeBuffers) {
+                destroy_buffer(buf);
+                return;
+            }
+            free_buffers_.push_back(buf);
+        }
+
+        static std::vector<unsigned char>* create_buffer() {
+            void* raw = mi_malloc(sizeof(std::vector<unsigned char>));
+            if (!raw) {
+                throw std::bad_alloc();
+            }
+            return new(raw) std::vector<unsigned char>();
+        }
+
+        static void destroy_buffer(std::vector<unsigned char>* buf) {
+            if (!buf) return;
+            std::destroy_at(buf);
+            mi_free(buf);
+        }
+
+        std::mutex mtx_;
+        std::vector<std::vector<unsigned char>*> free_buffers_;
+    };
+
+    struct FileSendTask {
+        int in_fd;           // File descriptor
+        off_t offset;        // Start offset in file
+        size_t length;       // Length to send
+        size_t sent_so_far;  // Internal tracking
+
+        // Header to send before the file content
+        std::vector<unsigned char> header_data;
+        size_t header_send_offset = 0;
+
+        // Metadata for callbacks/logging (Generic user data could be added here if needed)
+        // For now, we keep it simple. If the user needs to track correlation_id, 
+        // they can capture it in the completion callback (future feature).
+        
+        FileSendTask(int fd, off_t off, size_t len, std::vector<unsigned char> hdr)
+            : in_fd(fd), offset(off), length(len), sent_so_far(0), header_data(std::move(hdr)) {}
+    };
+
+    class ClientState {
+    public:
+        enum State {
+            READING_HEADER,
+            READING_BODY
+        };
+
+        // State Management
+        State current_state = READING_HEADER;
+
+        // Buffers
+        std::vector<unsigned char> header_buffer;
+        size_t bytes_read_in_header = 0;
+
+        std::shared_ptr<std::vector<unsigned char>> body_buffer;
+        size_t bytes_read_in_body = 0;
+
+        // Protocol Fields (Generic)
+        uint32_t expected_body_length = 0;
+        
+        // Added for MYMQ compatibility
+        uint16_t event_type = 0;
+        uint32_t correlation_id = 0;
+        uint16_t ack_level = 0;
+        bool id_registered = false;
+        uint16_t channel_role = 0;
+        
+        // These were MYMQ specific, but are common enough for a length-prefixed protocol.
+        // We can keep them generic or parse them in the callback.
+        // To be fully decoupled, the Server should only care about LENGTH.
+        // But for convenience, we store the parsed header fields here if the protocol is fixed.
+        // Let's assume the Server supports a pluggable Header Parser, 
+        // OR we just expose the raw header buffer to the callback.
+        // For this refactor, we will expose raw header to callback.
+
+        std::atomic<bool> is_closing{false};
+        int fd = -1;
+
+        std::string clientid = "UNKNOWN"; // Generic ID
+
+        SSL* ssl = nullptr;
+        bool is_handshake_complete = false;
+        bool enable_sendfile = false;
+
+        bool epoll_out_registered = false; 
+
+        // Send Queue
+        using SendItem = std::variant<std::vector<unsigned char>, FileSendTask>;
+
+        std::deque<SendItem> send_queue;
+        size_t current_vec_send_offset = 0; 
+        bool is_writing = false;
+        std::mutex send_queue_mtx; 
+
+        // Callback to notify the event loop that data is ready to be written
+        // This is crucial for async sends (e.g. from other threads) to wake up epoll
+        std::function<void(int)> on_write_ready;
+
+        ClientState(size_t header_size) : header_buffer(header_size) {}
+        ClientState() = default;
+
+        bool is_closed(){ return is_closing.load(); }
+        int get_fd(){ return fd; }
+
+        void enqueue_message(std::variant<std::vector<unsigned char>, FileSendTask> payload) {
+            std::unique_lock<std::mutex> statelock(this->send_queue_mtx);
+            bool was_empty = send_queue.empty();
+            send_queue.emplace_back(std::move(payload));
+            if (was_empty) {
+                is_writing = true;
+                if(on_write_ready && fd != -1) {
+                     on_write_ready(fd);
+                }
+            }
+        }
+    };
+
+    class TcpSession {
+    public:
+        TcpSession(std::shared_ptr<ClientState> state) : state_(state) {
+            if(state) clientid = state->clientid;
+        }
+
+        void send(std::vector<unsigned char> msg) {
+            auto state = state_.lock();
+            if (!state || state->is_closed()) return;
+            state->enqueue_message(std::move(msg));
+        }
+
+        void send_file(FileSendTask task) {
+            auto state = state_.lock();
+            if (!state || state->is_closed()) return;
+            state->enqueue_message(std::move(task));
+        }
+
+        int fd() const {
+            auto state = state_.lock();
+            return state ? state->get_fd() : -1;
+        }
+
+        bool is_connected() const {
+            auto state = state_.lock();
+            return state && !state->is_closed();
+        }
+        std::string get_clientid(){
+            return clientid;
+        }
+        
+        void set_clientid(const std::string& id) {
+            auto state = state_.lock();
+            if (state) {
+                state->clientid = id;
+                clientid = id;
+            }
+        }
+        
+        uint16_t get_channel_role() const {
+            auto state = state_.lock();
+            return state ? state->channel_role : 0;
+        }
+        
+        void set_channel_role(uint16_t role) {
+            auto state = state_.lock();
+            if (state) {
+                state->channel_role = role;
+            }
+        }
+
+    private:
+        std::weak_ptr<ClientState> state_;
+        std::string clientid;
+    };
 }
 
+using Net::ClientState;
+using Net::TcpSession;
+using Net::FileSendTask;
 
-
-
-
+// Helper for time string (keep as is)
+inline std::string now_ms_time_gen_str() {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    auto ms = duration_cast<milliseconds>(now.time_since_epoch()) % 1000;
+    std::time_t t = system_clock::to_time_t(now);
+    std::tm tm_local{};
+    localtime_r(&t, &tm_local);
+    std::ostringstream oss;
+    oss << std::put_time(&tm_local, "%Y-%m-%d %H:%M:%S") << '.'
+        << std::setw(3) << std::setfill('0') << ms.count();
+    return oss.str();
+}
 
 using ClientStateMap = tbb::concurrent_hash_map<int, std::shared_ptr<ClientState>>;
 
-class Server{
+class Server {
 public:
-    // ClientState 结构体用于管理每个客户端的读取状态
-
-  enum class IOStatus {
-        OK_WAITING,      // 数据读完了/未就绪，等待下次 Epoll (对应之前的 return true)
-        OK_COMPLETED,    // 成功处理完一条完整消息，【必须立即尝试读取下一条】
-        ERROR_DEAD       // 发生致命错误，断开连接 (对应之前的 return false)
+    enum class IOStatus {
+        OK_WAITING,      
+        OK_COMPLETED,    
+        ERROR_DEAD       
     };
 
+    // Callback now gives access to Header and Body
+    // User is responsible for parsing the Header to get Type/ID/Ack
+    using ClientMessageCallback = std::function<void(
+        TcpSession& session,
+        const std::vector<unsigned char>& header, // Raw Header
+        std::shared_ptr<std::vector<unsigned char>> body
+    )>;
 
-
-
-
-    Server() {
+    Server(size_t header_size = 12) : HEADER_SIZE(header_size) { // Default 12 for MYMQ compatibility
         init_sys();
     }
 
     ~Server() {
-
-        if (server_fd != -1) {
-            close(server_fd);
-            cerr( "Server socket closed." );
-
-        }
-        if (epfd_ != -1) {
-            close(epfd_);
-            cerr("Epoll instance closed.");
-
-        }
+        if (server_fd != -1) { close(server_fd); }
+        if (epfd_ != -1) { close(epfd_); }
     }
-    using ClientMessageCallback = std::function<void(
-        TcpSession& session,         // 核心变化：传入 Session 对象
-        uint16_t event_type,
-        uint32_t correlation_id,
-        uint16_t ack_level,
-        Mybyte msg_body
-    )>;
 
-    // 设置回调函数的方法
     void set_client_message_callback(ClientMessageCallback cb) {
         std::unique_lock<std::shared_mutex> ulock(mtx_callback);
         client_msg_callback_ = cb;
     }
+
 
 
 
@@ -143,7 +326,7 @@ public:
             cerr("IP not found");
         }
         PORT= cm.getint("port");
-        HEADER_SIZE=MYMQ::HEADER_SIZE;
+        // HEADER_SIZE is set in constructor
         msg_body_limit=cm.getull("msgbodylimit_len");
         check_connect_liveness_ms=cm.getint("livenesscheck_ms");
 
@@ -256,7 +439,7 @@ public:
         running_ = true;
 
         while (running_) {
-            int event_num = epoll_wait(epfd_, events.data(), MAX_EVENT_NUM, -1);
+            int event_num = epoll_wait(epfd_, events.data(), MAX_EVENT_NUM, 200);
 
             if (event_num == -1) {
                 if (errno == EINTR) {
@@ -314,7 +497,7 @@ public:
                         SSL_set_fd(ssl, new_socket);
 
                         struct epoll_event client_event;
-                        client_event.events = EPOLLIN | EPOLLET | EPOLLONESHOT;
+                        client_event.events = EPOLLIN | EPOLLET; // Removed EPOLLONESHOT for optimization
                         client_event.data.fd = new_socket;
 
                         // [安全检查 2] 如果加入 epoll 失败，要释放 SSL 内存
@@ -329,8 +512,19 @@ public:
                         ClientStateMap::accessor ac;
                         map_client_states.insert(ac,new_socket);
                         ac->second=std::make_unique<ClientState>(HEADER_SIZE);
+                        ac->second->fd = new_socket; // Set FD
                         ac->second->ssl = ssl;                 // 保存 SSL 指针
                         ac->second->is_handshake_complete = false; // 标记握手未完成
+
+                        // Set wakeup callback for async writes
+                        ac->second->on_write_ready = [this](int client_fd) {
+                            struct epoll_event ev;
+                            ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
+                            ev.data.fd = client_fd;
+                            // epoll_ctl is thread-safe
+                            epoll_ctl(this->epfd_, EPOLL_CTL_MOD, client_fd, &ev);
+                        };
+
                         ac.release();
 
                         cerr("[" + now_ms_time_gen_str() + "] [信息] 新连接 FD: " +std::to_string( new_socket ));
@@ -425,6 +619,13 @@ public:
                                                 if (status == IOStatus::ERROR_DEAD) {
                                                     client_alive = false;
                                                 }
+                                                
+                                                // [性能优化] 处理完业务逻辑后，如果有数据待发送，尝试立即发送
+                                                // 避免依赖下一次 epoll_wait 的 EPOLLOUT 触发，减少系统调用和上下文切换
+                                                if (client_alive && !client->send_queue.empty()) {
+                                                     // 直接复用 handle_write_event 逻辑
+                                                     client_alive = handle_write_event(fd, *client);
+                                                }
                                             }
                                         }
 
@@ -434,33 +635,41 @@ public:
                                             client_alive = handle_write_event(fd, *client);
                                         }
 
-                                        // --- 标签: 检查是否需要重置 EPOLLONESHOT ---
+                                        // --- 标签: 检查是否需要更新 EPOLL 状态 ---
                                         CHECK_REARM:
 
-                                        // D. 重置 EPOLLONESHOT
-                                        // 此时没有 Map 锁，可以安全调用 epoll_ctl
-                                        if (client_alive && need_rearm_epoll) {
-                                            struct epoll_event ev;
-                                            // 基础事件：读 + 边缘 + 单次
-                                            uint32_t events = EPOLLIN | EPOLLET | EPOLLONESHOT;
-
-                                            // 检查是否需要写
-                                            // 即使这里不加锁也大致安全，因为原子性或者 state 内部有锁
-                                            // 为了严谨，可以锁一下 client->send_queue_mtx 来检查 is_writing
+                                        if (client_alive) {
+                                            bool should_be_writing = false;
                                             {
                                                 std::lock_guard<std::mutex> lock(client->send_queue_mtx);
-                                                if (client->is_writing) {
-                                                    events |= EPOLLOUT;
+                                                should_be_writing = client->is_writing;
+                                            }
+
+                                            // Optimization: Only call epoll_ctl if the state actually changes
+                                            if (should_be_writing && !client->epoll_out_registered) {
+                                                // Need to ADD EPOLLOUT
+                                                struct epoll_event ev;
+                                                ev.events = EPOLLIN | EPOLLET | EPOLLOUT;
+                                                ev.data.fd = fd;
+                                                if (epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == 0) {
+                                                    client->epoll_out_registered = true;
+                                                } else {
+                                                    // Handle error (e.g. client disconnected)
+                                                    client_alive = false;
+                                                }
+                                            } 
+                                            else if (!should_be_writing && client->epoll_out_registered) {
+                                                // Need to REMOVE EPOLLOUT
+                                                struct epoll_event ev;
+                                                ev.events = EPOLLIN | EPOLLET;
+                                                ev.data.fd = fd;
+                                                if (epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == 0) {
+                                                    client->epoll_out_registered = false;
+                                                } else {
+                                                     client_alive = false;
                                                 }
                                             }
-
-                                            ev.events = events;
-                                            ev.data.fd = fd;
-
-                                            if (epoll_ctl(epfd_, EPOLL_CTL_MOD, fd, &ev) == -1) {
-                                                // 如果重置失败（比如 fd 刚好被关了），当作连接死亡处理
-                                                client_alive = false;
-                                            }
+                                            // Else: No change needed, save the syscall!
                                         }
 
                                         // =======================================================
@@ -470,18 +679,10 @@ public:
                                             // 1. 标记逻辑死亡，阻止后续异步操作
                                             client->is_closing.store(true);
 
-                                            // 2. 从 Map 中移除 (需要重新获取锁)
-                                            {
-                                                ClientStateMap::accessor ac;
-                                                if (map_client_states.find(ac, fd)) {
-                                                    map_client_states.erase(ac);
-                                                }
-                                            }
-
-                                            // 3. 关闭连接
+                                            // 2. 关闭连接
                                             // fd 是值拷贝进来的，依然有效
                                             // client 指针在这里析构时，如果引用计数归零，会自动释放 ClientState 内存
-                                            close_connection(fd);
+                                            close_connection(fd, client);
                                         }
                                     });
 
@@ -503,31 +704,24 @@ public:
 
     }
 
-    void close_connection(int fd){
+    void close_connection(int fd, const std::shared_ptr<ClientState>& client){
         auto time = now_ms_time_gen_str();
-        std::string clientid_to_log = "UNKNOWN";
+        std::string clientid_to_log = client ? client->clientid : "UNKNOWN";
 
-
+        if (client) {
+            client->is_closing.store(true);
+            if (client->ssl) {
+                SSL_shutdown(client->ssl);
+                SSL_free(client->ssl);
+                client->ssl = nullptr;
+            }
+        }
 
         ClientStateMap::accessor ac;
         if(map_client_states.find(ac,fd)){
             map_client_states.erase(ac);
         }
-        else{
-            std::cerr << "[" << now_ms_time_gen_str() << "] [Error] FD '" << fd << "' NOT FOUND " << std::endl;
-        }
         ac.release();
-
-        tbb::concurrent_hash_map<int, std::string>::accessor ac1;
-        if(map_clientid.find(ac1,fd)){
-            clientid_to_log=ac1->second;
-            map_clientid.erase(ac1);
-        }
-        else{
-              std::cerr << "[" << now_ms_time_gen_str() << "] [Error] FD '" << fd<< "' NOT FOUND " << std::endl;
-        }
-        ac1.release();
-
 
         out("[" + time + "][ClientID: " + clientid_to_log + "][State: Offline]" );
 
@@ -600,60 +794,12 @@ public:
                                 }
 
                             // --- 2. Handle sending a SendFileTask (header + file) ---
-                            } else if constexpr (std::is_same_v<T, SendFileTask>) {
-                               SendFileTask& task = arg;
+                            } else if constexpr (std::is_same_v<T, FileSendTask>) {
+                               FileSendTask& task = arg;
 
                                 // --- 2a. Send the header first ---
-                                if (!task.header_sent) {
-                                    // 构造 Header 的逻辑保持不变
-                                    if (task.header_data.empty()) {
-                                        MessageBuilder mb;
-                                        mb.append_string(task.topicname);
-                                        mb.append_size_t(task.partition);
-                                        mb.append_uint16(static_cast<uint16_t>(Err::NULL_ERROR));
-                                        mb.append_size_t(task.offset_next_to_consume);
-                                        auto pull_inf_additional = std::move(mb.data);
-
-                                        // --- 开始构建最终包头 ---
-                                        MessageBuilder mb_final;
-
-                                        // 1. 计算 Metadata 块的大小 (Vector 自带一个 uint32 长度前缀)
-                                        uint32_t meta_block_size = sizeof(uint32_t) + static_cast<uint32_t>(pull_inf_additional.size());
-
-                                        // 2. 计算 Task Payload 块的大小 (我们需手动加一个 uint32 长度前缀来表示 Payload 长度)
-                                        uint32_t payload_block_size = sizeof(uint32_t) + static_cast<uint32_t>(task.length);
-
-                                        // 3. 计算这两者组成的“新层级(Body)”的总大小
-                                        uint32_t body_wrapper_size = meta_block_size + payload_block_size;
-
-                                        uint32_t total_message_length = static_cast<uint32_t>(HEADER_SIZE + sizeof(uint32_t) + body_wrapper_size);
-
-
-                                        mb_final.reserve(HEADER_SIZE + sizeof(uint32_t) + meta_block_size + sizeof(uint32_t));
-
-                                        // --- 写入数据 ---
-
-                                        // [Level 0] 总长度
-                                        mb_final.append_uint32(total_message_length);
-
-                                        // [Level 1] 协议头字段
-                                        mb_final.append_uint16(static_cast<uint16_t>(Eve::SERVER_RESPONSE_PULL_DATA));
-                                        mb_final.append(task.correlation_id, task.ack_level);
-
-                                        // [Level 1] Body 层 (新增的层级，与 corr_id/ack 同级)
-                                        // 这里写入算好的 Body 总长度
-                                        mb_final.append_uint32(body_wrapper_size);
-
-                                            // [Level 2] Metadata (append_uchar_vector 会自动加上 meta 长度前缀)
-                                            mb_final.append_uchar_vector(pull_inf_additional);
-
-                                            // [Level 2] Task Payload (手动写入长度前缀，实际数据紧随其后)
-                                            mb_final.append_uint32(static_cast<uint32_t>(task.length));
-
-                                        task.header_data = std::move(mb_final.data);
-                                        task.header_send_offset = 0;
-                                    }
-
+                                if (task.header_send_offset < task.header_data.size()) {
+                                    
                                     const char* buffer_ptr = reinterpret_cast<const char*>(task.header_data.data() + task.header_send_offset);
                                     size_t remaining_header_length = task.header_data.size() - task.header_send_offset;
                                     size_t written_bytes = 0;
@@ -663,12 +809,11 @@ public:
 
                                     if (ret == 1) {
                                         task.header_send_offset += written_bytes;
-                                        if (task.header_send_offset == task.header_data.size()) {
-                                            task.header_sent = true; // Header 发送完毕
-                                        } else {
+                                        if (task.header_send_offset < task.header_data.size()) {
                                             should_break_and_wait = true; // 没发完通常意味着 buffer 满
                                             return;
                                         }
+                                        // Header sent completely, proceed to file
                                     } else {
                                         int err = SSL_get_error(ssl, 0);
                                         switch (err) {
@@ -687,10 +832,11 @@ public:
                                                 return;
                                         }
                                     }
-                                } // end if (!task.header_sent)
+                                } 
 
                                 // --- 2b. Send the file data (kTLS Zero-copy) ---
-                                if (task.header_sent) {
+                                if (task.header_send_offset == task.header_data.size()) {
+
                                     off_t current_file_offset = task.offset + task.sent_so_far;
                                     size_t remaining_file_length = task.length - task.sent_so_far;
 
@@ -847,84 +993,20 @@ private:
         }
     }
 
-
-
-    void add_clientid(std::string_view id, int sock) {
-        tbb::concurrent_hash_map<int, std::string>::accessor ac;
-        if (!map_clientid.find(ac, sock)) {
-            map_clientid.insert(ac, sock);
-            ac->second = id;
-        } else {
-            if (ac->second != id) {
-                std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 (FD: " << sock
-                          << ") 更新 ID: " << ac->second << " -> " << id << std::endl;
-                ac->second = id;
-            }
+    void handle_event(std::shared_ptr<ClientState> state, std::shared_ptr<std::vector<unsigned char>> body) {
+        ClientMessageCallback curr_cb;
+        {
+            std::shared_lock<std::shared_mutex> slock(mtx_callback);
+            curr_cb = client_msg_callback_;
+        }
+        if (curr_cb) {
+            TcpSession session(state);
+            curr_cb(session, state->header_buffer, std::move(body));
         }
     }
 
-    // 内部辅助函数
-    void delete_clientid( int sock){
-        tbb::concurrent_hash_map<int, std::string>::accessor ac;
-        if(map_clientid.find(ac,sock)){
-            map_clientid.erase(sock);
-        }
-        else{
-              std::cerr << "[" << now_ms_time_gen_str() << "] [Error] delete_clientid : FD '" << sock << "' NOT FOUND " << std::endl;
-        }
-    }
-
-    bool register_clientid( int sock, const Mybyte& body,std::shared_ptr<ClientState> state) {
-        MessageParser mp(body.data(),body.size());
-        bool success = 0;
-
-            auto userid = mp.read_string_view();
-            if (userid.empty()) {
-                cerr("[" + now_ms_time_gen_str() + "] [错误] 客户端 (FD: " +std::to_string( sock) + ") 发送了空的注册ID。" );
-            } else {
-                add_clientid(userid, sock);
-                    state->clientid = userid;
-                    state->id_registered = true; // 标记为已注册
-
-                    state->current_state = ClientState::READING_HEADER;
-                    state->bytes_read_in_header = 0;
-                    state->expected_body_length = 0;
-                    state->bytes_read_in_body = 0;
-
-                    success = 1;
-                    std::cerr << "[" << now_ms_time_gen_str() << "] [信息] 客户端 '" << userid
-                              << "' (FD: " << sock << ") 注册成功。" << std::endl;
-
-
-
-            }
-
-        return success; // 如果需要关闭，返回 false
-    }
-
-    void process_message( int sock, Mybyte&& body,std::shared_ptr<ClientState> state) {
-
-        uint16_t eventtype=state->event_type;
-
-            std::vector<unsigned char> real_body;
-        if (static_cast<Eve>(eventtype) == MYMQ::EventType::CLIENT_REQUEST_REGISTER) {
-            // 可能是客户端崩溃后但tcp检测到断联前再次重连，没必要回绝
-            auto succ =register_clientid( sock, body,state);
-            // --- 准备发送响应 ---
-            MessageBuilder mb;
-            mb.append(succ);
-            MessageBuilder mb2;
-            mb2.append(mb.data);
-           handle_event(state,std::move(mb2.data));
-
-        }
-        else{
-            // 状态：已注册
-
-            handle_event(state,std::move(body) );
-
-        }
-
+    void process_message(int sock, std::shared_ptr<std::vector<unsigned char>> body, std::shared_ptr<ClientState> state) {
+        handle_event(state, std::move(body));
     }
 
     IOStatus handle_client(int sock, std::shared_ptr<ClientState> state) {
@@ -965,29 +1047,26 @@ private:
                         return IOStatus::ERROR_DEAD;
                     }
                     state->expected_body_length = total_length - HEADER_SIZE;
-
-//                    if (state->expected_body_length > msg_body_limit) {
-//                        std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state->expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
-//                        return IOStatus::ERROR_DEAD;
-//                    }
+                    if (state->expected_body_length > msg_body_limit) {
+                        std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 收到过大消息体 (FD: " << sock << "): " << state->expected_body_length << " bytes, limit is " << msg_body_limit << std::endl;
+                        return IOStatus::ERROR_DEAD;
+                    }
 
                     if (state->expected_body_length == 0) {
                         state->current_state = ClientState::READING_HEADER;
                         state->bytes_read_in_header = 0;
                         state->bytes_read_in_body = 0;
-
-                        // 【改动 2】process_message 需要接收 shared_ptr state
-                        // 这样 handle_event 才能把 session 传给用户
-                        process_message(sock, Mybyte{}, state);
+                        process_message(sock, Net::ReceiveBufferPool::instance().acquire(0), state);
 
                         return IOStatus::OK_COMPLETED;
                     } else {
-                        // 有消息体，准备读取
-                        state->body_buffer.clear();
-                        state->body_buffer.resize(state->expected_body_length);
+                        state->body_buffer = Net::ReceiveBufferPool::instance().acquire(state->expected_body_length);
+                        if (!state->body_buffer || state->body_buffer->size() < state->expected_body_length) {
+                            std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 无法分配消息体缓冲 (FD: " << sock << "), size=" << state->expected_body_length << std::endl;
+                            return IOStatus::ERROR_DEAD;
+                        }
                         state->bytes_read_in_body = 0;
                         state->current_state = ClientState::READING_BODY;
-                        // fall-through
                     }
                 }
             } else { // ret == 0
@@ -1013,15 +1092,18 @@ private:
 
         // --- 状态 2: 正在读取消息体 ---
         if (state->current_state == ClientState::READING_BODY) {
-            // 确保 buffer 大小
-            if (state->body_buffer.size() < state->expected_body_length) {
-                state->body_buffer.resize(state->expected_body_length);
+            if (!state->body_buffer || state->body_buffer->size() < state->expected_body_length) {
+                state->body_buffer = Net::ReceiveBufferPool::instance().acquire(state->expected_body_length);
+                if (!state->body_buffer || state->body_buffer->size() < state->expected_body_length) {
+                    std::cerr << "[" << now_ms_time_gen_str() << "] [错误] 消息体缓冲无效 (FD: " << sock << "), size=" << state->expected_body_length << std::endl;
+                    return IOStatus::ERROR_DEAD;
+                }
             }
 
             if (state->bytes_read_in_body < state->expected_body_length) {
                 size_t bytes_read_this_time = 0;
                 int ret = SSL_read_ex(state->ssl,
-                                      reinterpret_cast<char*>(state->body_buffer.data() + state->bytes_read_in_body),
+                                      reinterpret_cast<char*>(state->body_buffer->data() + state->bytes_read_in_body),
                                       state->expected_body_length - state->bytes_read_in_body,
                                       &bytes_read_this_time);
 
@@ -1035,7 +1117,8 @@ private:
                         state->bytes_read_in_header = 0;
                         state->bytes_read_in_body = 0;
                         state->expected_body_length = 0;
-                        process_message(sock, std::move(state->body_buffer), state);
+                        auto ready_body = std::move(state->body_buffer);
+                        process_message(sock, std::move(ready_body), state);
 
                         return IOStatus::OK_COMPLETED;
                     }
@@ -1062,24 +1145,6 @@ private:
         }
 
         return IOStatus::OK_WAITING;
-    }
-
-    void handle_event(std::shared_ptr<ClientState> state, Mybyte msg_body) {
-
-        // 1. 准备回调
-        ClientMessageCallback curr_cb;
-        {
-            std::shared_lock<std::shared_mutex> slock(mtx_callback);
-            curr_cb = client_msg_callback_;
-        }
-
-        if (curr_cb) {
-            TcpSession session(state);
-            short type = state->event_type;
-            uint32_t cid = state->correlation_id;
-            uint16_t ack = state->ack_level;
-            curr_cb(session, type, cid, ack, std::move(msg_body));
-        }
     }
 
 private:

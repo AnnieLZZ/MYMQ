@@ -17,7 +17,7 @@ namespace MYMQ_Public {
 
 // 注意：只包含您希望用户看到的错误码。
 enum class CommonErrorCode : uint16_t {
-    NULL_ERROR=4000,
+    Success=4000,
     // MQ 错误
     GROUP_NOT_FOUND=4001,
     MEMBER_NOT_FOUND=4002,
@@ -42,18 +42,24 @@ enum class CommonErrorCode : uint16_t {
     UPDATE_GENERATION=4021,
     GENERATION_EXPIRED=4022,
 
+    QUEUE_FULL=4023,
+    PRODUCER_STOPPED=4024,
+    NETWORK_FATAL=4025,
+    TIMEOUT=4026,
+
 
 
     // Logsegment 错误
     FULL_SEGMENT=5000,
     FAILED_ALLOCATE=5001,
-    IO_ERROR=5002
+    IO_ERROR=5002,
+    UNKNOWN_SERVER_ERROR=5003 // 新增错误码
 };
 
 // ServerErrorCode 的 to_string 函数
 inline std::string to_string(CommonErrorCode code) {
     switch (code) {
-    case CommonErrorCode::NULL_ERROR: return "NULL_ERROR";
+    case CommonErrorCode::Success: return "Success";
     case CommonErrorCode::GROUP_NOT_FOUND: return "GROUP_NOT_FOUND";
     case CommonErrorCode::MEMBER_NOT_FOUND: return "MEMBER_NOT_FOUND";
     case CommonErrorCode::ILLEGAL_GENERATION: return "ILLEGAL_GENERATION";
@@ -74,6 +80,10 @@ inline std::string to_string(CommonErrorCode code) {
     case CommonErrorCode::REQUEST_TIMEOUT: return "REQUEST_TIMEOUT";
     case CommonErrorCode::UNKNOWN_TOPICPARTITION: return "UNKNOWN_TOPICPARTITION";
     case CommonErrorCode::CLIENT_NOT_IN_GROUP: return "CLIENT_NOT_IN_GROUP";
+    case CommonErrorCode::QUEUE_FULL: return "QUEUE_FULL";
+    case CommonErrorCode::PRODUCER_STOPPED: return "PRODUCER_STOPPED";
+    case CommonErrorCode::NETWORK_FATAL: return "NETWORK_FATAL";
+    case CommonErrorCode::TIMEOUT: return "TIMEOUT";
     case CommonErrorCode::FULL_SEGMENT: return "FULL_SEGMENT";
     case CommonErrorCode::FAILED_ALLOCATE: return "FAILED_ALLOCATE";
     case CommonErrorCode::IO_ERROR: return "IO_ERROR";
@@ -86,7 +96,7 @@ inline std::string to_string(CommonErrorCode code) {
 
 enum class ClientErrorCode :uint16_t{
     NOT_IN_GROUP=1000,
-    NULL_ERROR=1003,
+    Success=1003,
     PULL_TIMEOUT=1004,
     PULL_OTHER_IN_PULL=1005,
     COMMIT_SYNC_TIMEOUT=1006,
@@ -100,16 +110,27 @@ enum class ClientErrorCode :uint16_t{
     REACHED_MAX_FLYING_REQUEST=1014,
     CRC_VERIFY_FAILED=1015,
     PARTIAL_PARASE_FAILED=1016,
-    NOT_REGISTER=1017
+    NOT_REGISTER=1017,
+    PRODUCER_STOPPED=1018,
+    QUEUE_FULL=1019,
+    TIMEOUT=1020,
+    NETWORK_FATAL=1021
 
 
+};
+
+enum class ChannelRole : uint16_t {
+    UNKNOWN = 0,
+    CONTROL = 1,
+    FETCH = 2,
+    PRODUCE = 3
 };
 
 // ClientErrorCode 的 to_string 函数
 inline std::string to_string(ClientErrorCode code) {
     switch (code) {
     case ClientErrorCode::NOT_IN_GROUP: return "NOT_IN_GROUP";
-    case ClientErrorCode::NULL_ERROR: return "NULL_ERROR";
+    case ClientErrorCode::Success: return "Success";
     case ClientErrorCode::PULL_TIMEOUT: return "PULL_TIMEOUT";
     case ClientErrorCode::PULL_OTHER_IN_PULL: return "PULL_OTHER_IN_PULL";
     case ClientErrorCode::COMMIT_SYNC_TIMEOUT: return "COMMIT_SYNC_TIMEOUT";
@@ -124,6 +145,10 @@ inline std::string to_string(ClientErrorCode code) {
     case ClientErrorCode::CRC_VERIFY_FAILED: return "CRC_VERIFY_FAILED"; // <-- 补齐
     case ClientErrorCode::PARTIAL_PARASE_FAILED: return "PARTIAL_PARASE_FAILED"; // <-- 补齐
     case ClientErrorCode::NOT_REGISTER: return "NOT_REGISTER"; // <-- 补齐
+    case ClientErrorCode::PRODUCER_STOPPED: return "PRODUCER_STOPPED";
+    case ClientErrorCode::QUEUE_FULL: return "QUEUE_FULL";
+    case ClientErrorCode::TIMEOUT: return "TIMEOUT";
+    case ClientErrorCode::NETWORK_FATAL: return "NETWORK_FATAL";
     default: return "UNKNOWN_CLIENT_ERROR_CODE (" + std::to_string(static_cast<uint16_t>(code)) + ")";
     }
 }
@@ -137,6 +162,12 @@ struct TopicPartition
     TopicPartition(const std::string& topic_,size_t partition_):topic(topic_),partition(partition_) {}
     bool operator==(const TopicPartition& other) const {
         return topic == other.topic && partition == other.partition;
+    }
+    bool operator<(const TopicPartition& other) const {
+        if (topic != other.topic) {
+            return topic < other.topic;
+        }
+        return partition < other.partition;
     }
 };
 
@@ -153,6 +184,11 @@ struct CommitAsyncResponce {
     TopicPartition tp;
     size_t committed_offset;
     CommonErrorCode error;
+    
+    CommitAsyncResponce() = default;
+    CommitAsyncResponce(std::string gid, TopicPartition t, size_t off, CommonErrorCode err)
+        : groupid(std::move(gid)), tp(std::move(t)), committed_offset(off), error(err) {}
+        
     CommitAsyncResponce(const CommitAsyncResponce& resp):groupid(resp.groupid),tp(resp.tp),committed_offset(resp.committed_offset),error(resp.error) {}
 };
 

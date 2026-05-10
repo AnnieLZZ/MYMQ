@@ -93,4 +93,12 @@ private:
     std::atomic<bool> running_;
 };
 
+inline void cerr(const std::string& str) {
+    Printqueue::instance().out(str, true, false);
+}
+
+inline void out(const std::string& str) {
+    Printqueue::instance().out(str, false, false);
+}
+
 #endif // PRINTQUEUE_H

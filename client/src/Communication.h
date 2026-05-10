@@ -12,14 +12,17 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <cstring>
 #include <atomic>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <optional>
 #include <future>
 #include <memory>
 #include "Timer.h"
 #include "MYMQ_innercodes.h"
+#include "MYMQ_PublicCodes.h"
 #include "zlib.h"
 #include "readerwriterqueue.h"
 #include "tbb/concurrent_hash_map.h"
@@ -37,7 +40,7 @@
 using Mybyte = std::vector<unsigned char>;
 using MP = MessageParser;
 using Eve=MYMQ::EventType;
-using ClientState=MYMQ::MYMQ_Client::ClientState;
+using ClientState=MYMQ::Client::ClientState;
 using PendingMessage=MYMQ::PendingMessage;
 using ResponseCallback=MYMQ::ResponseCallback;
 
@@ -64,6 +67,9 @@ inline std::string now_ms_time_gen_str() {
 }
 
 
+namespace MYMQ {
+namespace Network {
+
 class Communication_client {
 public:
     // [!_MODIFIED_!] Callback simplified to match your core class's handler
@@ -73,7 +79,8 @@ public:
         enum State { READING_HEADER, READING_BODY };
         State current_state = READING_HEADER;
         std::vector<unsigned char> header_buffer;
-        std::vector<unsigned char> body_buffer;
+        std::shared_ptr<void> body_owner;
+        unsigned char* body_ptr = nullptr;
         uint32_t expected_body_length = 0;
         uint16_t event_type = 0;
         uint32_t correlation_id = 0;
@@ -85,7 +92,8 @@ public:
         void reset(size_t header_size) {
             current_state = READING_HEADER;
             header_buffer.assign(header_size, 0);
-            body_buffer.clear();
+            body_owner.reset();
+            body_ptr = nullptr;
             expected_body_length = 0;
             event_type = 0;
             correlation_id = 0;
@@ -95,15 +103,20 @@ public:
     };
 
     Communication_client(const std::string& path_,size_t request_timeout_ms) :
-        path(path_), client_state(0),request_timeout_timer(this->map_wait_responces,curr_flying_request_num,request_timeout_ms) {
+        path(path_), client_state(0), default_request_timeout_ms_(request_timeout_ms) {
     }
 
     ~Communication_client() {
         stop();
     }
 
+    void set_request_timeout_ms(size_t ms) {
+        request_timeout_ms_override_ = ms;
+    }
+
     void init() {
         if (running_.load()) return;
+        network_fatal_.store(false, std::memory_order_release);
 
 
         {
@@ -126,6 +139,29 @@ public:
             IO_buffer_size=config_mgr.get_size_t("IO_buffer_size");
             IO_buffer.resize(IO_buffer_size);
 
+        }
+
+        {
+            size_t request_timeout_ms = default_request_timeout_ms_;
+            if (request_timeout_ms_override_) {
+                request_timeout_ms = *request_timeout_ms_override_;
+            } else {
+                try {
+                    Config_manager cm_sys(path + "\\config\\sys.ini");
+                    request_timeout_ms = cm_sys.get_size_t("request_timeout_ms");
+                } catch (...) {
+                    request_timeout_ms = default_request_timeout_ms_;
+                }
+            }
+            if(!inrange(request_timeout_ms,10,3600000)){
+                request_timeout_ms = default_request_timeout_ms_;
+            }
+            request_timeout_timer = std::make_unique<RequestTimeoutQueue>(
+                this->map_wait_responces,
+                curr_flying_request_num,
+                request_timeout_ms,
+                [this] { notify_send_state(); }
+            );
         }
 
 
@@ -219,20 +255,34 @@ public:
     bool get_is_register(){
         return is_registered.load();
     }
+
+    enum class SendFailReason : uint8_t {
+        None = 0,
+        Stopped = 1,
+        QueueFull = 2,
+        InFlightFull = 3
+    };
+
     bool send_msg(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler) {
+        return try_send_msg(event_type, msg_body, std::move(handler), nullptr);
+    }
+
+    bool try_send_msg(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler, SendFailReason* fail_reason) {
+        if (!running_.load(std::memory_order_acquire)) {
+            if (fail_reason) *fail_reason = SendFailReason::Stopped;
+            return false;
+        }
+
         MessageBuilder mb;
-        // 1. 获取 ID
         uint32_t coid = Correlation_ID.fetch_add(1);
 
         uint32_t total_length_on_wire = static_cast<uint32_t>(HEADER_SIZE + sizeof(uint32_t) + msg_body.size());
         mb.reserve(total_length_on_wire);
 
-        //// HEADER 构建
         mb.append_uint32(total_length_on_wire);
         mb.append_uint16(event_type);
         mb.append_uint32(coid);
         mb.append_uint16(static_cast<uint16_t>(ack_level));
-        //// BODY 构建
         mb.append_uchar_vector(msg_body);
 
         bool need_wait_response = !(event_type == static_cast<uint16_t>(Eve::CLIENT_REQUEST_PUSH) &&
@@ -245,23 +295,96 @@ public:
                 acc->second = std::move(handler); // 转移所有权，保存回调
             }
             curr_flying_request_num++;
-            request_timeout_timer.add(coid);
+            if (request_timeout_timer) {
+                request_timeout_timer->add(coid);
+            }
         }
 
-        send_queue.try_emplace(std::move(mb.data), coid, ResponseCallback{});
+        if (!send_queue.try_emplace(std::move(mb.data), coid, ResponseCallback{})) {
+            if (need_wait_response) {
+                tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
+                if (map_wait_responces.find(acc, coid)) {
+                    map_wait_responces.erase(acc);
+                    curr_flying_request_num--;
+                    notify_send_state();
+                }
+            }
+            if (fail_reason) *fail_reason = SendFailReason::QueueFull;
+            return false;
+        }
 
-        // 4. 唤醒发送线程
         send_pending.store(true);
-        return 1;
+        notify_send_state();
+        if (fail_reason) *fail_reason = SendFailReason::None;
+        return true;
     }
 
+    bool send_msg_blocking(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler, size_t max_in_flight_requests_num, std::chrono::milliseconds timeout = std::chrono::milliseconds(60000), SendFailReason* fail_reason = nullptr) {
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+
+        while (true) {
+            if (!running_.load(std::memory_order_acquire)) {
+                if (fail_reason) *fail_reason = SendFailReason::Stopped;
+                return false;
+            }
+
+            if (max_in_flight_requests_num > 0) {
+                size_t curr_fly = curr_flying_request_num.load(std::memory_order_acquire);
+                if (curr_fly >= max_in_flight_requests_num) {
+                    std::unique_lock<std::mutex> lock(send_state_mtx_);
+                    send_state_cv_.wait_until(lock, deadline, [&] {
+                        return !running_.load(std::memory_order_acquire) ||
+                               curr_flying_request_num.load(std::memory_order_acquire) < max_in_flight_requests_num;
+                    });
+                    if (std::chrono::steady_clock::now() >= deadline) {
+                        if (fail_reason) *fail_reason = SendFailReason::InFlightFull;
+                        return false;
+                    }
+                    continue;
+                }
+            }
+
+            SendFailReason local_reason = SendFailReason::None;
+            ResponseCallback handler_attempt = handler;
+            if (try_send_msg(event_type, msg_body, std::move(handler_attempt), &local_reason)) {
+                if (fail_reason) *fail_reason = SendFailReason::None;
+                return true;
+            }
+
+            if (local_reason == SendFailReason::Stopped) {
+                if (fail_reason) *fail_reason = SendFailReason::Stopped;
+                return false;
+            }
+
+            if (std::chrono::steady_clock::now() >= deadline) {
+                if (fail_reason) *fail_reason = local_reason;
+                return false;
+            }
+
+            std::unique_lock<std::mutex> lock(send_state_mtx_);
+            send_state_cv_.wait_until(lock, deadline);
+        }
+    }
 
     void stop() {
         if (!running_.load()) return;
+        network_fatal_.store(false, std::memory_order_release);
         running_.store(false);
+        notify_send_state();
 
         if (io_thread_.joinable()) {
             io_thread_.join();
+        }
+
+        if (ssl_) {
+            SSL_shutdown(ssl_);
+            SSL_free(ssl_);
+            ssl_ = nullptr;
+        }
+
+        if (ctx_) {
+            SSL_CTX_free(ctx_);
+            ctx_ = nullptr;
         }
 
         if (clientSocket != INVALID_SOCKET) {
@@ -273,10 +396,62 @@ public:
         if (iResult != 0) {
             std::cerr << "[" << now_ms_time_gen_str() << "] WSACleanup failed: " << iResult << std::endl;
         }
+        request_timeout_timer.reset();
+    }
+
+    bool inject_inflight_for_test(uint32_t coid, ResponseCallback handler) {
+        tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
+        if (!map_wait_responces.insert(acc, coid)) {
+            return false;
+        }
+        acc->second = std::move(handler);
+        curr_flying_request_num++;
+        notify_send_state();
+        return true;
+    }
+
+    size_t drain_inflight_with_error(MYMQ_Public::CommonErrorCode code) {
+        uint16_t net = htons(static_cast<uint16_t>(code));
+        auto body = std::make_shared<Mybyte>(sizeof(uint16_t));
+        std::memcpy(body->data(), &net, sizeof(uint16_t));
+
+        std::vector<uint32_t> keys;
+        keys.reserve(map_wait_responces.size());
+        for (auto it = map_wait_responces.begin(); it != map_wait_responces.end(); ++it) {
+            keys.push_back(it->first);
+        }
+
+        std::vector<ResponseCallback> callbacks;
+        callbacks.reserve(keys.size());
+
+        tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
+        for (uint32_t coid : keys) {
+            if (map_wait_responces.find(acc, coid)) {
+                callbacks.push_back(std::move(acc->second));
+                map_wait_responces.erase(acc);
+                curr_flying_request_num--;
+            }
+        }
+        notify_send_state();
+
+        for (auto& cb : callbacks) {
+            try {
+                cb(
+                    static_cast<uint16_t>(MYMQ::EventType::EVENTTYPE_NULL),
+                    MYMQ::OwnedBytes{body->data(), body->size(), body}
+                );
+            } catch (...) {
+            }
+        }
+        return callbacks.size();
     }
 
     void set_clientid(const std::string clientid) {
         client_id_str = clientid;
+    }
+    
+    void set_channel_role(MYMQ_Public::ChannelRole role) {
+        channel_role_ = static_cast<uint16_t>(role);
     }
 
     void send_msg_prior(uint16_t event_type, const Mybyte& msg_body, ResponseCallback handler){
@@ -287,6 +462,10 @@ public:
     }
 
 private:
+    void notify_send_state() {
+        send_state_cv_.notify_all();
+    }
+
     // 尝试发送队列中的消息 (logic unchanged)
     void attemped_send() {
         if (!connection_established_.load() || !ssl_handshaked_) {
@@ -316,7 +495,9 @@ private:
                     std::cerr << "[" << now_ms_time_gen_str() << "] SSL_write failed for client_id. Error code: " << err << std::endl;
                     ERR_print_errors_fp(stderr); // 打印详细 OpenSSL 错误栈
                     client_id_message_to_send_.reset();
+                    network_fatal_.store(true, std::memory_order_release);
                     running_.store(false);
+                    notify_send_state();
                     return;
                 }
             } else {
@@ -367,8 +548,11 @@ private:
 
                     PendingMessage dummy;
                     send_queue.try_dequeue(dummy);
+                    notify_send_state();
 
+                    network_fatal_.store(true, std::memory_order_release);
                     running_.store(false);
+                    notify_send_state();
                     return;
                 }
             } else {
@@ -377,6 +561,7 @@ private:
                 if (off == msg.size()) {
                     PendingMessage dummy;
                     send_queue.try_dequeue(dummy);
+                    notify_send_state();
 
                 } else {
 
@@ -393,20 +578,23 @@ private:
         if (client_id_sent_.load()) return;
 
 
-        MessageBuilder mb_full;
-        uint16_t event_type = static_cast<uint16_t>(Eve::CLIENT_REQUEST_REGISTER);
-        uint32_t total_length_on_wire = static_cast<uint32_t>(HEADER_SIZE + sizeof(uint32_t) +client_id_str.size());
-        mb_full.reserve(total_length_on_wire);
+        MessageBuilder payload;
+        payload.append_uint16(1);
+        payload.append_uint16(channel_role_);
+        payload.append_string(client_id_str);
 
-        ////HEADER
+        const uint32_t total_length_on_wire =
+            static_cast<uint32_t>(HEADER_SIZE + sizeof(uint32_t) + payload.data.size());
+
+        MessageBuilder mb_full;
+        mb_full.reserve(total_length_on_wire);
         mb_full.append_uint32(total_length_on_wire);
-        mb_full.append_uint16(event_type);
+        mb_full.append_uint16(static_cast<uint16_t>(Eve::CLIENT_REQUEST_REGISTER));
         mb_full.append_uint32(Correlation_ID++);
         mb_full.append_uint16(static_cast<uint16_t>(ack_level));
-        ////HEADER
-        mb_full.append_string(client_id_str);
+        mb_full.append_uchar_vector(payload.data);
 
-        auto full_message = mb_full.data;
+        auto full_message = std::move(mb_full.data);
         client_id_message_to_send_ = std::make_pair(std::move(full_message), 0);
         send_pending.store(true);
         client_id_sent_.store(true);
@@ -458,6 +646,7 @@ private:
                 int lastError = WSAGetLastError();
                 if (lastError == WSAEINTR) continue;
                 std::cerr << "[" << now_ms_time_gen_str() << "] select() failed with error: " << lastError << std::endl;
+                network_fatal_.store(true, std::memory_order_release);
                 running_.store(false);
                 break;
             }
@@ -472,6 +661,7 @@ private:
                 int opt_len = sizeof(opt_val);
                 if (getsockopt(clientSocket, SOL_SOCKET, SO_ERROR, (char*)&opt_val, &opt_len) == SOCKET_ERROR) {
                     std::cerr << "[" << now_ms_time_gen_str() << "] getsockopt(SO_ERROR) failed: " << WSAGetLastError() << std::endl;
+                    network_fatal_.store(true, std::memory_order_release);
                     running_.store(false);
                     break;
                 }
@@ -486,6 +676,7 @@ private:
                     ssl_want_read_ = false;
                 } else {
                     std::cerr << "[" << now_ms_time_gen_str() << "] Non-blocking connect failed with error: " << opt_val << std::endl;
+                    network_fatal_.store(true, std::memory_order_release);
                     running_.store(false);
                     break;
                 }
@@ -519,6 +710,7 @@ private:
                         } else {
                             std::cerr << "[" << now_ms_time_gen_str() << "] SSL Handshake Failed. Error code: " << err << std::endl;
                             ERR_print_errors_fp(stderr);
+                            network_fatal_.store(true, std::memory_order_release);
                             running_.store(false);
                             break;
                         }
@@ -549,6 +741,7 @@ private:
                 if (FD_ISSET(clientSocket, &read_fds)) {
                     // 此时 handle_incoming_data 内部已经是 SSL_read 了
                     if (!handle_incoming_data()) {
+                        network_fatal_.store(true, std::memory_order_release);
                         running_.store(false);
                         break;
                     }
@@ -556,167 +749,196 @@ private:
             }
         }
 
+        if (network_fatal_.exchange(false, std::memory_order_acq_rel)) {
+            drain_inflight_with_error(MYMQ_Public::CommonErrorCode::NETWORK_FATAL);
+        }
         std::cout << "[" << now_ms_time_gen_str() << "] Client I/O loop stopped." << std::endl;
     }
     bool handle_incoming_data() {
-
-
-        // 【核心修改】死循环读取，直到 SSL 说没数据 (WANT_READ)
         while (true) {
-            size_t bytes_received = 0;
-            int ret = SSL_read_ex(ssl_, IO_buffer.data(),IO_buffer_size, &bytes_received);
-
-            // ---------------------------------------------------------
-            //情况 A: 读取失败或需要等待 (ret == 0)
-            // ---------------------------------------------------------
-            if (ret == 0) {
-                int err_code = SSL_get_error(ssl_, bytes_received);
-
-                if (err_code == SSL_ERROR_WANT_READ || err_code == SSL_ERROR_WANT_WRITE) {
-                    // [重点] 缓冲区空了，可以安全退出循环，回到 select 等待下一次通知
-                    return true;
-                }
-
-                switch (err_code) {
-                case SSL_ERROR_ZERO_RETURN:
-                    // 对端 Graceful Close
-                    cerr("The connection has been closed normally by the other party.");
-                    running_.store(false);
-                    return false; // 停止 io_loop
-
-                case SSL_ERROR_SYSCALL:
-                    // 网络中断或强制断开
-                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL Syscall error (Network broken)." << std::endl;
-                    running_.store(false);
-                    return false; // 不要 throw，返回 false 让外层退出
-
-                case SSL_ERROR_SSL:
-                    // 协议错误
-                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL Protocol error." << std::endl;
-                    ERR_print_errors_fp(stderr);
+            if (client_state.current_state == ClientState::READING_HEADER) {
+                size_t bytes_read = 0;
+                const size_t bytes_needed = HEADER_SIZE - client_state.received_bytes;
+                int ret = SSL_read_ex(
+                    ssl_,
+                    client_state.header_buffer.data() + client_state.received_bytes,
+                    bytes_needed,
+                    &bytes_read
+                );
+                if (ret == 0) {
+                    int err_code = SSL_get_error(ssl_, ret);
+                    if (err_code == SSL_ERROR_WANT_READ || err_code == SSL_ERROR_WANT_WRITE) {
+                        return true;
+                    }
+                    unsigned long ssl_err = ERR_peek_last_error();
+                    const char* reason = ssl_err ? ERR_reason_error_string(ssl_err) : nullptr;
+                    bool unexpected_eof = (err_code == SSL_ERROR_SSL &&
+                                           reason != nullptr &&
+                                           std::string(reason).find("unexpected eof while reading") != std::string::npos);
+                    bool syscall_eof = (err_code == SSL_ERROR_SYSCALL && ssl_err == 0);
+                    if (unexpected_eof || syscall_eof) {
+                        std::cout << "[" << now_ms_time_gen_str() << "] TLS peer closed connection." << std::endl;
+                        running_.store(false);
+                        return false;
+                    }
+                    if (err_code == SSL_ERROR_ZERO_RETURN) {
+                        cerr("The connection has been closed normally by the other party.");
+                    } else if (err_code == SSL_ERROR_SYSCALL) {
+                        std::cerr << "[" << now_ms_time_gen_str() << "] SSL Syscall error (Network broken)." << std::endl;
+                    } else if (err_code == SSL_ERROR_SSL) {
+                        std::cerr << "[" << now_ms_time_gen_str() << "] SSL Protocol error." << std::endl;
+                        ERR_print_errors_fp(stderr);
+                    } else {
+                        cerr("UNKNOWN ERROR IN SSL_read_ex : " + std::to_string(err_code));
+                    }
+                    network_fatal_.store(true, std::memory_order_release);
                     running_.store(false);
                     return false;
+                }
+                client_state.received_bytes += bytes_read;
+                if (client_state.received_bytes < HEADER_SIZE) {
+                    continue;
+                }
 
-                default:
-                    cerr("UNKNOWN ERROR IN SSL_read_ex : " + std::to_string(err_code));
+                uint32_t total_length_net;
+                memcpy(&total_length_net, client_state.header_buffer.data(), sizeof(uint32_t));
+                uint32_t total_length = ntohl(total_length_net);
+                if (total_length < HEADER_SIZE) {
+                    cerr("[" + now_ms_time_gen_str() + "] [Error] Malformed msg. Length: " + std::to_string(total_length));
+                    network_fatal_.store(true, std::memory_order_release);
+                    return false;
+                }
+
+                uint16_t event_type_net;
+                memcpy(&event_type_net, client_state.header_buffer.data() + sizeof(uint32_t), sizeof(uint16_t));
+                client_state.event_type = ntohs(event_type_net);
+
+                uint32_t correlation_id_net;
+                memcpy(&correlation_id_net, client_state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t), sizeof(uint32_t));
+                client_state.correlation_id = ntohl(correlation_id_net);
+
+                uint16_t ack_level_net;
+                memcpy(&ack_level_net, client_state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t), sizeof(uint16_t));
+                client_state.ack_level = ntohs(ack_level_net);
+
+                client_state.expected_body_length = total_length - HEADER_SIZE;
+                if (client_state.expected_body_length == 0) {
+                    handle_event(
+                        client_state.event_type,
+                        client_state.correlation_id,
+                        client_state.ack_level,
+                        MYMQ::OwnedBytes{}
+                    );
+                    client_state.reset(HEADER_SIZE);
+                    continue;
+                }
+
+                MYMQ::Client::BufferPool::Block block;
+                if (!MYMQ::Client::BufferPool::instance().try_allocate_for(
+                        client_state.expected_body_length,
+                        std::chrono::milliseconds(0),
+                        block)) {
+                    cerr("[" + now_ms_time_gen_str() + "] [Error] BufferPool exhausted while receiving response body.");
+                    network_fatal_.store(true, std::memory_order_release);
                     running_.store(false);
                     return false;
                 }
-            }
-
-            // ---------------------------------------------------------
-            // 情况 B: 成功读取到数据 (ret == 1)
-            // ---------------------------------------------------------
-            else if (ret == 1) {
-                int bytes_processed = 0;
-
-                // 处理当前 buffer 中的所有数据
-                while (bytes_processed < bytes_received) {
-
-                    // --- 1. 读头部 ---
-                    if (client_state.current_state == ClientState::READING_HEADER) {
-                        int bytes_needed = HEADER_SIZE - client_state.received_bytes;
-                        int bytes_available = bytes_received - bytes_processed;
-                        int bytes_to_copy = (bytes_needed < bytes_available) ? bytes_needed : bytes_available;
-
-                        memcpy(client_state.header_buffer.data() + client_state.received_bytes,
-                               IO_buffer.data() + bytes_processed,
-                               bytes_to_copy);
-
-                        client_state.received_bytes += bytes_to_copy;
-                        bytes_processed += bytes_to_copy;
-
-                        if (client_state.received_bytes == HEADER_SIZE) {
-                            // 解析头部
-                            uint32_t total_length_net;
-                            memcpy(&total_length_net, client_state.header_buffer.data(), sizeof(uint32_t));
-                            uint32_t total_length = ntohl(total_length_net);
-
-                            if (total_length < HEADER_SIZE) {
-                                cerr("[" + now_ms_time_gen_str() + "] [Error] Malformed msg. Length: " + std::to_string(total_length));
-                                return false;
-                            }
-
-                            uint16_t event_type_net;
-                            memcpy(&event_type_net, client_state.header_buffer.data() + sizeof(uint32_t), sizeof(uint16_t));
-                            client_state.event_type = ntohs(event_type_net);
-
-                            uint32_t correlation_id_net;
-                            memcpy(&correlation_id_net, client_state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t), sizeof(uint32_t));
-                            client_state.correlation_id = ntohl(correlation_id_net);
-
-                            uint16_t ack_level_net;
-                            memcpy(&ack_level_net, client_state.header_buffer.data() + sizeof(uint32_t) + sizeof(uint16_t) + sizeof(uint32_t), sizeof(uint16_t));
-                            client_state.ack_level = ntohs(ack_level_net);
-
-                            client_state.expected_body_length = total_length - HEADER_SIZE;
-
-                            if (client_state.expected_body_length > 0) {
-                                client_state.body_buffer.resize(client_state.expected_body_length);
-                                client_state.current_state = ClientState::READING_BODY;
-                                client_state.received_bytes = 0;
-                            } else {
-                                // Header Only 消息处理
-                                auto tmp= Mybyte{};
-                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level,tmp);
-                                client_state.reset(HEADER_SIZE);
-                            }
-                        }
+                auto* raw = static_cast<unsigned char*>(block.data);
+                client_state.body_ptr = raw;
+                client_state.body_owner = std::shared_ptr<void>(
+                    raw,
+                    [block = std::move(block)](void*) mutable {
+                        MYMQ::Client::BufferPool::instance().release(block);
                     }
-                    // --- 2. 读包体 ---
-                    else if (client_state.current_state == ClientState::READING_BODY) {
-                        int bytes_needed = client_state.expected_body_length - client_state.received_bytes;
-                        int bytes_available = bytes_received - bytes_processed;
-                        int bytes_to_copy = (bytes_needed < bytes_available) ? bytes_needed : bytes_available;
-
-                        memcpy(client_state.body_buffer.data() + client_state.received_bytes,
-                               IO_buffer.data() + bytes_processed,
-                               bytes_to_copy);
-
-                        client_state.received_bytes += bytes_to_copy;
-                        bytes_processed += bytes_to_copy;
-
-                        if (client_state.received_bytes == client_state.expected_body_length) {
-                            // 完整消息处理
-                            if (!is_registered) {
-                                if (static_cast<Eve>(client_state.event_type) == MYMQ::EventType::SERVER_RESPONSE_REGISTER) {
-                                    MP mp(client_state.body_buffer.data(),client_state.body_buffer.size());
-                                    auto view = mp.read_bytes_view();
-                                    MP mp_content(view.first, view.second);
-                                    auto succ = mp_content.read_bool();
-                                    std::string resp = "Register result : '" + client_id_str + "' register ";
-                                    if (succ) {
-                                        is_registered = 1;
-                                        resp += "success";
-                                    } else {
-                                        resp += "failed";
-                                    }
-                                    out(resp);
-                                } else {
-                                    std::cerr << "[" << now_ms_time_gen_str() << "] Not yet registered but received Event." << std::endl;
-                                }
-
-                            } else {
-
-                                MP mp(client_state.body_buffer.data(),client_state.body_buffer.size());
-                                auto body=mp.read_uchar_vector();
-                                handle_event(client_state.event_type, client_state.correlation_id, client_state.ack_level,std::move( body));
-                            }
-
-                            client_state.reset(HEADER_SIZE);
-                        }
-                    }
-                }
+                );
+                client_state.current_state = ClientState::READING_BODY;
+                client_state.received_bytes = 0;
                 continue;
             }
+
+            size_t bytes_read = 0;
+            const size_t bytes_needed = client_state.expected_body_length - client_state.received_bytes;
+            int ret = SSL_read_ex(
+                ssl_,
+                client_state.body_ptr + client_state.received_bytes,
+                bytes_needed,
+                &bytes_read
+            );
+            if (ret == 0) {
+                int err_code = SSL_get_error(ssl_, ret);
+                if (err_code == SSL_ERROR_WANT_READ || err_code == SSL_ERROR_WANT_WRITE) {
+                    return true;
+                }
+                unsigned long ssl_err = ERR_peek_last_error();
+                const char* reason = ssl_err ? ERR_reason_error_string(ssl_err) : nullptr;
+                bool unexpected_eof = (err_code == SSL_ERROR_SSL &&
+                                       reason != nullptr &&
+                                       std::string(reason).find("unexpected eof while reading") != std::string::npos);
+                bool syscall_eof = (err_code == SSL_ERROR_SYSCALL && ssl_err == 0);
+                if (unexpected_eof || syscall_eof) {
+                    std::cout << "[" << now_ms_time_gen_str() << "] TLS peer closed connection." << std::endl;
+                    running_.store(false);
+                    return false;
+                }
+                if (err_code == SSL_ERROR_ZERO_RETURN) {
+                    cerr("The connection has been closed normally by the other party.");
+                } else if (err_code == SSL_ERROR_SYSCALL) {
+                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL Syscall error (Network broken)." << std::endl;
+                } else if (err_code == SSL_ERROR_SSL) {
+                    std::cerr << "[" << now_ms_time_gen_str() << "] SSL Protocol error." << std::endl;
+                    ERR_print_errors_fp(stderr);
+                } else {
+                    cerr("UNKNOWN ERROR IN SSL_read_ex : " + std::to_string(err_code));
+                }
+                network_fatal_.store(true, std::memory_order_release);
+                running_.store(false);
+                return false;
+            }
+            client_state.received_bytes += bytes_read;
+            if (client_state.received_bytes < client_state.expected_body_length) {
+                continue;
+            }
+
+            if (!is_registered) {
+                if (static_cast<Eve>(client_state.event_type) == MYMQ::EventType::SERVER_RESPONSE_REGISTER) {
+                    MP mp(client_state.body_ptr, client_state.expected_body_length);
+                    auto view = mp.read_bytes_view();
+                    MP mp_content(view.first, view.second);
+                    auto succ = mp_content.read_bool();
+                    std::string resp = "Register result : '" + client_id_str + "' role(" + std::to_string(channel_role_) + ") register ";
+                    if (succ) {
+                        is_registered = 1;
+                        resp += "success";
+                    } else {
+                        resp += "failed";
+                    }
+                    out(resp);
+                } else {
+                    std::cerr << "[" << now_ms_time_gen_str() << "] Not yet registered but received Event." << std::endl;
+                }
+                client_state.reset(HEADER_SIZE);
+                continue;
+            }
+
+            MP mp(client_state.body_ptr, client_state.expected_body_length);
+            auto view = mp.read_bytes_view();
+            handle_event(
+                client_state.event_type,
+                client_state.correlation_id,
+                client_state.ack_level,
+                MYMQ::OwnedBytes{view.first, view.second, client_state.body_owner}
+            );
+            client_state.reset(HEADER_SIZE);
+            continue;
         }
     }
 
-    void handle_event(uint16_t eventtype, uint32_t correlation_id, uint16_t ack_level, Mybyte msg_body) {
+    void handle_event(uint16_t eventtype, uint32_t correlation_id, uint16_t ack_level, MYMQ::OwnedBytes msg_body) {
         tbb::concurrent_hash_map<uint32_t, ResponseCallback>::accessor acc;
 
         if (map_wait_responces.find(acc, correlation_id)) {
             curr_flying_request_num--;
+            notify_send_state();
             auto cb = std::move(acc->second);
             map_wait_responces.erase(acc);
             cb(eventtype,std::move(msg_body) );
@@ -745,10 +967,14 @@ private:
     std::string server_IP;
     int port;
     uint16_t HEADER_SIZE;
+    size_t default_request_timeout_ms_ = MYMQ::REQUEST_TIMEOUT_MS_DEFAULT;
 
 
     SOCKET clientSocket;
     std::atomic<bool> running_{false};
+    std::atomic<bool> network_fatal_{false};
+    std::mutex send_state_mtx_;
+    std::condition_variable send_state_cv_;
     std::string client_id_str;
     std::thread io_thread_;
 
@@ -765,11 +991,13 @@ private:
     std::atomic<bool> client_id_sent_{false};
 
     MYMQ::ACK_Level ack_level=MYMQ::ACK_Level::ACK_PROMISE_INDISK;
+    uint16_t channel_role_ = static_cast<uint16_t>(MYMQ_Public::ChannelRole::CONTROL);
 
     tbb::concurrent_hash_map<uint32_t, ResponseCallback> map_wait_responces;
-    RequestTimeoutQueue request_timeout_timer;
+    std::unique_ptr<RequestTimeoutQueue> request_timeout_timer;
 
     std::atomic<uint32_t> Correlation_ID{0};
+    std::optional<size_t> request_timeout_ms_override_{};
 
 
 
@@ -789,5 +1017,8 @@ private:
 
 
 };
+
+} // namespace Network
+} // namespace MYMQ
 
 #endif // COMMUNICATION_H

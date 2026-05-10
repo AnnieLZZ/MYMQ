@@ -16,7 +16,7 @@
 #define NOMINMAX
 #endif
 #include <winsock2.h>
-#include"zstd.h"
+#include <zstd.h>
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "zstd_static.lib")
 #else
@@ -73,6 +73,10 @@ public:
         append_bytes(&network_value, sizeof(network_value));
     }
 
+    void append_int32(int32_t value) {
+        append_int(static_cast<int>(value));
+    }
+
     void append_uint32(uint32_t value) {
         uint32_t network_value = htonl(value);
         append_bytes(&network_value, sizeof(network_value));
@@ -81,6 +85,10 @@ public:
     void append_uint16(uint16_t value){
         uint16_t network_value = htons(value);
         append_bytes(&network_value, sizeof(network_value));
+    }
+
+    void append_int16(int16_t value){
+        append_short(static_cast<short>(value));
     }
 
     void append_bool(bool value) {
@@ -96,6 +104,21 @@ public:
     void append_int64(int64_t value) {
         uint64_t network_value = hton64(static_cast<uint64_t>(value));
         append_bytes(&network_value, sizeof(network_value));
+    }
+
+    void append_byte(int8_t value) {
+        data.push_back(static_cast<unsigned char>(value));
+    }
+
+    void append_varint(int64_t value) {
+        // ZigZag Encode
+        uint64_t n = (static_cast<uint64_t>(value) << 1) ^ (value >> 63);
+        
+        while (n >= 0x80) {
+            data.push_back(static_cast<unsigned char>((n & 0x7F) | 0x80));
+            n >>= 7;
+        }
+        data.push_back(static_cast<unsigned char>(n));
     }
 
 
@@ -292,6 +315,55 @@ public:
         unsigned char byte_value = m_data[m_offset];
         m_offset += 1;
         return byte_value != 0;
+    }
+
+    // ==========================================
+    // 补全缺失的 API
+    // ==========================================
+
+    const unsigned char* get_current_ptr() const {
+        return m_data + m_offset;
+    }
+
+    size_t get_offset() const {
+        return m_offset;
+    }
+
+    size_t get_remaining_bytes() const {
+        return remaining();
+    }
+
+    int8_t read_byte() {
+        if (m_offset + 1 > m_size) {
+            throw std::out_of_range("Not enough data to read byte.");
+        }
+        return static_cast<int8_t>(m_data[m_offset++]);
+    }
+
+    // 读取 Varint (支持 ZigZag 解码，适配 int64_t)
+    int64_t read_varint() {
+        uint64_t value = 0;
+        int shift = 0;
+        size_t temp_offset = m_offset;
+
+        while (true) {
+            if (temp_offset >= m_size) {
+                throw std::out_of_range("Not enough data to read varint.");
+            }
+            uint8_t byte = m_data[temp_offset++];
+            value |= (static_cast<uint64_t>(byte & 0x7F) << shift);
+            if (!(byte & 0x80)) {
+                break;
+            }
+            shift += 7;
+            if (shift > 63) {
+                throw std::runtime_error("Varint too long.");
+            }
+        }
+        m_offset = temp_offset;
+
+        // ZigZag 解码: (n >> 1) ^ -(n & 1)
+        return (value >> 1) ^ -(value & 1);
     }
 
     // ==========================================

@@ -7,9 +7,6 @@
 #include <chrono>
 #include <cassert>
 
-// 假设头文件中已包含 MYMQ_Producer 的定义
-// #include "MYMQ_Producer.h"
-
 using Err_Client = MYMQ_Public::ClientErrorCode;
 
 // 用于本地存储预期的消息结构
@@ -75,7 +72,7 @@ int main() {
             expected_data[i].value
             );
 
-        if (err != Err_Client::NULL_ERROR) {
+        if (err != Err_Client::Success) {
             cerr("FATAL: Push failed at index " + std::to_string(i) + " Error: " + MYMQ_Public::to_string(err));
             return -1; // 发送失败直接退出，验证测试要求 100% 可靠
         }
@@ -119,7 +116,7 @@ int main() {
         // auto pull_result = mc.pull(res, PULL_TIMEOUT_S * 1000, dummy_cost_us);
 
         // 调试日志：如果拉取为空，打印状态
-        if (res.empty() && pull_result != Err_Client::NULL_ERROR) {
+        if (res.empty() && pull_result != Err_Client::Success) {
             // 简单的 debug 输出，防止大量刷屏，仅在非预期错误时打印
             if (pull_result != Err_Client::PULL_TIMEOUT && pull_result != Err_Client::EMPTY_RECORD) {
                 std::cout << "[DEBUG] pull_result=" << MYMQ_Public::to_string(pull_result) << std::endl;
@@ -137,7 +134,7 @@ int main() {
             continue;
         }
 
-        if (pull_result != Err_Client::NULL_ERROR && pull_result != Err_Client::PARTIAL_PARASE_FAILED) {
+        if (pull_result != Err_Client::Success && pull_result != Err_Client::PARTIAL_PARASE_FAILED) {
             cerr("ERROR: Pull failed with code: " + MYMQ_Public::to_string(pull_result));
             verification_passed = false;
             break;

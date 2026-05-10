@@ -27,14 +27,25 @@
 #include<deque>
 #include <string>
 #include"zlib.h"
-#include"zstd.h"
+#include <zstd.h>
 #include"../src/Serialize.h"
 #include <ctime>
 #include <iomanip>
 #include<functional>
 #include"MYMQ_Publiccodes.h"
+#include "BufferPool.h"
 #include"tbb/concurrent_unordered_map.h"
 #include<memory>
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <windows.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
+#endif
 
 
 namespace MYMQ { // 推荐使用命名空间进一步封装
@@ -310,86 +321,149 @@ struct Record{
 
 class BatchBuffer {//生产者用的
 public:
-    std::vector<unsigned char> data_;
+    MYMQ::Client::BufferPool::Block block_{};
+    unsigned char* data_ = nullptr;
+    size_t capacity_ = 0;
     size_t write_pos_ = 0; // 当前写到了哪里
-size_t record_count_ = 0;
-    // 初始化时直接分配固定大小（比如 1MB），禁止后续扩容
-    explicit BatchBuffer(size_t capacity) {
-        data_.resize(capacity);
+    size_t record_count_ = 0;
+    int64_t first_timestamp_ = -1; // For calculating timestamp delta
+
+    explicit BatchBuffer(size_t capacity) : capacity_(capacity) {
         write_pos_ = 0;
+        first_timestamp_ = -1;
     }
+
+    ~BatchBuffer() {
+        release();
+    }
+
+    BatchBuffer(const BatchBuffer&) = delete;
+    BatchBuffer& operator=(const BatchBuffer&) = delete;
 
     // 重置 Buffer（复用时调用，不释放内存）
     void clear() {
         write_pos_ = 0;
         record_count_ = 0;
+        first_timestamp_ = -1;
+    }
+
+    bool ensure_allocated_for(std::chrono::milliseconds timeout) {
+        if (data_ != nullptr && capacity_ > 0) return true;
+        MYMQ::Client::BufferPool::Block blk;
+        if (!MYMQ::Client::BufferPool::instance().try_allocate_for(capacity_, timeout, blk)) {
+            return false;
+        }
+        block_ = blk;
+        data_ = reinterpret_cast<unsigned char*>(block_.data);
+        return true;
+    }
+
+    void release() {
+        if (!block_.valid()) return;
+        MYMQ::Client::BufferPool::instance().release(block_);
+        data_ = nullptr;
+        write_pos_ = 0;
+        record_count_ = 0;
+        first_timestamp_ = -1;
     }
 
     // 检查剩余空间是否足够
     bool has_capacity_for(size_t size_needed) const {
-        return (write_pos_ + size_needed) <= data_.size();
+        return (write_pos_ + size_needed) <= capacity_;
     }
 
     // 返回有效数据大小
     size_t size() const { return write_pos_; }
 
     // 返回数据指针（给 ZSTD 用）
-    const void* data_ptr() const { return data_.data(); }
+    const void* data_ptr() const { return data_; }
+
+    // Helper: Calculate Varint Size (ZigZag)
+    static size_t varint_size(int64_t value) {
+        uint64_t n = (static_cast<uint64_t>(value) << 1) ^ (value >> 63);
+        size_t len = 0;
+        while (n >= 0x80) {
+            len++;
+            n >>= 7;
+        }
+        return len + 1;
+    }
+
+    // Helper: Write Varint (ZigZag) - Unsafe (Caller must check bounds)
+    void write_varint_unsafe(int64_t value) {
+        uint64_t n = (static_cast<uint64_t>(value) << 1) ^ (value >> 63);
+        while (n >= 0x80) {
+            data_[write_pos_++] = static_cast<unsigned char>((n & 0x7F) | 0x80);
+            n >>= 7;
+        }
+        data_[write_pos_++] = static_cast<unsigned char>(n);
+    }
 
     // --- 核心：替代 build_Record 的逻辑 ---
     // 返回 true 表示写入成功，false 表示空间不足
     bool append_record(const std::string& key, const std::string& value) {
-        // 1. 预计算长度
+        if (data_ == nullptr) return false;
+        // 1. Calculate Timestamps
+        auto now = std::chrono::system_clock::now();
+        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        
+        if (first_timestamp_ == -1) {
+            first_timestamp_ = ts;
+        }
+        int64_t ts_delta = ts - first_timestamp_;
+        int64_t offset_delta = static_cast<int64_t>(record_count_);
+
+        // 2. Calculate Sizes
         size_t key_len = key.size();
         size_t val_len = value.size();
 
-        // ---------------------------------------------------------
-        // 逻辑: [TotalLen] -> [KeyLen][Key][ValLen][Val][Time]
-        // ---------------------------------------------------------
+        size_t sz_attr = 1;
+        size_t sz_ts_delta = varint_size(ts_delta);
+        size_t sz_off_delta = varint_size(offset_delta);
+        size_t sz_key_len = varint_size(static_cast<int64_t>(key_len));
+        size_t sz_val_len = varint_size(static_cast<int64_t>(val_len));
+        size_t sz_headers = varint_size(0); // 0 headers
 
-        // Record 内部大小 = Key部分 + Val部分 + Time(8)
-        size_t record_inner_size = sizeof(uint32_t) + key_len +
-                                   sizeof(uint32_t) + val_len +
-                                   sizeof(uint64_t);   // Time
+        // Body Size: Attributes + TS + Off + KeyLen + Key + ValLen + Val + Headers
+        size_t body_size = sz_attr + sz_ts_delta + sz_off_delta + sz_key_len + key_len + sz_val_len + val_len + sz_headers;
+        size_t sz_length = varint_size(static_cast<int64_t>(body_size));
 
-        // 写入 Batch 需要的总空间 (包含开头的 4字节 TotalLen)
-        size_t total_size_needed = sizeof(uint32_t) + record_inner_size;
+        size_t total_size_needed = sz_length + body_size;
 
-        // 2. 检查容量
-        if (write_pos_ + total_size_needed > data_.size()) {
+        // 3. Check Capacity
+        if (write_pos_ + total_size_needed > capacity_) {
             return false;
         }
 
-        // --- 开始写入 ---
-        unsigned char* ptr = data_.data() + write_pos_;
+        // 4. Write Data
+        // Length
+        write_varint_unsafe(static_cast<int64_t>(body_size));
+        
+        // Attributes (0)
+        data_[write_pos_++] = 0;
 
-        // A. 写入单条 Record 的总长度 (不包含自身 4 字节)
-        // 解析端：std::memcpy(&single_rec_len, rec_ptr, 4);
-        uint32_t n_record_len = htonl(static_cast<uint32_t>(record_inner_size));
-        std::memcpy(ptr, &n_record_len, sizeof(uint32_t));
-        ptr += sizeof(uint32_t);
+        // Timestamp Delta
+        write_varint_unsafe(ts_delta);
 
-        // B. 写入 Key (Length + Data)
-        // 解析端：std::memcpy(&key_len, kv_start, 4);
-        uint32_t n_key_len = htonl(static_cast<uint32_t>(key_len));
-        std::memcpy(ptr, &n_key_len, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-        std::memcpy(ptr, key.data(), key_len);          ptr += key_len;
+        // Offset Delta
+        write_varint_unsafe(offset_delta);
 
-        // C. 写入 Value (Length + Data)
-        // 解析端：std::memcpy(&val_len, kv_start, 4);
-        uint32_t n_val_len = htonl(static_cast<uint32_t>(val_len));
-        std::memcpy(ptr, &n_val_len, sizeof(uint32_t)); ptr += sizeof(uint32_t);
-        std::memcpy(ptr, value.data(), val_len);        ptr += val_len;
+        // Key
+        write_varint_unsafe(static_cast<int64_t>(key_len));
+        if (key_len > 0) {
+            std::memcpy(data_ + write_pos_, key.data(), key_len);
+            write_pos_ += key_len;
+        }
 
-        auto now = std::chrono::system_clock::now();
-        int64_t ts = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
-        uint64_t ts_value = static_cast<uint64_t>(ts);
+        // Value
+        write_varint_unsafe(static_cast<int64_t>(val_len));
+        if (val_len > 0) {
+            std::memcpy(data_ + write_pos_, value.data(), val_len);
+            write_pos_ += val_len;
+        }
 
-        uint64_t n_time = htonll(ts_value);
-        std::memcpy(ptr, &n_time, sizeof(uint64_t));
-        ptr += sizeof(uint64_t);
-
-        write_pos_ += total_size_needed;
+        // Headers (0)
+        write_varint_unsafe(0);
 
         record_count_++;
         return true;
@@ -400,7 +474,13 @@ size_t record_count_ = 0;
 
 }
 
-using ResponseCallback = std::function<void(uint16_t event_type, std::vector<unsigned char> msg_body)>;
+struct OwnedBytes {
+    const unsigned char* data = nullptr;
+    size_t size = 0;
+    std::shared_ptr<void> owner{};
+};
+
+using ResponseCallback = std::function<void(uint16_t event_type, OwnedBytes msg_body)>;
 struct PendingMessage {
     std::vector<unsigned char> message_bytes;
     size_t offset;
@@ -431,7 +511,7 @@ struct HeartbeatResponce{
 
 
 
-namespace MYMQ_Client{
+namespace Client{
 
 
 struct ClientState {
@@ -462,42 +542,44 @@ struct SparseCallback {
 using TopicPartition=MYMQ_Public::TopicPartition;
 using CallbackQueue = std::deque<MYMQ_Public::SupportedCallbacks>;
 using BatchBuffer= MSG_serial::BatchBuffer;
+struct BatchItem {
+    std::unique_ptr<BatchBuffer> buffer;
+    std::vector<SparseCallback> callbacks;
+    size_t batch_count = 0;
+};
+
 struct Push_queue {
     std::mutex mtx;
     std::condition_variable cv_full;
 
-    BatchBuffer buf_1;
-    BatchBuffer buf_2;
+    // Active buffer (currently being written to)
+    std::unique_ptr<BatchBuffer> active_buf;
+    std::vector<SparseCallback> active_cbs;
+    size_t current_batch_count{0};
 
-    BatchBuffer* active_buf;
-    BatchBuffer* flushing_buf;
+    // Ready queue (full buffers waiting to be flushed)
+    std::deque<std::unique_ptr<BatchItem>> ready_queue;
 
-    // 回调双缓冲
-    std::vector<SparseCallback> cbs1;
-    std::vector<SparseCallback> cbs2;
-    std::vector<SparseCallback>* active_cbs = &cbs1;
-    std::vector<SparseCallback>* flushing_cbs = &cbs2;
+    std::vector<std::unique_ptr<BatchBuffer>> free_pool;
 
-    bool is_flushing = false;
+    bool is_flushing = false; // Flag to ensure only one flush task per partition runs at a time
 
-    CallbackQueue callbacks_;
     ZSTD_CCtx* cctx = nullptr;
     TopicPartition tp;
+    
+    // Configuration
+    size_t buffer_size_ = 1024 * 1024;
+    size_t max_queued_batches_ = 5; // Allow 5 pending batches + 1 active
 
-    std::atomic<size_t> current_batch_count{0};
-
-    Push_queue(const TopicPartition& tp, size_t buffer_size = 1024 * 1024)
-        : tp(tp),
-        buf_1(buffer_size),
-        buf_2(buffer_size),
-        active_buf(&buf_1),
-        flushing_buf(&buf_2)
+    Push_queue(const TopicPartition& tp, size_t buffer_size = 1024 * 1024, size_t max_queued_batches = 5)
+        : tp(tp), buffer_size_(buffer_size), max_queued_batches_(max_queued_batches)
     {
-        cctx=ZSTD_createCCtx();
+        cctx = ZSTD_createCCtx();
+        active_buf = std::make_unique<BatchBuffer>(buffer_size_);
     }
 
     ~Push_queue() {
-        ZSTD_freeCCtx(cctx);
+        if (cctx) ZSTD_freeCCtx(cctx);
     }
 };
 
@@ -505,15 +587,16 @@ struct Push_queue {
 
 
 
-struct endoffset_point
+struct Commitedoffset_point
 {
     TopicPartition tp;
     mutable std::atomic<size_t> off;
-    endoffset_point(size_t off_,const TopicPartition& tp_):tp(tp_),off(off_){}
+    Commitedoffset_point(size_t off_,const TopicPartition& tp_):tp(tp_),off(off_){}
 };
 
 
 class PollBuffer {
+    using Chuckitem= std::pair<size_t, OwnedBytes> ;
 public:
 
     mutable std::atomic<size_t> local_consume_offset{0};
@@ -537,7 +620,7 @@ public:
         {
             std::lock_guard<std::mutex> ulock(mtx);
             {
-                std::deque<std::vector<unsigned char>> tmp{};
+                std::deque<Chuckitem> tmp{};
                 std::swap(tmp,queue_);
             }
 
@@ -548,8 +631,11 @@ public:
 
     }
 
-    bool try_pop(std::vector<unsigned char>& target) {
+    bool try_pop(Chuckitem& target, bool* became_need_poll = nullptr) {
         std::lock_guard<std::mutex> ulock(mtx);
+        if (became_need_poll) {
+            *became_need_poll = false;
+        }
 
         if (queue_.empty()) {
             return false;
@@ -559,7 +645,7 @@ public:
         target = std::move(item);
 
 
-        size_t popped_size = target.size();
+        size_t popped_size = target.second.size;
         queue_.pop_front();
 
         size_t current = curr_size.fetch_sub(popped_size, std::memory_order_relaxed) - popped_size;
@@ -568,16 +654,19 @@ public:
         // 只有当前是 PAUSE 且水位降到 LOW 以下，才“切换”状态
         if (state.load(std::memory_order_relaxed) == PAUSE && current <= low_level_capacity) {
             state.store(NEED_POLL, std::memory_order_release);
+            if (became_need_poll) {
+                *became_need_poll = true;
+            }
         }
 
         return true;
     }
 
-    void push(std::vector<unsigned char>& obj) {
+    void push(OwnedBytes obj,size_t record_num_of_chuck) {
         std::lock_guard<std::mutex> ulock(mtx);
 
-        size_t obj_size = obj.size();
-        queue_.emplace_back(std::move(obj));
+        size_t obj_size = obj.size;
+        queue_.emplace_back(record_num_of_chuck,std::move(obj));
 
         // 更新大小
         size_t current = curr_size.fetch_add(obj_size, std::memory_order_relaxed) + obj_size;
@@ -591,7 +680,8 @@ public:
 
 private:
     std::mutex mtx;
-    std::deque<std::vector<unsigned char>> queue_;
+
+    std::deque< Chuckitem  > queue_;
 
     // 使用 atomic 允许无锁查询
     std::atomic<size_t> curr_size{0};
@@ -615,16 +705,14 @@ private:
 
 public:
 
-
     PushqueueMap::iterator begin() { return batches.begin(); }
     PushqueueMap::iterator end() { return batches.end(); }
-    PushQueuePtr get_queue(const MYMQ_Public::TopicPartition& tp,size_t buffer_size) {
+    PushQueuePtr get_queue(const MYMQ_Public::TopicPartition& tp, size_t buffer_size, size_t max_queued_batches) {
         auto it = batches.find(tp);
         if (it != batches.end()) {
             return it->second;
         }
-
-        auto new_queue = std::make_shared<Push_queue>(tp,buffer_size);
+        auto new_queue = std::make_shared<Push_queue>(tp, buffer_size, max_queued_batches);
 
         // 原子插入
         auto result = batches.emplace(tp, new_queue);
@@ -636,7 +724,7 @@ public:
 
 struct TP_Point
 {
-    std::shared_ptr<endoffset_point> endoffset_ptr=nullptr;
+    std::shared_ptr<Commitedoffset_point> endoffset_ptr=nullptr;
     std::shared_ptr<PollBuffer> pollqueue_ptr=nullptr;
 };
 }

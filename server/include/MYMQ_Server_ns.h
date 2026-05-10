@@ -74,167 +74,8 @@ private:
     std::atomic<size_t>  uncalled_count_ = 0;
 };
 
-struct SendFileTask {
-    int in_fd;           // 文件描述符
-    off_t offset;        // 初始偏移量
-    size_t length;       // 发送长度
-    size_t sent_so_far;  // 已发送字节数
-
-
-     bool header_sent=0;
-     std::vector<unsigned char>   header_data;
-     size_t header_send_offset=0;
-    // 下面这些仅作记录用，如果不需要可以删掉
-    size_t offset_next_to_consume;
-    std::string topicname;
-    size_t partition;
-    uint32_t correlation_id;
-    uint16_t ack_level;
-
-    SendFileTask(int fd, off_t off, size_t len, size_t first_off, const std::string& topic, size_t par, uint32_t cid, uint16_t ack)
-        : in_fd(fd), offset(off), length(len), sent_so_far(0),
-          offset_next_to_consume(first_off), topicname(topic), partition(par), correlation_id(cid), ack_level(ack) {}
-    SendFileTask(MYMQ_Server::MessageLocation mesloc, const std::string& topic, size_t par, uint32_t cid, uint16_t ack)
-        : in_fd(mesloc.file_descriptor), offset(mesloc.offset_in_file), length(mesloc.length), sent_so_far(0),
-          offset_next_to_consume(mesloc.offset_next_to_consume), topicname(topic), partition(par),correlation_id(cid),ack_level(ack) {}
-};
-
-class ClientState {
-    public:
-    enum State {
-        READING_HEADER,
-        READING_BODY
-    };
-
-    // 状态管理
-    State current_state = READING_HEADER;
-
-    // 接收缓冲区
-    std::vector<unsigned char> header_buffer;
-    size_t bytes_read_in_header = 0;
-
-    std::vector<unsigned char> body_buffer;
-    size_t bytes_read_in_body = 0;
-
-    // 协议解析字段
-    uint32_t expected_body_length = 0;
-    uint16_t event_type = 0;
-    uint32_t correlation_id = 0;
-    uint16_t ack_level = 0;
-
-    std::atomic<bool> is_closing{false};
-    int fd = -1;
-
-    bool id_registered = false;
-    std::string clientid = "UNKNOWN";
-
-    SSL* ssl = nullptr;
-    bool is_handshake_complete = false;
-    bool enable_sendfile = false;
-
-    uint32_t last_events=UINT32_MAX;
-
-    // --- 发送相关结构 ---
-
-    // 文件发送任务 (精简版：只存文件元数据，不存 Header)
-
-
-    // 发送队列元素：可以是普通字节(Mybyte) 或 文件任务
-    using SendItem = std::variant<std::vector<unsigned char>, SendFileTask>;
-
-    std::deque<SendItem> send_queue;
-    size_t current_vec_send_offset = 0; // 如果队首是 vector，记录发送到了哪里
-    bool is_writing = false;
-    std::mutex send_queue_mtx; // 专门锁队列的锁
-
-    // 构造函数
-    ClientState(size_t header_size) : header_buffer(header_size) {}
-    ClientState() = default;
-
-
-    bool is_closed(){
-    return  this->is_closing.load();
-        }
-    int get_fd(){
-        return this->fd;
-    }
-
-    // --- 核心入队函数 ---
-    // 统一处理 ResponsePayload (可能是字节，也可能是文件)
-    void enqueue_message(uint16_t event_type, uint32_t correlation_id, uint16_t ack_level,  std::variant<std::vector<unsigned char>, SendFileTask> payload) {
-
-        short event_type_s = static_cast<short>(event_type);
-
-        // -------------------------------------------------------
-        // 情况 A: 发送普通字节消息
-        // -------------------------------------------------------
-        if (std::holds_alternative<std::vector<unsigned char>>(payload)) {
-            auto& msg_body = std::get<std::vector<unsigned char>>(payload);
-
-            MessageBuilder mb;
-            uint32_t total_length = static_cast<uint32_t>(MYMQ::HEADER_SIZE + sizeof(uint32_t) + msg_body.size());
-
-            mb.reserve(total_length);
-            mb.append_uint32(total_length);
-            mb.append_uint16(event_type_s);
-            mb.append_uint32(correlation_id);
-            mb.append_uint16(ack_level);
-            mb.append_uchar_vector(msg_body); // 拷贝 body
-
-            std::vector<unsigned char> full_message = std::move(mb.data);
-
-            {
-                std::unique_lock<std::mutex> statelock(this->send_queue_mtx);
-                this->send_queue.emplace_back(std::move(full_message));
-                if (!this->send_queue.empty()) this->is_writing = true;
-            }
-        }
-        // -------------------------------------------------------
-        // 情况 B: 发送文件 (Zero-Copy)
-        // -------------------------------------------------------
-        else if (std::holds_alternative<SendFileTask>(payload)) {
-            auto& file_task = std::get<SendFileTask>(payload);
-
-            {
-                std::unique_lock<std::mutex> statelock(this->send_queue_mtx);
-
-                // 再放文件任务
-                this->send_queue.emplace_back(std::move(file_task));
-
-                if (!this->send_queue.empty()) this->is_writing = true;
-            }
-        }
-    }
-
-};
-
-class TcpSession {
-public:
-    TcpSession(std::shared_ptr<ClientState> state) : state_(state) {clientid=state->clientid;}
-
-    void send(MYMQ::EventType type, uint32_t cid, uint16_t ack, std::variant<std::vector<unsigned char>, SendFileTask> payload) {
-            auto state = state_.lock();
-            if (!state || state->is_closed()) return;
-            state->enqueue_message(static_cast<uint16_t>( type), cid, ack, std::move(payload));
-        }
-    int fd() const {
-        auto state = state_.lock();
-        return state ? state->get_fd() : -1;
-    }
-
-    // 检查连接是否有效
-    bool is_connected() const {
-        auto state = state_.lock();
-        return state && !state->is_closed();
-    }
-    std::string get_clientid(){
-        return clientid;
-    }
-
-private:
-    std::weak_ptr<ClientState> state_;
-    std::string clientid;
-};
+// Removed SendFileTask, ClientState, TcpSession as they are now provided by generic Net namespace in Server.h
+// or are no longer needed in this namespace.
 
 using AssignmentMap = std::map<std::string, std::set<size_t>>;
 // ==========================================
@@ -368,8 +209,17 @@ private:
     std::map<std::string, std::map<size_t, std::string>> partition_owners_;
     std::map<TopicPartition,OffsetAndMetadata> map_OffsetAndMetadata;
 
+    // 【新增】撤销回调
+    using RevocationCallback = std::function<void(const std::string&, size_t)>;
+    RevocationCallback revocation_cb_;
+
 public:
     ConsumerGroupState(const std::string& id) : group_id(id) {}
+
+    void set_revocation_callback(RevocationCallback cb) {
+        std::lock_guard<std::mutex> lock(group_mtx);
+        revocation_cb_ = cb;
+    }
 
     // 【新增】公共查询接口（调试/管理用）
     std::string get_partition_owner(const std::string& topic, size_t partition) {
@@ -391,6 +241,13 @@ private:
         auto it = p_map.find(pid);
         if (it != p_map.end() && it->second == member_id) {
             p_map.erase(it);
+            
+            // 【关键】通知外部：分区所有权已撤销
+            // 这将触发 Long Polling 提前返回
+            if (revocation_cb_) {
+                revocation_cb_(topic, pid);
+            }
+
             // 如果该 Topic 下没有分区了，可以清理 Topic key
             if (p_map.empty()) partition_owners_.erase(topic);
         }
@@ -634,7 +491,7 @@ public:
             TopicPartition tp{topic, partition};
             map_OffsetAndMetadata[tp] = {offset, client_gen_id};
 
-            return Err::NULL_ERROR;
+            return Err::Success;
         }
 
 
@@ -673,7 +530,7 @@ public:
             if(!all_success){
                 return Err::GENERATION_EXPIRED;
             }
-            return Err::NULL_ERROR;
+            return Err::Success;
         }
 
         bool get_committed_offset(const std::string& topic, size_t partition,size_t& offset_ref) {

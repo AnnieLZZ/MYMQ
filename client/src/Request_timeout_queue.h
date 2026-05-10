@@ -9,6 +9,8 @@
 #include <chrono>
 #include <vector>
 #include <iostream>
+#include <functional>
+#include <cstring>
 
 #include"MYMQ_innercodes.h"
 using Mybyte = std::vector<unsigned char>;
@@ -22,10 +24,11 @@ struct TimeoutNode {
 class RequestTimeoutQueue {
 public:
     // 构造函数：传入业务 Map、计数器引用、以及超时时间（毫秒）
-    RequestTimeoutQueue(tbb::concurrent_hash_map<uint32_t, ResponseCallback>& map_wait_responces,std::atomic<size_t>& flying_count_ref, size_t timeout_ms)
+    RequestTimeoutQueue(tbb::concurrent_hash_map<uint32_t, ResponseCallback>& map_wait_responces,std::atomic<size_t>& flying_count_ref, size_t timeout_ms, std::function<void()> on_flying_count_released = {})
         :m_map_wait_responses(map_wait_responces),
           m_curr_flying_request_num(flying_count_ref),
           m_timeout_duration(std::chrono::milliseconds(timeout_ms)),
+          m_on_flying_count_released(std::move(on_flying_count_released)),
           m_running(true) 
     {
         m_thread = std::thread([this] { worker_thread(); });
@@ -52,6 +55,7 @@ private:
     tbb::concurrent_hash_map<uint32_t, ResponseCallback>& m_map_wait_responses;
     std::atomic<size_t>& m_curr_flying_request_num;
     std::chrono::milliseconds m_timeout_duration;
+    std::function<void()> m_on_flying_count_released;
 
     // 核心数据结构
     moodycamel::ConcurrentQueue<TimeoutNode> m_concurrent_queue;
@@ -127,11 +131,19 @@ private:
                 // 2. 从 Map 移除
                 m_map_wait_responses.erase(acc);
                 m_curr_flying_request_num--;
+                if (m_on_flying_count_released) {
+                    m_on_flying_count_released();
+                }
 
                 // 3. 执行回调 (通知上层 Timeout)
                 try {
-                    // 假设你的 Mybyte 和 Event 定义
-                    cb(static_cast<uint16_t>(Eve::EVENTTYPE_NULL), Mybyte{}); 
+                    uint16_t net = htons(static_cast<uint16_t>(MYMQ_Public::CommonErrorCode::REQUEST_TIMEOUT));
+                    auto body = std::make_shared<Mybyte>(sizeof(uint16_t));
+                    std::memcpy(body->data(), &net, sizeof(uint16_t));
+                    cb(
+                        static_cast<uint16_t>(Eve::EVENTTYPE_NULL),
+                        MYMQ::OwnedBytes{body->data(), body->size(), body}
+                    );
                 } catch (...) {
                     // 吞掉用户回调的异常，保护检测线程
                     std::cerr << "Exception in timeout callback for coid: " << coid << std::endl;
