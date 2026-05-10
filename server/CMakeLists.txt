@@ -146,6 +146,7 @@ target_link_libraries(MYMQ
 
 # --- 6. 创建可执行文件 ---
 add_executable(MyMQ_App main.cpp)
+add_executable(MyMQ_PerfProbe perf_probe.cpp)
 
 # --- 6a. 复制 config 目录到构建目录 ---
 add_custom_target(CopyConfig
@@ -157,6 +158,8 @@ add_custom_target(CopyConfig
 
 # 确保在构建 MyMQ_App 之前，先执行 CopyConfig
 add_dependencies(MyMQ_App CopyConfig)
+add_dependencies(MyMQ_PerfProbe CopyConfig)
 
 # --- 7. 链接您的库到可执行文件 ---
 target_link_libraries(MyMQ_App PRIVATE MYMQ)
+target_link_libraries(MyMQ_PerfProbe PRIVATE MYMQ)

@@ -11,6 +11,7 @@
 #include <optional>
 #include <tbb/tbb.h>
 #include"MYMQ_Publiccodes.h"
+#include"MYMQ_Perf.h"
 #include"Logsegment.h"
 #include"MYMQ_innercodes.h"
 #include"MYMQ_Server_ns.h"
@@ -975,6 +976,50 @@ public:
         return  partition_ptr->get_endoffset();
     }
 
+    MYMQ_ServerPerfSnapshot get_perf_snapshot() {
+        MYMQ_ServerPerfSnapshot s;
+        s.total_requests = total_requests_.load(std::memory_order_relaxed);
+        s.push_requests = push_requests_.load(std::memory_order_relaxed);
+        s.push_success = push_success_.load(std::memory_order_relaxed);
+        s.push_failed = push_failed_.load(std::memory_order_relaxed);
+        s.pull_requests = pull_requests_.load(std::memory_order_relaxed);
+        s.pull_hit = pull_hit_.load(std::memory_order_relaxed);
+        s.pull_no_record = pull_no_record_.load(std::memory_order_relaxed);
+        s.commit_requests = commit_requests_.load(std::memory_order_relaxed);
+        s.commit_success = commit_success_.load(std::memory_order_relaxed);
+        s.commit_failed = commit_failed_.load(std::memory_order_relaxed);
+        s.response_packets = response_packets_.load(std::memory_order_relaxed);
+        s.response_file_packets = response_file_packets_.load(std::memory_order_relaxed);
+        s.response_error_packets = response_error_packets_.load(std::memory_order_relaxed);
+        s.pushed_payload_bytes = pushed_payload_bytes_.load(std::memory_order_relaxed);
+        s.pulled_payload_bytes = pulled_payload_bytes_.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(pending_fetches_mutex_);
+            for (const auto& kv : pending_fetches_) {
+                s.pending_pull_requests += kv.second.size();
+            }
+        }
+        return s;
+    }
+
+    void reset_perf_counters() {
+        total_requests_.store(0, std::memory_order_relaxed);
+        push_requests_.store(0, std::memory_order_relaxed);
+        push_success_.store(0, std::memory_order_relaxed);
+        push_failed_.store(0, std::memory_order_relaxed);
+        pull_requests_.store(0, std::memory_order_relaxed);
+        pull_hit_.store(0, std::memory_order_relaxed);
+        pull_no_record_.store(0, std::memory_order_relaxed);
+        commit_requests_.store(0, std::memory_order_relaxed);
+        commit_success_.store(0, std::memory_order_relaxed);
+        commit_failed_.store(0, std::memory_order_relaxed);
+        response_packets_.store(0, std::memory_order_relaxed);
+        response_file_packets_.store(0, std::memory_order_relaxed);
+        response_error_packets_.store(0, std::memory_order_relaxed);
+        pushed_payload_bytes_.store(0, std::memory_order_relaxed);
+        pulled_payload_bytes_.store(0, std::memory_order_relaxed);
+    }
+
 private:
 
 
@@ -1083,11 +1128,13 @@ private:
             uint16_t ack_level = mp_header.read_uint16();
 
             MYMQ::EventType type = static_cast<MYMQ::EventType>(event_type_short);
+            total_requests_.fetch_add(1, std::memory_order_relaxed);
 
             cerr("["+std::to_string(correlation_id)+"]["+session.get_clientid()+"]"+ MYMQ::to_string(type)+" called.");
             MessageParser mp(msg_body->data(),msg_body->size());
             mp.skip(4);
             if(type==MYMQ::EventType::CLIENT_REQUEST_PULL){
+                pull_requests_.fetch_add(1, std::memory_order_relaxed);
 
                 auto groupid=mp.read_string();
                 auto topicname=mp.read_string();
@@ -1102,12 +1149,14 @@ private:
                 auto res= pull(offset,topicname,partition,bytes_need);
                 bool failed=1;
                 if(res.second==Err::Success){
+                    pull_hit_.fetch_add(1, std::memory_order_relaxed);
                     send_file_packet(session, Eve::SERVER_RESPONSE_PULL_DATA, correlation_id, ack_level, res.first, topicname, partition, offset);
                     failed=0;
 
                 }
                 // --- Long Polling Logic ---
                 else if (res.second == Err::NO_RECORD) {
+                    pull_no_record_.fetch_add(1, std::memory_order_relaxed);
                     std::lock_guard<std::mutex> lock(pending_fetches_mutex_);
                     TopicPartition tp(topicname, partition);
                     
@@ -1140,6 +1189,7 @@ private:
 
             }
             else if(type==MYMQ::EventType::CLIENT_REQUEST_PUSH){
+                push_requests_.fetch_add(1, std::memory_order_relaxed);
 
 
 
@@ -1148,6 +1198,7 @@ private:
 
                 const auto role = static_cast<MYMQ_Public::ChannelRole>(session.get_channel_role());
                 if (role != MYMQ_Public::ChannelRole::UNKNOWN && role != MYMQ_Public::ChannelRole::PRODUCE) {
+                    push_failed_.fetch_add(1, std::memory_order_relaxed);
                     MB mb_res;
                     mb_res.append(topicname,partition);
                     mb_res.append_uint16(static_cast<uint16_t>(Err::INTERNAL_ERROR));
@@ -1166,6 +1217,7 @@ private:
 
 
                 if(!MYMQ::Crc32::verify_crc32(msg_view.first,msg_view.second,crc)){
+                    push_failed_.fetch_add(1, std::memory_order_relaxed);
                     cerr("Push CRC verify : Not match , refused to push");
                     if(ack_level!=static_cast<uint16_t>(MYMQ::ACK_Level::ACK_NORESPONCE)){
                             mb_res.append_uint16(static_cast<uint16_t>(Err::CRC_VERIFY_FAILED));
@@ -1176,6 +1228,12 @@ private:
 
 
                 auto push_res= push(msg_view,topicname,partition);
+                if (push_res == Err::Success) {
+                    push_success_.fetch_add(1, std::memory_order_relaxed);
+                    pushed_payload_bytes_.fetch_add(msg_view.second, std::memory_order_relaxed);
+                } else {
+                    push_failed_.fetch_add(1, std::memory_order_relaxed);
+                }
                 uint64_t baseoffset;
                 std::memcpy(&baseoffset,msg_view.first,sizeof(uint64_t));
                 baseoffset=ntohll(baseoffset);
@@ -1188,6 +1246,7 @@ private:
                  cerr("Push result : "+MYMQ_Public::to_string(push_res));
             }
             else if(type==MYMQ::EventType::CLIENT_REQUEST_COMMIT_OFFSET){
+                commit_requests_.fetch_add(1, std::memory_order_relaxed);
 
                 auto groupid=mp.read_string();
                 auto memberid=mp.read_string();
@@ -1232,6 +1291,11 @@ private:
                 MB mb;
                 mb.reserve(sizeof (uint32_t)*2+groupid.size()+topicname.size()+sizeof (size_t)*2+sizeof (uint16_t));
                 mb.append(groupid,topicname,partition,static_cast<uint16_t>(error),offset_digit);
+                if (error == Err::Success) {
+                    commit_success_.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    commit_failed_.fetch_add(1, std::memory_order_relaxed);
+                }
                 send_packet(session, Eve::SERVER_RESPONCE_COMMIT_OFFSET, correlation_id, ack_level, mb.data);
 
 
@@ -1409,6 +1473,7 @@ private:
 
     void send_packet(Net::TcpSession& session, Eve type, uint32_t correlation_id, uint16_t ack_level, std::vector<unsigned char> body) {
         if (!session.is_connected()) return;
+        response_packets_.fetch_add(1, std::memory_order_relaxed);
 
         MB mb_body;
         mb_body.append_uchar_vector(body);
@@ -1428,6 +1493,8 @@ private:
 
     void send_file_packet(Net::TcpSession& session, Eve type, uint32_t correlation_id, uint16_t ack_level, MesLoc loc, const std::string& topic, size_t partition, size_t offset) {
          if (!session.is_connected()) return;
+         response_file_packets_.fetch_add(1, std::memory_order_relaxed);
+         pulled_payload_bytes_.fetch_add(loc.length, std::memory_order_relaxed);
 
          // Construct Body for File Send (Metadata only)
          // The actual file content is sent via send_file
@@ -1462,6 +1529,7 @@ private:
     }
 
     void send_error_response(Net::TcpSession& session, uint32_t correlation_id, uint16_t ack_level, const std::string& topic, size_t partition, Err error_code, size_t offset) {
+        response_error_packets_.fetch_add(1, std::memory_order_relaxed);
         MB mb_res;
         // Construct error body
         // Body: [Topic][Partition][ErrorCode][Offset][DataLen=0]
@@ -1494,6 +1562,22 @@ private:
     Server server_;
     Timer timer_;
     std::thread server_thread_;
+
+    std::atomic<uint64_t> total_requests_{0};
+    std::atomic<uint64_t> push_requests_{0};
+    std::atomic<uint64_t> push_success_{0};
+    std::atomic<uint64_t> push_failed_{0};
+    std::atomic<uint64_t> pull_requests_{0};
+    std::atomic<uint64_t> pull_hit_{0};
+    std::atomic<uint64_t> pull_no_record_{0};
+    std::atomic<uint64_t> commit_requests_{0};
+    std::atomic<uint64_t> commit_success_{0};
+    std::atomic<uint64_t> commit_failed_{0};
+    std::atomic<uint64_t> response_packets_{0};
+    std::atomic<uint64_t> response_file_packets_{0};
+    std::atomic<uint64_t> response_error_packets_{0};
+    std::atomic<uint64_t> pushed_payload_bytes_{0};
+    std::atomic<uint64_t> pulled_payload_bytes_{0};
 
 
 };

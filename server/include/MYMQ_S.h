@@ -4,6 +4,7 @@
 
 #include <memory> // 为了 std::unique_ptr
 #include "MYMQ_Publiccodes.h" // 包含公共定义
+#include "MYMQ_Perf.h"
 #include"MYMQ_innercodes.h"
 #include"MYMQ_Server_ns.h"
 
@@ -31,6 +32,8 @@ public:
     MYMQ_S(MYMQ_S&&) = delete;
     MYMQ_S& operator=(MYMQ_S&&) = delete;
 
+    MYMQ_ServerPerfSnapshot get_perf_snapshot() const;
+    void reset_perf_counters();
 
 private:
     std::unique_ptr<MessageQueue> pimpl;

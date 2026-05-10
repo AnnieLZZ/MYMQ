@@ -1,190 +1,208 @@
-# MYMQ API User Guide
+# MYMQ API User Guide (Current Code)
 
-This document will guide you on how to initialize the client, produce messages, and consume messages.
+This guide is based on the current public API in `client/include/MYMQ_C.h`.
 
-## Before You Start: Configuration File
+## Before You Start
 
-> **Important:** All configuration files (e.g., `config/business.ini`) are read only once before the program starts. Any changes made to the configuration file while the program is running will not take effect.
+- Config files are loaded only at startup.
+- Common client config files:
+  - `client/config/communication.ini`
+  - `client/config/sys.ini`
+  - `client/config/business.ini`
 
------
-
-## 1\. Setup & Subscription
-
-### 1.1 Create the Client
-
-First, create an `MYMQ_Client` instance.
+## 1. Headers and Core Types
 
 ```cpp
-// Param 1: Client ID (Optional, defaults to "Client-1")
-// Param 2: Push ACK Level (Optional, defaults to 1, i.e., ACK_PROMISE_ACCEPT)
-std::string clientid = "my-client";
-MYMQ::ACK_Level acklevel = MYMQ::ACK_Level::ACK_PROMISE_ACCEPT;
-
-MYMQ_Client mc(clientid, acklevel);
+#include "MYMQ_C.h"
+#include "MYMQ_PublicCodes.h"
 ```
 
-  * **ACK Level 1 (`ACK_PROMISE_ACCEPT`)** means the server only confirms that the message has been received and the data is not corrupted.
+Core types:
 
-### 1.2 Subscribe to or Create a Topic
+- `MYMQ_Producer`
+- `MYMQ_Consumer`
+- `MYMQ_Public::TopicPartition`
+- `MYMQ_Public::ClientErrorCode`
+- `MYMQ_Public::PushResponce`
+- `MYMQ_Public::CommitAsyncResponce`
 
-You can subscribe to a topic directly. If the topic or consumer group does not exist, the server will create them automatically.
+## 2. Producer Usage
+
+## 2.1 Create Producer
 
 ```cpp
-mc.subscribe_topic("testtopic");
+// ack_level:
+// 1 = wait for server ACK
+// 0 = no ACK (callbacks will not fire)
+MYMQ_Producer producer("producer-1", 1);
 ```
 
-Alternatively, you can choose to manually create a topic and specify the number of partitions:
+## 2.2 Create Topic
 
 ```cpp
-// Create a topic named "topic1" with 4 partitions
-mc.create_topic("topic1", 4);
+producer.create_topic("topic_demo", 4);
 ```
 
------
-
-## 2\. Consumer Guide
-
-The following steps will detail the consumer's responsibilities.
-
-> **Core Concept: `TopicPartition`:**
-> All operations that require specifying a partition (Pull, Commit, etc.) must use a `MYMQ_Public::TopicPartition` object (referred to as a 'tp object' in this document) to specify the target.
-
-### 2.1 Join a Consumer Group
+## 2.3 Push Without Callback
 
 ```cpp
-mc.join_group("testgroup");
-```
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+auto err = producer.push(tp, "k1", "v1");
 
-  * Please check the console output for "JoinGroup success".
-  * After successfully joining, you can call the `get_assigned_partition()` method to get the list of partitions assigned to you.
-
-
-
------
-#### 2.2 Pull Messages
-
-Pulling messages is a **blocking** operation (until timeout or data arrives). Data is returned via a reference parameter, and the function return value indicates the status.
-
-```cpp
-// 1. Define the partition you want to pull from
-MYMQ_Public::TopicPartition tp("testtopic", 0);
-
-// 2. Prepare a container to receive data
-std::vector<MYMQ_Public::ConsumerRecord> res;
-
-// 3. Execute the pull
-// Note: The new API does not require passing an offset; the client manages it internally.
-auto pull_result = mc.pull(tp, res);
-
-// 4. Check the pull result
-if (pull_result == Err_Client::PULL_TIMEOUT) {
-    // Pull timed out, no new messages
-    std::cout << "pull timeout" << std::endl;
-} 
-else if (pull_result == Err_Client::NULL_ERROR) {
-    // Pull successful, res contains the batch of messages
-} 
-else {
-    // Handle other errors
+if (err != MYMQ_Public::ClientErrorCode::Success) {
+    // handle error
 }
 ```
 
-#### 2.3 Process Records
-
-Pulling is done in batches. The `pull` interface will fill the passed `std::vector` with multiple messages.
+## 2.4 Push With Callback
 
 ```cpp
-// (Continued from previous step)
-if (!res.empty()) {
-    // Get the first and last message in the batch
-    auto& msg_first = res.front();
-    auto& msg_back  = res.back();
-    
-    // Get basic information
-    std::cout << "Batch size: " << res.size() << std::endl;
-    std::cout << "First Offset: " << msg_first.getOffset() << std::endl;
-    std::cout << "Last Offset:  " << msg_back.getOffset()  << std::endl;
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
 
-    // Iterate to process all messages
-    for (const auto& msg : res) {
-        std::string key = msg.getKey();
-        std::string val = msg.getValue();
-        // Business logic...
+auto on_push = [](MYMQ_Public::PushResponce resp) {
+    // resp.tp / resp.errorcode / resp.offset
+};
+
+auto err = producer.push(tp, "k2", "v2", on_push);
+```
+
+Notes:
+
+- With `ack_level=0`, the server does not send push ACK, so callback will not be called.
+- Typical return errors include `QUEUE_FULL`, `NOT_REGISTER`, `TIMEOUT`.
+
+## 2.5 Stop Producer
+
+```cpp
+producer.stop();
+```
+
+## 3. Consumer Usage
+
+## 3.1 Create Consumer
+
+```cpp
+MYMQ_Consumer consumer("consumer-1", 1);
+```
+
+## 3.2 Subscribe and Join Group
+
+```cpp
+consumer.subscribe_topic("topic_demo");
+consumer.join_group("group_demo");
+```
+
+Optional checks:
+
+```cpp
+bool in_group = consumer.get_is_ingroup();
+auto assigned = consumer.get_assigned_partition();
+```
+
+## 3.3 Trigger Pull
+
+```cpp
+consumer.trigger_pull();
+```
+
+## 3.4 Pull Records
+
+```cpp
+std::vector<MYMQ_Public::ConsumerRecord> records;
+auto err = consumer.pull(records, 5000); // timeout ms
+
+if (err == MYMQ_Public::ClientErrorCode::Success) {
+    for (const auto& r : records) {
+        auto key = r.getKey();
+        auto val = r.getValue();
+        auto off = r.getOffset();
     }
 }
 ```
-```
 
-### 2.4 Synchronous Offset Commit (Commit Sync)
-
-> **Note:** Before committing manually, please ensure the `'autocommit'` field in the `config/business.ini` file is set to `0` (disabled).
-
-This method will **block** the main thread until the commit times out or a confirmation response is received from the server.
+Pull with latency output:
 
 ```cpp
-MYMQ_Public::TopicPartition tp("testtopic", 0);
-size_t new_offset = 100;
-
-mc.commit_sync(tp, new_offset);
+std::vector<MYMQ_Public::ConsumerRecord> records;
+int64_t latency_us = 0;
+auto err = consumer.pull(records, 5000, latency_us);
 ```
 
-### 2.5 Asynchronous Offset Commit (Commit Async)
+## 3.5 Commit Offset
 
-This method **will not** block the main thread.
+Sync commit:
 
 ```cpp
-MYMQ_Public::TopicPartition tp("testtopic", 0);
-size_t new_offset = 100;
-
-// 1. Simple async commit (don't care about the result)
-mc.commit_async(tp, new_offset);
-
-// 2. Async commit (with callback)
-// Assuming you have a callback function:
-// void MyCommitCallback(const MYMQ_Public::CommitAsyncResponce& resp) { ... }
-
-mc.commit_async(tp, new_offset, MyCommitCallback);
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+size_t next_offset_to_consume = 100;
+auto err = consumer.commit_sync(tp, next_offset_to_consume);
 ```
 
-### 2.6 Auto Commit
-
-If you don't want to bother with manual commits, you can enable auto-commit:
-
-1.  Set the `'autocommit'` field in the `config/business.ini` file to `1` (enabled).
-2.  Also, set the value for `'autocommit_perior_ms'` (e.g., `5000`), which will be the auto-commit interval in milliseconds.
-
------
-
-## 3\. Producer Guide
-
-The following steps will detail the producer's responsibilities.
-
-### 3.1 Synchronous Push (Sync Push)
-
-This method will **block** until it receives confirmation from the server (based on the `acklevel` setting). Both Key and Value can be empty.
+Async commit (no callback):
 
 ```cpp
-MYMQ_Public::TopicPartition tp("testtopic", 0);
-std::string key1 = "key1";
-std::string val1 = "val1";
-
-Err_Client err = mc.push(tp, key1, val1);
-// Check the err variable to confirm if the push was successful
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+size_t next_offset_to_consume = 100;
+auto err = consumer.commit_async(tp, next_offset_to_consume);
 ```
 
-### 3.2 Asynchronous Push (Push with Callback)
-
-This method **will not** block. You can pass a callback function (of type `MYMQ_Public::SupportedCallbacks`) as the 5th parameter to be notified when the push is complete.
+Async commit (with callback):
 
 ```cpp
-MYMQ_Public::TopicPartition tp("testtopic", 0);
-std::string key1 = "key1";
-std::string val1 = "val1";
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+size_t next_offset_to_consume = 100;
 
-// Assuming you have a callback function:
-// void MyPushCallback(const MYMQ_Public::PushResponce& resp) { ... }
+auto on_commit = [](MYMQ_Public::CommitAsyncResponce resp) {
+    // resp.groupid / resp.tp / resp.committed_offset / resp.error
+};
 
-mc.push(tp, key1, val1, MyPushCallback);
+auto err = consumer.commit_async(tp, next_offset_to_consume, on_commit);
 ```
 
-> **Note:** When `acklevel` is set to `0` (`MYMQ::ACK_Level::NORESPONCE`), the server will not return any response, so the set callback will **never** be triggered.
+## 3.6 Local Seek
+
+```cpp
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+auto err = consumer.seek(tp, 0);
+```
+
+## 3.7 Other Useful APIs
+
+```cpp
+consumer.set_pull_max_record_num_local(100000);
+consumer.set_pull_fetch_min_bytes(1024 * 1024);
+```
+
+Get local consumed position:
+
+```cpp
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+size_t pos = 0;
+auto err = consumer.get_position_consumed(tp, pos);
+```
+
+Leave group:
+
+```cpp
+auto err = consumer.leave_group();
+```
+
+## 4. Error Handling
+
+- API calls return `MYMQ_Public::ClientErrorCode`.
+- Use `MYMQ_Public::to_string(err)` for readable logs.
+- Common values:
+  - `Success`
+  - `PULL_TIMEOUT`
+  - `EMPTY_RECORD`
+  - `NOT_IN_GROUP`
+  - `REACHED_MAX_FLYING_REQUEST`
+  - `QUEUE_FULL`
+  - `NETWORK_FATAL`
+
+## 5. Full Examples
+
+- `client/examples/main.cpp`
+- `client/examples/example_test_perf.cpp`
+- `client/examples/example_test_seek.cpp`
+- `client/examples/example_test_backpressure.cpp`

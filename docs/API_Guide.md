@@ -1,184 +1,208 @@
-# MYMQ API 用户手册
+# MYMQ API 用户手册（当前代码版）
 
-本文档将指导你如何初始化客户端、生产和消费消息。
+本文档基于当前公开接口 `client/include/MYMQ_C.h` 编写。
 
-## 启动前：配置文件
-> **重要提示：** 所有配置文件 (例如 `config/business.ini`) 均只在程序启动前读取一次。程序运行中对配置文件的修改不会生效。
+## 启动前说明
 
----
+- 配置文件仅在启动时读取一次，运行中修改不会生效。
+- 客户端常用配置：
+  - `client/config/communication.ini`
+  - `client/config/sys.ini`
+  - `client/config/business.ini`
 
-## 1. 初始化与订阅 (Setup & Subscription)
-
-### 1.1 创建客户端
-首先，创建一个 `MYMQ_Client` 实例。
-
-```cpp
-// 参数1: 客户端ID (可选, 默认 "Client-1")
-// 参数2: Push的ACK等级 (可选, 默认 1, 即 ACK_PROMISE_INDISK)
-std::string clientid = "my-client";
-
-MYMQ_Client mc(clientid, 1);
-````
-
-  * **ACK 等级 1 (`ACK_PROMISE_INDISK`)** 意味着服务确认消息已收到且数据没有损坏并已经写入linux page cache。
-
-### 1.2 订阅或创建主题
-
-你可以直接订阅一个主题。如果该主题或消费组不存在，服务器将会自动创建它们。
+## 1. 头文件与基础类型
 
 ```cpp
-mc.subscribe_topic("testtopic");
+#include "MYMQ_C.h"
+#include "MYMQ_PublicCodes.h"
 ```
 
-或者，你也可以选择手动创建主题并指定分区数：
+常用类型：
+
+- `MYMQ_Producer`
+- `MYMQ_Consumer`
+- `MYMQ_Public::TopicPartition`
+- `MYMQ_Public::ClientErrorCode`
+- `MYMQ_Public::PushResponce`
+- `MYMQ_Public::CommitAsyncResponce`
+
+## 2. Producer 实际用法
+
+## 2.1 创建 Producer
 
 ```cpp
-// 创建一个4分区的名为 "topic1" 的主题
-mc.create_topic("topic1", 4);
+// ack_level:
+// 1 = 需要服务端ACK（默认行为）
+// 0 = 不等待ACK（回调不会触发）
+MYMQ_Producer producer("producer-1", 1);
 ```
 
------
-
-## 2\. 消费者 (Consumer) 指南
-
-接下来的步骤将分离消费者的职责。
-
-> **核心概念 `TopicPartition`:**
-> 所有需要指定分区的操作 (Pull, Commit 等)，都必须使用 `MYMQ_Public::TopicPartition` 对象 (在本文档中简称 'tp对') 来指定目标。
-
-### 2.1 加入消费组 (Join Group)
+## 2.2 创建主题
 
 ```cpp
-mc.join_group("testgroup");
+producer.create_topic("topic_demo", 4);
 ```
 
-  * 请检查控制台输出 "JoinGroup success" 字样。
-  * 加入成功后，你可以调用 `get_assigned_partition()` 方法来获取你被分配到的分区列表。
-
-#### 2.2 拉取消息 (Pull)
-
-拉取消息是一个**阻塞**操作（直到超时或有数据），它通过引用参数返回数据，函数返回值用于指示状态。
+## 2.3 发送消息（无回调）
 
 ```cpp
-// 1. 定义你要拉取的分区
-MYMQ_Public::TopicPartition tp("testtopic", 0);
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+auto err = producer.push(tp, "k1", "v1");
 
-// 2. 准备接收数据的容器
-std::vector<MYMQ_Public::ConsumerRecord> res;
-
-// 3. 执行拉取
-// 注意：新版 API 不再需要手动传入 offset，客户端内部会自动管理
-auto pull_result = mc.pull(tp, res);
-
-// 4. 检查拉取结果
-if (pull_result == Err_Client::PULL_TIMEOUT) {
-    // 拉取超时，没有新消息
-    std::cout << "pull timeout" << std::endl;
-} 
-else if (pull_result == Err_Client::NULL_ERROR) {
-    // 拉取成功，res 中包含消息批次
-} 
-else {
-    // 处理其他错误
+if (err != MYMQ_Public::ClientErrorCode::Success) {
+    // 处理错误
 }
 ```
 
-#### 2.3 处理消息 (Process Records)
-
-拉取是以批次 (Batch) 为单位的，`pull` 接口会将多条消息填充到传入的 `std::vector` 中。
+## 2.4 发送消息（带回调）
 
 ```cpp
-// (续上一步)
-if (!res.empty()) {
-    // 获取批次中的第一条和最后一条消息
-    auto& msg_first = res.front();
-    auto& msg_back  = res.back();
-    
-    // 获取基本信息
-    std::cout << "Batch size: " << res.size() << std::endl;
-    std::cout << "First Offset: " << msg_first.getOffset() << std::endl;
-    std::cout << "Last Offset:  " << msg_back.getOffset()  << std::endl;
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
 
-    // 遍历处理所有消息
-    for (const auto& msg : res) {
-        std::string key = msg.getKey();
-        std::string val = msg.getValue();
-        // 业务逻辑...
+auto on_push = [](MYMQ_Public::PushResponce resp) {
+    // resp.tp / resp.errorcode / resp.offset
+};
+
+auto err = producer.push(tp, "k2", "v2", on_push);
+```
+
+说明：
+
+- 当 `ack_level=0` 时，服务端不返回 push ack，回调不会触发。
+- 发送失败会返回 `ClientErrorCode`，例如 `QUEUE_FULL`、`NOT_REGISTER`、`TIMEOUT`。
+
+## 2.5 停止 Producer
+
+```cpp
+producer.stop();
+```
+
+## 3. Consumer 实际用法
+
+## 3.1 创建 Consumer
+
+```cpp
+MYMQ_Consumer consumer("consumer-1", 1);
+```
+
+## 3.2 订阅并入组
+
+```cpp
+consumer.subscribe_topic("topic_demo");
+consumer.join_group("group_demo");
+```
+
+可选检查：
+
+```cpp
+bool in_group = consumer.get_is_ingroup();
+auto assigned = consumer.get_assigned_partition();
+```
+
+## 3.3 主动触发拉取
+
+```cpp
+consumer.trigger_pull();
+```
+
+## 3.4 拉取消息
+
+```cpp
+std::vector<MYMQ_Public::ConsumerRecord> records;
+auto err = consumer.pull(records, 5000); // timeout ms
+
+if (err == MYMQ_Public::ClientErrorCode::Success) {
+    for (const auto& r : records) {
+        auto key = r.getKey();
+        auto val = r.getValue();
+        auto off = r.getOffset();
     }
 }
 ```
 
-### 2.4 同步提交偏移量 (Commit Sync)
-
-> **注意：** 手动提交前，请先确认 `config/business.ini` 文件中 `'autocommit'` 字段被置为 `0` (禁用)。
-
-此方法会**阻塞**主线程，直到提交超时或收到服务器的确认响应。
+带解析耗时版本：
 
 ```cpp
-MYMQ_Public::TopicPartition tp("testtopic", 0);
-size_t new_offset = 100;
-
-mc.commit_sync(tp, new_offset);
+std::vector<MYMQ_Public::ConsumerRecord> records;
+int64_t latency_us = 0;
+auto err = consumer.pull(records, 5000, latency_us);
 ```
 
-### 2.5 异步提交偏移量 (Commit Async)
+## 3.5 提交位点
 
-此方法**不会**阻塞主线程。
+同步提交：
 
 ```cpp
-MYMQ_Public::TopicPartition tp("testtopic", 0);
-size_t new_offset = 100;
-
-// 1. 简单异步提交 (不关心结果)
-mc.commit_async(tp, new_offset);
-
-// 2. 异步提交 (带回调)
-// 假设你有一个回调函数:
-// void MyCommitCallback(const MYMQ_Public::CommitAsyncResponce& resp) { ... }
-
-mc.commit_async(tp, new_offset, MyCommitCallback);
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+size_t next_offset_to_consume = 100;
+auto err = consumer.commit_sync(tp, next_offset_to_consume);
 ```
 
-### 2.6 自动提交 (Auto Commit)
-
-如果你不想麻烦地手动提交，可以启用自动提交：
-
-1.  将 `config/business.ini` 文件中的 `'autocommit'` 字段置为 `1` (启用)。
-2.  同时设定 `'autocommit_perior_ms'` 的值（例如 `5000`），它将作为自动提交的间隔时间（毫秒）。
-
------
-
-## 3\. 生产者 (Producer) 指南
-
-接下来的步骤将分离生产者的职责。
-
-### 3.1 同步推送 (Sync Push)
-
-此方法会**阻塞**，直到收到服务器（根据 `acklevel` 设定的）确认。Key 和 Value 均可为空。
+异步提交（无回调）：
 
 ```cpp
-MYMQ_Public::TopicPartition tp("testtopic", 0);
-std::string key1 = "key1";
-std::string val1 = "val1";
-
-Err_Client err = mc.push(tp, key1, val1);
-// 检查 err 变量来确认推送是否成功
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+size_t next_offset_to_consume = 100;
+auto err = consumer.commit_async(tp, next_offset_to_consume);
 ```
 
-### 3.2 异步推送 (Push with Callback)
-
-此方法**不会**阻塞。你可以在第4个参数传入一个回调函数（类型为 `MYMQ_Public::SupportedCallbacks`），以便在推送完成时收到通知。
+异步提交（带回调）：
 
 ```cpp
-MYMQ_Public::TopicPartition tp("testtopic", 0);
-std::string key1 = "key1";
-std::string val1 = "val1";
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+size_t next_offset_to_consume = 100;
 
-// 假设你有一个回调函数:
-// void MyPushCallback(const MYMQ_Public::PushResponce& resp) { ... }
+auto on_commit = [](MYMQ_Public::CommitAsyncResponce resp) {
+    // resp.groupid / resp.tp / resp.committed_offset / resp.error
+};
 
-mc.push(tp, key1, val1, MyPushCallback);
+auto err = consumer.commit_async(tp, next_offset_to_consume, on_commit);
 ```
 
-> **注意：** 当 `acklevel` 设为 `0` (`MYMQ::ACK_Level::NORESPONCE`) 时，服务器不会返回任何响应，因此设置的回调将**永远不会**被触发。
+## 3.6 调整消费位点（本地）
+
+```cpp
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+auto err = consumer.seek(tp, 0);
+```
+
+## 3.7 其它常用接口
+
+```cpp
+consumer.set_pull_max_record_num_local(100000);
+consumer.set_pull_fetch_min_bytes(1024 * 1024);
+```
+
+查询本地已消费位置：
+
+```cpp
+MYMQ_Public::TopicPartition tp("topic_demo", 0);
+size_t pos = 0;
+auto err = consumer.get_position_consumed(tp, pos);
+```
+
+离组：
+
+```cpp
+auto err = consumer.leave_group();
+```
+
+## 4. 错误处理建议
+
+- 所有 API 返回 `MYMQ_Public::ClientErrorCode` 时，都建议打印 `MYMQ_Public::to_string(err)`。
+- 常见状态：
+  - `Success`
+  - `PULL_TIMEOUT`
+  - `EMPTY_RECORD`
+  - `NOT_IN_GROUP`
+  - `REACHED_MAX_FLYING_REQUEST`
+  - `QUEUE_FULL`
+  - `NETWORK_FATAL`
+
+## 5. 完整示例位置
+
+- `client/examples/main.cpp`
+- `client/examples/example_test_perf.cpp`
+- `client/examples/example_test_seek.cpp`
+- `client/examples/example_test_backpressure.cpp`
 

@@ -113,18 +113,16 @@ int main() {
     print_stats("Producer", diff_push.count(), push_count, push_bytes);
 
     // 等待落盘/同步
-    out("Waiting for server sync (20s)...");
-    std::this_thread::sleep_for(std::chrono::seconds(20));
+    out("Waiting for server sync (30s)...");
+    std::this_thread::sleep_for(std::chrono::seconds(30));
 
-    // [修改点] 触发消费者的拉取预热 (如果是Client端主动拉取模式，通常需要先触发一下或者让后台线程跑起来)
-    mc.trigger_pull();
-    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+    // 删除预热逻辑
+    // mc.trigger_pull();
+    // std::this_thread::sleep_for(std::chrono::milliseconds(5000));
 
-    // ==========================================
-    // Phase 2: Consumer Benchmark (Modified)
-    // ==========================================
     out("\n--- [Phase 2] Consumer Benchmark Start ---");
-
+    auto wall_clock_start = high_resolution_clock::now(); // 计时开始
+    mc.trigger_pull(); // 立刻触发并进入 while 循环拉取
     std::vector<MYMQ_Public::ConsumerRecord> res;
 
     int consumed_count = 0;
@@ -134,8 +132,7 @@ int main() {
     const int STALL_LIMIT_SEC = 50;
     auto last_data_time = high_resolution_clock::now();
 
-    // 用于记录总墙钟时间（仅供参考）
-    auto wall_clock_start = high_resolution_clock::now();
+
 
     // 定义累加器，用于存储 pull 返回的内部有效耗时 (us)
     int64_t total_internal_cost_time = 0;
@@ -200,7 +197,9 @@ int main() {
     std::cout << "Total Effective Processing Time: " << duration_sec << " s" << std::endl;
 
     // 打印吞吐量
-    print_stats("Consumer (Effective)", duration_sec, consumed_count, consumed_bytes);
+    // print_stats("Consumer (Effective)", duration_sec, consumed_count, consumed_bytes);
+    // 打印吞吐量 (将 duration_sec 替换为 wall_diff.count())
+    print_stats("Consumer (Real Wall-Clock)", wall_diff.count(), consumed_count, consumed_bytes);
 
     return 0;
 }
