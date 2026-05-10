@@ -17,7 +17,7 @@
 #include<memory>
 #include<condition_variable>
 #include<mutex>
-#include "version.h"
+#include "MYMQ_ClientVersion.h"
 
 // 仅声明 cerr 函数
 void cerr(const std::string& message);

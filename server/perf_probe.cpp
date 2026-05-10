@@ -1,5 +1,5 @@
 #include "MYMQ_S.h"
-#include "version.h"
+#include "MYMQ_ServerVersion.h"
 
 #include <atomic>
 #include <chrono>
@@ -63,4 +63,3 @@ int main() {
     std::cout << "[MYMQ PERF PROBE] Stopping..." << std::endl;
     return 0;
 }
-

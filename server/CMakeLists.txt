@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/version.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/MYMQ_ServerVersion.h"
 )
 # --- 2. 查找系统库 ---
 

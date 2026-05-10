@@ -1,5 +1,5 @@
 #include"MYMQ_S.h"
-#include "version.h"
+#include "MYMQ_ServerVersion.h"
 #include<iostream>
 int main(){
     std::cout<< SERVER_VERSION_STRING<<std::endl;

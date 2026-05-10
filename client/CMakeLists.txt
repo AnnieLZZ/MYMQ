@@ -6,7 +6,7 @@ project(MYMQ VERSION 4.0.0 LANGUAGES CXX)
 
 configure_file(
     "${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in"
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/version.h"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/MYMQ_ClientVersion.h"
 )
 
 set(SRC_FILES
